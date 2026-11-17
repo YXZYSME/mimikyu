@@ -297,6 +297,14 @@ impl BidiConnection {
             .cloned()
     }
 
+    fn clear_active_target_if_matches(&self, user_context: Option<&str>, target_id: &str) {
+        let key = context_scope_key(user_context);
+        let mut guard = self.active_targets.write();
+        if guard.get(&key).map(String::as_str) == Some(target_id) {
+            guard.remove(&key);
+        }
+    }
+
     fn resolve_context_state(&self, cid: &str) -> Option<Arc<BidiContextState>> {
         let contexts = self.contexts.read();
         if let Some(state) = contexts.get(cid) {
@@ -1145,10 +1153,6 @@ impl DriverSession for BidiSession {
                 continue;
             }
             let tid = c["context"].as_str().unwrap_or_default().to_string();
-            let active = active_tid
-                .as_deref()
-                .map(|a| a == tid)
-                .unwrap_or_else(|| tid == self.ctx());
             let title = match self
                 .conn
                 .send(
@@ -1172,8 +1176,26 @@ impl DriverSession for BidiSession {
                 target_id: tid,
                 url: c["url"].as_str().unwrap_or_default().to_string(),
                 title,
-                active,
+                active: false,
             });
+        }
+        if !out.is_empty() {
+            let resolved_active = active_tid
+                .filter(|aid| out.iter().any(|t| &t.target_id == aid))
+                .unwrap_or_else(|| {
+                    let self_tid = self.ctx();
+                    let fallback = if out.iter().any(|t| t.target_id == self_tid) {
+                        self_tid.to_string()
+                    } else {
+                        out[0].target_id.clone()
+                    };
+                    self.conn
+                        .set_active_target(self.state.user_context.as_deref(), &fallback);
+                    fallback
+                });
+            if let Some(tab) = out.iter_mut().find(|t| t.target_id == resolved_active) {
+                tab.active = true;
+            }
         }
         Ok(out)
     }
@@ -2087,6 +2109,8 @@ impl DriverSession for BidiSession {
         if self.state.is_root {
             self.conn.shutdown_all().await;
         } else {
+            self.conn
+                .clear_active_target_if_matches(self.state.user_context.as_deref(), self.ctx());
             let _ = self
                 .conn
                 .send("browsingContext.close", json!({ "context": self.ctx() }))
@@ -2095,6 +2119,10 @@ impl DriverSession for BidiSession {
                 && let Some(ref uc) = self.state.user_context
             {
                 self.conn.isolated_contexts.write().remove(uc);
+                self.conn
+                    .active_targets
+                    .write()
+                    .remove(&context_scope_key(Some(uc)));
                 let _ = self
                     .conn
                     .send("browser.removeUserContext", json!({ "userContext": uc }))

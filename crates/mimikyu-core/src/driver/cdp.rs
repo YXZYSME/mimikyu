@@ -235,6 +235,14 @@ impl CdpConnection {
             .cloned()
     }
 
+    fn clear_active_target_if_matches(&self, context_id: Option<&str>, target_id: &str) {
+        let key = context_scope_key(context_id);
+        let mut guard = self.active_targets.write();
+        if guard.get(&key).map(String::as_str) == Some(target_id) {
+            guard.remove(&key);
+        }
+    }
+
     async fn connect(ws_url: &str, process: ProcessGuard) -> Result<Arc<Self>> {
         let mut ws_config = WebSocketConfig::default();
         ws_config.max_message_size = Some(128 * 1024 * 1024);
@@ -1098,16 +1106,29 @@ impl DriverSession for CdpSession {
                 continue;
             }
             let target_id = t["targetId"].as_str().unwrap_or_default().to_string();
-            let active = active_tid
-                .as_deref()
-                .map(|a| a == target_id)
-                .unwrap_or_else(|| target_id == self.state.target_id);
             out.push(TabInfo {
                 target_id,
                 url: t["url"].as_str().unwrap_or_default().to_string(),
                 title: t["title"].as_str().unwrap_or_default().to_string(),
-                active,
+                active: false,
             });
+        }
+        if !out.is_empty() {
+            let resolved_active = active_tid
+                .filter(|aid| out.iter().any(|t| &t.target_id == aid))
+                .unwrap_or_else(|| {
+                    let fallback = if out.iter().any(|t| t.target_id == self.state.target_id) {
+                        self.state.target_id.clone()
+                    } else {
+                        out[0].target_id.clone()
+                    };
+                    self.conn
+                        .set_active_target(self.state.context_id.as_deref(), &fallback);
+                    fallback
+                });
+            if let Some(tab) = out.iter_mut().find(|t| t.target_id == resolved_active) {
+                tab.active = true;
+            }
         }
         Ok(out)
     }
@@ -1583,15 +1604,22 @@ impl DriverSession for CdpSession {
         {
             let code = ev.code.as_deref().unwrap_or(default_code);
             let vk = ev.windows_virtual_key_code.unwrap_or(default_vk);
+            let text = ev.text.as_deref().or(default_text);
+            let down_type = if text.is_some() {
+                "keyDown"
+            } else {
+                "rawKeyDown"
+            };
             let mut down_params = json!({
-                "type": "rawKeyDown",
+                "type": down_type,
                 "key": cdp_key,
                 "code": code,
                 "windowsVirtualKeyCode": vk,
                 "modifiers": ev.modifiers,
             });
-            if let Some(txt) = ev.text.as_deref().or(default_text) {
+            if let Some(txt) = text {
                 down_params["text"] = json!(txt);
+                down_params["unmodifiedText"] = json!(txt);
             }
             self.call("Input.dispatchKeyEvent", down_params).await?;
 
@@ -1620,7 +1648,12 @@ impl DriverSession for CdpSession {
         if let Some(code) = ev.code.as_deref().or_else(|| spec.map(|s| s.1)) {
             params["code"] = json!(code);
         }
-        if let Some(ref text) = ev.text {
+        let fallback_text = if ev.event_type == KeyEventType::Char && ev.key.chars().count() == 1 {
+            Some(ev.key.as_str())
+        } else {
+            None
+        };
+        if let Some(text) = ev.text.as_deref().or(fallback_text) {
             params["text"] = json!(text);
         }
         if let Some(vk) = ev.windows_virtual_key_code.or_else(|| spec.map(|s| s.2)) {
@@ -2011,6 +2044,10 @@ impl DriverSession for CdpSession {
         } else if self.state.owns_context {
             if let Some(ref ctx_id) = self.state.context_id {
                 self.conn.isolated_contexts.write().remove(ctx_id);
+                self.conn
+                    .active_targets
+                    .write()
+                    .remove(&context_scope_key(Some(ctx_id)));
                 let _ = self
                     .conn
                     .send_browser(
@@ -2020,13 +2057,38 @@ impl DriverSession for CdpSession {
                     .await;
             }
         } else {
-            let _ = self
+            self.conn.clear_active_target_if_matches(
+                self.state.context_id.as_deref(),
+                &self.state.target_id,
+            );
+            if self
                 .conn
                 .send_browser(
                     "Target.closeTarget",
                     json!({ "targetId": self.state.target_id }),
                 )
-                .await;
+                .await
+                .is_ok()
+            {
+                for _ in 0..50 {
+                    let Ok(res) = self.conn.send_browser("Target.getTargets", json!({})).await
+                    else {
+                        break;
+                    };
+                    let still_present = res["targetInfos"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter().any(|t| {
+                                t["targetId"].as_str() == Some(self.state.target_id.as_str())
+                            })
+                        })
+                        .unwrap_or(false);
+                    if !still_present {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
         }
         Ok(())
     }
@@ -2169,10 +2231,19 @@ mod tests {
             Some(("Enter", "Enter", 13, Some("\r")))
         );
         assert_eq!(
+            named_key_cdp_spec("Return"),
+            Some(("Enter", "Enter", 13, Some("\r")))
+        );
+        assert_eq!(
+            named_key_cdp_spec("Space"),
+            Some((" ", "Space", 32, Some(" ")))
+        );
+        assert_eq!(
             named_key_cdp_spec("ArrowLeft"),
             Some(("ArrowLeft", "ArrowLeft", 37, None))
         );
         assert_eq!(named_key_cdp_spec("a"), None);
         assert_eq!(named_key_cdp_spec("!"), None);
+        assert_eq!(named_key_cdp_spec(" "), None);
     }
 }

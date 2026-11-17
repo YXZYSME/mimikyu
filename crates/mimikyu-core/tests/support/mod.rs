@@ -177,6 +177,24 @@ impl TestServer {
                             br#"<!doctype html><html><head><title>Subframe</title></head><body><p id="sub-ok">subframe-loaded</p><img src="/blocked.png" alt="sub-blocked" /></body></html>"#
                                 .to_vec(),
                         ),
+                        ("GET", "/form-keys") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Form Keys</title></head>
+<body>
+  <form id="key-form" onsubmit="event.preventDefault(); window.__formSubmitted = true; document.getElementById('form-status').textContent = 'submitted';">
+    <input id="form-inp" type="text" />
+  </form>
+  <div id="form-status">pending</div>
+  <textarea id="ta"></textarea>
+  <input id="inp2" type="text" />
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
                         _ => (
                             "404 Not Found",
                             "text/plain",

@@ -181,6 +181,116 @@ async fn exercise_engine_full(engine: EngineKind) {
         .expect("read #inp value after backspace");
     assert_eq!(inp_after_bs, "mimikyu");
 
+    // 6a-2. KeyEventType::Char Enter (form submit + textarea newline), Space, and printable without text
+    session
+        .navigate(&server.url("/form-keys"))
+        .await
+        .expect("navigate /form-keys");
+    session
+        .focus_node(None, Some("#form-inp"))
+        .await
+        .expect("focus #form-inp");
+    session
+        .insert_text("hello")
+        .await
+        .expect("insert_text #form-inp");
+    session
+        .dispatch_key(KeyEvent {
+            event_type: KeyEventType::Char,
+            key: "Enter".to_string(),
+            code: None,
+            text: None,
+            windows_virtual_key_code: None,
+            modifiers: 0,
+        })
+        .await
+        .expect("dispatch_key Enter on form");
+    let form_status = session
+        .eval_isolated("document.getElementById('form-status').textContent")
+        .await
+        .expect("check form submission");
+    assert_eq!(
+        form_status, "submitted",
+        "Enter with KeyEventType::Char and text: None must submit <form>"
+    );
+
+    session
+        .focus_node(None, Some("#ta"))
+        .await
+        .expect("focus #ta");
+    session
+        .insert_text("a")
+        .await
+        .expect("insert_text a");
+    session
+        .dispatch_key(KeyEvent {
+            event_type: KeyEventType::Char,
+            key: "Enter".to_string(),
+            code: None,
+            text: None,
+            windows_virtual_key_code: None,
+            modifiers: 0,
+        })
+        .await
+        .expect("dispatch_key Enter on textarea");
+    session
+        .insert_text("b")
+        .await
+        .expect("insert_text b");
+    let ta_val = session
+        .eval_isolated("document.getElementById('ta').value")
+        .await
+        .expect("read #ta value");
+    assert_eq!(
+        ta_val, "a\nb",
+        "Enter with KeyEventType::Char and text: None must insert newline in <textarea>"
+    );
+
+    session
+        .focus_node(None, Some("#inp2"))
+        .await
+        .expect("focus #inp2");
+    session
+        .dispatch_key(KeyEvent {
+            event_type: KeyEventType::Char,
+            key: "Z".to_string(),
+            code: None,
+            text: None,
+            windows_virtual_key_code: None,
+            modifiers: 0,
+        })
+        .await
+        .expect("dispatch_key Z without text");
+    session
+        .dispatch_key(KeyEvent {
+            event_type: KeyEventType::Char,
+            key: "Space".to_string(),
+            code: None,
+            text: None,
+            windows_virtual_key_code: None,
+            modifiers: 0,
+        })
+        .await
+        .expect("dispatch_key Space without text");
+    session
+        .insert_text("ok")
+        .await
+        .expect("insert_text ok");
+    let inp2_val = session
+        .eval_isolated("document.getElementById('inp2').value")
+        .await
+        .expect("read #inp2 value");
+    assert_eq!(
+        inp2_val, "Z ok",
+        "printable key without text and Space must insert 'Z ok'"
+    );
+
+    // Navigate back to / for subsequent checks (#file-inp, screenshot, etc.)
+    session
+        .navigate(&server.url("/"))
+        .await
+        .expect("navigate back to /");
+
     // 6b. File input upload
     let tmp_file = tempfile::NamedTempFile::new().expect("temp file");
     std::fs::write(tmp_file.path(), b"hello-upload").expect("write temp file");
@@ -265,6 +375,39 @@ async fn exercise_engine_full(engine: EngineKind) {
         "tab2 should no longer be active"
     );
     tab2.dispose().await.expect("dispose tab2");
+
+    // 6d-2. Disposing an active non-root tab immediately removes it from list_tabs() and marks remaining tab active
+    let tab3 = session
+        .new_tab(Some(&server.url("/target")))
+        .await
+        .expect("new_tab tab3");
+    let tab3_id = tab3.info().target_id.clone();
+    let tabs_with_t3 = session.list_tabs().await.expect("list_tabs with tab3");
+    assert!(
+        tabs_with_t3
+            .iter()
+            .find(|t| t.target_id == tab3_id)
+            .expect("tab3 present")
+            .active,
+        "tab3 should be active before dispose: {tabs_with_t3:?}"
+    );
+    tab3.dispose().await.expect("dispose active tab3");
+    let tabs_after_t3_dispose = session
+        .list_tabs()
+        .await
+        .expect("list_tabs immediately after tab3.dispose()");
+    assert!(
+        !tabs_after_t3_dispose.iter().any(|t| t.target_id == tab3_id),
+        "disposed tab3 must be immediately absent from list_tabs(): {tabs_after_t3_dispose:?}"
+    );
+    let root_after_dispose = tabs_after_t3_dispose
+        .iter()
+        .find(|t| t.target_id == session.info().target_id)
+        .expect("root tab present after tab3 dispose");
+    assert!(
+        root_after_dispose.active,
+        "remaining root tab should be active immediately after active tab3.dispose(): {tabs_after_t3_dispose:?}"
+    );
 
     // 7. Screenshot & PDF
     let png = session
