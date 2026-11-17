@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -18,16 +18,20 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
 
 use crate::driver::{
-    now_ms, url_matches_pattern, AxNode, BoundingBox, BrowserDriver, ConsoleEntry, ContextOptions,
-    Cookie, DriverCapabilities, DriverSession, EngineKind, EnvProfile, KeyEvent, KeyEventType,
+    now_ms, AxNode, BoundingBox, BrowserDriver, ConsoleEntry, ContextOptions, Cookie,
+    DriverCapabilities, DriverSession, EngineKind, EnvProfile, KeyEvent, KeyEventType,
     LaunchOptions, MouseButton, MouseEvent, MouseEventType, NavInfo, NetworkEvent, OriginStorage,
-    ProfileMode, ProxyConfig, RouteAction, RouteMock, ScreenshotFormat, ScreenshotOpts,
-    SessionInfo, StorageState, TabInfo, WheelEvent,
+    PageError, PermissionGrant, PermissionState, ProfileMode, ProxyConfig, RouteMock,
+    ScreenshotFormat, ScreenshotOpts, SessionInfo, StorageState, TabInfo, WheelEvent,
 };
+use crate::env_profile::{build_window_init_script, ProxyRelay};
 use crate::error::{MimikyuError, Result};
+use crate::network::{
+    http_reason_phrase, merge_headers_case_insensitive, BlockPolicy, InterceptDecision,
+    InterceptRequest, NetworkInterceptor, ResourceType, RouteRule, TelemetryConfig, TelemetryStore,
+};
 use crate::process::ProcessGuard;
 
-const MAX_TELEMETRY_ENTRIES: usize = 2048;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const ISOLATED_SANDBOX: &str = "mimikyu_isolated";
 
@@ -55,12 +59,22 @@ impl BrowserDriver for BidiDriver {
         bidi_capabilities()
     }
 
-    async fn launch(&self, opts: LaunchOptions) -> Result<Arc<dyn DriverSession>> {
+    async fn launch(&self, mut opts: LaunchOptions) -> Result<Arc<dyn DriverSession>> {
         if opts.engine != EngineKind::Firefox {
             return Err(MimikyuError::InvalidConfig(format!(
                 "BidiDriver cannot launch engine '{}'",
                 opts.engine
             )));
+        }
+
+        let mut root_relay: Option<ProxyRelay> = None;
+        if let Some(ref proxy) = opts.proxy
+            && proxy.needs_relay()
+        {
+            let relay = ProxyRelay::start(proxy).await?;
+            let rewritten = relay.browser_proxy_config(proxy.bypass.clone());
+            opts.proxy = Some(rewritten);
+            root_relay = Some(relay);
         }
 
         let process = ProcessGuard::launch(&opts).await?;
@@ -70,7 +84,7 @@ impl BrowserDriver for BidiDriver {
         let profile_dir = process.profile_dir().to_path_buf();
         let pid = process.pid();
 
-        let conn = BidiConnection::connect(&ws_session_url, process).await?;
+        let conn = BidiConnection::connect(&ws_session_url, process, root_relay).await?;
 
         let new_sess = conn
             .send(
@@ -179,11 +193,14 @@ impl BrowserDriver for BidiDriver {
             owns_user_context,
             true,
             opts.main_world_eval,
+            opts.telemetry_capacity,
+            None,
         );
 
         session
             .apply_initial_options(
                 opts.env_profile,
+                Vec::new(),
                 opts.block_images,
                 opts.block_media,
                 opts.block_fonts,
@@ -230,8 +247,8 @@ fn resolve_proxy_port(parsed: &url::Url) -> u16 {
     if let Some(port) = parsed.port_or_known_default() {
         return port;
     }
-    match parsed.scheme() {
-        "socks" | "socks4" | "socks5" => 1080,
+    match parsed.scheme().to_ascii_lowercase().as_str() {
+        "socks" | "socks4" | "socks5" | "socks5h" => 1080,
         _ => 8080,
     }
 }
@@ -246,8 +263,8 @@ fn proxy_to_bidi_json(proxy: &ProxyConfig) -> Result<Value> {
     let mut obj = json!({
         "proxyType": "manual",
     });
-    match parsed.scheme() {
-        "socks" | "socks5" => {
+    match parsed.scheme().to_ascii_lowercase().as_str() {
+        "socks" | "socks5" | "socks5h" => {
             obj["socksProxy"] = json!(host_port);
             obj["socksVersion"] = json!(5);
         }
@@ -275,6 +292,7 @@ struct BidiConnection {
     isolated_contexts: RwLock<HashSet<String>>,
     active_targets: RwLock<HashMap<String, String>>,
     process: AsyncMutex<Option<ProcessGuard>>,
+    _root_proxy_relay: Mutex<Option<ProxyRelay>>,
     closed: AtomicBool,
     io_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -324,7 +342,11 @@ impl BidiConnection {
         None
     }
 
-    async fn connect(ws_url: &str, process: ProcessGuard) -> Result<Arc<Self>> {
+    async fn connect(
+        ws_url: &str,
+        process: ProcessGuard,
+        root_proxy_relay: Option<ProxyRelay>,
+    ) -> Result<Arc<Self>> {
         let mut ws_config = WebSocketConfig::default();
         ws_config.max_message_size = Some(128 * 1024 * 1024);
         ws_config.max_frame_size = Some(64 * 1024 * 1024);
@@ -345,6 +367,7 @@ impl BidiConnection {
             isolated_contexts: RwLock::new(HashSet::new()),
             active_targets: RwLock::new(HashMap::new()),
             process: AsyncMutex::new(Some(process)),
+            _root_proxy_relay: Mutex::new(root_proxy_relay),
             closed: AtomicBool::new(false),
             io_tasks: Mutex::new(Vec::new()),
         });
@@ -570,29 +593,87 @@ struct BidiContextState {
     owns_user_context: bool,
     is_root: bool,
     main_world_eval: bool,
-    console_logs: Mutex<VecDeque<ConsoleEntry>>,
-    network_events: Mutex<VecDeque<NetworkEvent>>,
-    pending_requests: Mutex<HashMap<String, NetworkEvent>>,
-    inflight_requests: Mutex<HashSet<String>>,
-    blocked_urls: Mutex<Vec<String>>,
-    route_mocks: Mutex<Vec<RouteMock>>,
+    telemetry_capacity: Option<usize>,
+    telemetry: Arc<TelemetryStore>,
+    interceptor: Mutex<NetworkInterceptor>,
+    env_headers: Mutex<BTreeMap<String, String>>,
+    env_script_id: AsyncMutex<Option<String>>,
+    pending_permissions: Mutex<Vec<PermissionGrant>>,
+    applied_permissions: Mutex<Vec<(String, String)>>,
+    pending_storage_scripts: Mutex<Vec<(String, String)>>,
+    _proxy_relay: Mutex<Option<ProxyRelay>>,
     intercept_id: AsyncMutex<Option<String>>,
     load_notify: Notify,
     disposed: AtomicBool,
 }
 
 impl BidiContextState {
-    fn handle_event(&self, conn: &Arc<BidiConnection>, method: &str, params: Value) {
+    fn handle_event(self: &Arc<Self>, conn: &Arc<BidiConnection>, method: &str, params: Value) {
         match method {
             "browsingContext.load" => {
+                if let Some(u) = params.get("url").and_then(|v| v.as_str())
+                    && let Some(origin) = extract_http_origin(u)
+                {
+                    let to_remove: Vec<String> = {
+                        let mut pending = self.pending_storage_scripts.lock();
+                        let mut matched = Vec::new();
+                        pending.retain(|(orig, sid)| {
+                            if orig == &origin {
+                                matched.push(sid.clone());
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        matched
+                    };
+                    let perms_to_apply: Vec<PermissionGrant> = {
+                        let pending = self.pending_permissions.lock();
+                        pending
+                            .iter()
+                            .filter(|g| {
+                                g.origin.is_none() || g.origin.as_deref() == Some(origin.as_str())
+                            })
+                            .cloned()
+                            .collect()
+                    };
+                    if !to_remove.is_empty() || !perms_to_apply.is_empty() {
+                        let conn_clone = Arc::clone(conn);
+                        let state_clone = Arc::clone(self);
+                        let uc = self.user_context.clone();
+                        let orig_clone = origin.clone();
+                        tokio::spawn(async move {
+                            for sid in to_remove {
+                                let _ = conn_clone
+                                    .send("script.removePreloadScript", json!({ "script": sid }))
+                                    .await;
+                            }
+                            for g in perms_to_apply {
+                                let target_orig = g.origin.as_deref().unwrap_or(&orig_clone);
+                                if send_bidi_permission(
+                                    &conn_clone,
+                                    &g.name,
+                                    g.state,
+                                    target_orig,
+                                    uc.as_deref(),
+                                )
+                                .await
+                                .is_ok()
+                                {
+                                    let mut applied = state_clone.applied_permissions.lock();
+                                    let entry = (g.name, target_orig.to_string());
+                                    if !applied.contains(&entry) {
+                                        applied.push(entry);
+                                    }
+                                }
+                            }
+                        });
+                    }
+                }
                 self.load_notify.notify_waiters();
             }
             "log.entryAdded" => {
-                let level = params
-                    .get("level")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("info")
-                    .to_string();
+                let entry_type = params.get("type").and_then(|v| v.as_str()).unwrap_or("");
                 let text = params
                     .get("text")
                     .and_then(|v| v.as_str())
@@ -602,32 +683,74 @@ impl BidiContextState {
                     .get("timestamp")
                     .and_then(|v| v.as_u64())
                     .unwrap_or_else(now_ms);
-                let frame = params
+                let frames = params
                     .get("stackTrace")
                     .and_then(|st| st.get("callFrames"))
-                    .and_then(|cf| cf.as_array())
-                    .and_then(|arr| arr.first());
-                let url = frame
+                    .and_then(|cf| cf.as_array());
+                let first_frame = frames.and_then(|arr| arr.first());
+                let url = first_frame
                     .and_then(|f| f.get("url"))
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(ToString::to_string);
-                let line = frame
+                let line_raw = first_frame
                     .and_then(|f| f.get("lineNumber"))
                     .and_then(|v| v.as_u64())
                     .map(|n| n as u32);
 
-                let mut logs = self.console_logs.lock();
-                if logs.len() >= MAX_TELEMETRY_ENTRIES {
-                    logs.pop_front();
+                if entry_type == "javascript" {
+                    let column = first_frame
+                        .and_then(|f| f.get("columnNumber"))
+                        .and_then(|v| v.as_u64())
+                        .map(|n| n as u32 + 1);
+                    let stack = frames
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|f| {
+                                    let fn_name = f
+                                        .get("functionName")
+                                        .and_then(|v| v.as_str())
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or("<anonymous>");
+                                    let u = f.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                    let ln =
+                                        f.get("lineNumber").and_then(|v| v.as_u64()).unwrap_or(0)
+                                            + 1;
+                                    let col = f
+                                        .get("columnNumber")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(0)
+                                        + 1;
+                                    format!("    at {fn_name} ({u}:{ln}:{col})")
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        })
+                        .filter(|s| !s.is_empty());
+                    self.telemetry.push_page_error(PageError {
+                        timestamp_ms,
+                        message: text,
+                        name: None,
+                        stack,
+                        url,
+                        line: line_raw.map(|l| l + 1),
+                        column,
+                    });
+                } else {
+                    let level = params
+                        .get("method")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| params.get("level").and_then(|v| v.as_str()))
+                        .unwrap_or("info")
+                        .to_string();
+                    self.telemetry.push_console(ConsoleEntry {
+                        timestamp_ms,
+                        level,
+                        text,
+                        url,
+                        line: line_raw,
+                    });
                 }
-                logs.push_back(ConsoleEntry {
-                    timestamp_ms,
-                    level,
-                    text,
-                    url,
-                    line,
-                });
             }
             "network.beforeRequestSent" => {
                 let req = &params["request"];
@@ -649,29 +772,43 @@ impl BidiContextState {
                     .unwrap_or("GET")
                     .to_string();
                 let request_headers = bidi_headers_to_btree(req.get("headers"));
-                let resource_type = req
+                let destination = req
                     .get("destination")
                     .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("other")
-                    .to_string();
+                    .unwrap_or("");
+                let initiator_type = params
+                    .get("initiator")
+                    .and_then(|i| i.get("type"))
+                    .and_then(|v| v.as_str());
+                let is_navigation = params
+                    .get("navigation")
+                    .and_then(|v| v.as_str())
+                    .is_some();
+                let resource_type_enum =
+                    ResourceType::from_bidi_event(destination, initiator_type, is_navigation);
+                let resource_type_str = if !destination.is_empty() {
+                    destination.to_string()
+                } else {
+                    format!("{resource_type_enum:?}")
+                };
 
-                self.inflight_requests.lock().insert(req_id.clone());
-                self.pending_requests.lock().insert(
-                    req_id.clone(),
+                self.telemetry.on_request_started(
                     NetworkEvent {
                         timestamp_ms: now_ms(),
                         request_id: req_id.clone(),
                         url: url.clone(),
                         method: http_method,
-                        resource_type,
+                        resource_type: resource_type_str,
                         status: None,
                         mime_type: None,
                         failed: false,
                         error_text: None,
-                        request_headers,
+                        request_headers: request_headers.clone(),
                         response_headers: BTreeMap::new(),
                     },
+                    None,
+                    None,
+                    BTreeMap::new(),
                 );
 
                 let is_blocked = params
@@ -679,38 +816,47 @@ impl BidiContextState {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
                 if is_blocked {
-                    let blocked = {
-                        let pats = self.blocked_urls.lock();
-                        pats.iter().any(|p| url_matches_pattern(p, &url))
-                    };
-                    let matched_mock = if blocked {
-                        None
+                    let env_hdrs = self.env_headers.lock().clone();
+                    let base_headers = if env_hdrs.is_empty() {
+                        request_headers
                     } else {
-                        let mocks = self.route_mocks.lock();
-                        mocks
-                            .iter()
-                            .find(|m| url_matches_pattern(&m.url_pattern, &url))
-                            .cloned()
+                        merge_headers_case_insensitive(&request_headers, &env_hdrs)
                     };
+                    let decision = self.interceptor.lock().decide(&InterceptRequest {
+                        url: &url,
+                        resource_type: resource_type_enum,
+                        headers: &base_headers,
+                    });
+                    let has_env_hdrs = !env_hdrs.is_empty();
                     let conn_clone = Arc::clone(conn);
+                    let telem = Arc::clone(&self.telemetry);
+
                     tokio::spawn(async move {
-                        if blocked {
-                            let _ = conn_clone
-                                .send("network.failRequest", json!({ "request": req_id }))
-                                .await;
-                            return;
-                        }
-                        match matched_mock.map(|m| m.action) {
-                            Some(RouteAction::Abort) => {
+                        match decision {
+                            InterceptDecision::Block { reason } => {
+                                telem.on_intercept_resolved_locally(
+                                    &req_id,
+                                    None,
+                                    BTreeMap::new(),
+                                    true,
+                                    Some(reason.to_string()),
+                                );
                                 let _ = conn_clone
                                     .send("network.failRequest", json!({ "request": req_id }))
                                     .await;
                             }
-                            Some(RouteAction::Fulfill {
+                            InterceptDecision::Fulfill {
                                 status,
                                 headers,
                                 body,
-                            }) => {
+                            } => {
+                                telem.on_intercept_resolved_locally(
+                                    &req_id,
+                                    Some(status),
+                                    headers.clone(),
+                                    false,
+                                    None,
+                                );
                                 let hdrs: Vec<Value> = headers
                                     .into_iter()
                                     .map(|(name, value)| {
@@ -723,7 +869,7 @@ impl BidiContextState {
                                 let mut resp_params = json!({
                                     "request": req_id,
                                     "statusCode": status,
-                                    "reasonPhrase": "OK",
+                                    "reasonPhrase": http_reason_phrase(status),
                                     "headers": hdrs,
                                 });
                                 if !body.is_empty() {
@@ -736,27 +882,50 @@ impl BidiContextState {
                                     .send("network.provideResponse", resp_params)
                                     .await;
                             }
-                            Some(RouteAction::ContinueWithHeaders { headers }) => {
-                                let hdrs: Vec<Value> = headers
-                                    .into_iter()
-                                    .map(|(name, value)| {
-                                        json!({
-                                            "name": name,
-                                            "value": { "type": "string", "value": value }
-                                        })
-                                    })
-                                    .collect();
-                                let _ = conn_clone
+                            InterceptDecision::ModifyHeaders { headers } => {
+                                let hdrs = btree_to_bidi_headers(&headers);
+                                if let Err(e) = conn_clone
                                     .send(
                                         "network.continueRequest",
                                         json!({ "request": req_id, "headers": hdrs }),
                                     )
-                                    .await;
+                                    .await
+                                {
+                                    warn!(
+                                        target: "mimikyu::bidi::network",
+                                        "network.continueRequest(ModifyHeaders) failed: {e}"
+                                    );
+                                    let _ = conn_clone
+                                        .send("network.continueRequest", json!({ "request": req_id }))
+                                        .await;
+                                }
                             }
-                            None => {
-                                let _ = conn_clone
-                                    .send("network.continueRequest", json!({ "request": req_id }))
-                                    .await;
+                            InterceptDecision::Continue => {
+                                if has_env_hdrs {
+                                    let hdrs = btree_to_bidi_headers(&base_headers);
+                                    if let Err(e) = conn_clone
+                                        .send(
+                                            "network.continueRequest",
+                                            json!({ "request": req_id, "headers": hdrs }),
+                                        )
+                                        .await
+                                    {
+                                        warn!(
+                                            target: "mimikyu::bidi::network",
+                                            "network.continueRequest(env_headers) failed: {e}"
+                                        );
+                                        let _ = conn_clone
+                                            .send(
+                                                "network.continueRequest",
+                                                json!({ "request": req_id }),
+                                            )
+                                            .await;
+                                    }
+                                } else {
+                                    let _ = conn_clone
+                                        .send("network.continueRequest", json!({ "request": req_id }))
+                                        .await;
+                                }
                             }
                         }
                     });
@@ -766,45 +935,32 @@ impl BidiContextState {
                 let Some(req_id) = params["request"]["request"].as_str() else {
                     return;
                 };
-                self.inflight_requests.lock().remove(req_id);
                 let resp = &params["response"];
-                if let Some(mut ev) = self.pending_requests.lock().remove(req_id) {
-                    ev.status = resp
-                        .get("status")
-                        .and_then(|v| v.as_u64())
-                        .map(|s| s as u16);
-                    ev.mime_type = resp
-                        .get("mimeType")
-                        .and_then(|v| v.as_str())
-                        .map(ToString::to_string);
-                    ev.response_headers = bidi_headers_to_btree(resp.get("headers"));
-                    self.push_network_event(ev);
-                }
+                let status = resp
+                    .get("status")
+                    .and_then(|v| v.as_u64())
+                    .map(|s| s as u16);
+                let mime_type = resp
+                    .get("mimeType")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let response_headers = bidi_headers_to_btree(resp.get("headers"));
+                self.telemetry
+                    .on_response_received(req_id, status, mime_type, response_headers);
+                self.telemetry.on_request_finished(req_id);
             }
             "network.fetchError" => {
                 let Some(req_id) = params["request"]["request"].as_str() else {
                     return;
                 };
-                self.inflight_requests.lock().remove(req_id);
-                if let Some(mut ev) = self.pending_requests.lock().remove(req_id) {
-                    ev.failed = true;
-                    ev.error_text = params
-                        .get("errorText")
-                        .and_then(|v| v.as_str())
-                        .map(ToString::to_string);
-                    self.push_network_event(ev);
-                }
+                let error_text = params
+                    .get("errorText")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                self.telemetry.on_request_failed(req_id, error_text);
             }
             _ => {}
         }
-    }
-
-    fn push_network_event(&self, ev: NetworkEvent) {
-        let mut events = self.network_events.lock();
-        if events.len() >= MAX_TELEMETRY_ENTRIES {
-            events.pop_front();
-        }
-        events.push_back(ev);
     }
 }
 
@@ -815,6 +971,7 @@ pub struct BidiSession {
 }
 
 impl BidiSession {
+    #[allow(clippy::too_many_arguments)]
     fn create(
         conn: Arc<BidiConnection>,
         info: SessionInfo,
@@ -822,18 +979,26 @@ impl BidiSession {
         owns_user_context: bool,
         is_root: bool,
         main_world_eval: bool,
+        telemetry_capacity: Option<usize>,
+        proxy_relay: Option<ProxyRelay>,
     ) -> Arc<Self> {
+        let telem_cfg = telemetry_capacity
+            .map(TelemetryConfig::with_capacity)
+            .unwrap_or_default();
         let state = Arc::new(BidiContextState {
             user_context,
             owns_user_context,
             is_root,
             main_world_eval,
-            console_logs: Mutex::new(VecDeque::with_capacity(128)),
-            network_events: Mutex::new(VecDeque::with_capacity(256)),
-            pending_requests: Mutex::new(HashMap::new()),
-            inflight_requests: Mutex::new(HashSet::new()),
-            blocked_urls: Mutex::new(Vec::new()),
-            route_mocks: Mutex::new(Vec::new()),
+            telemetry_capacity,
+            telemetry: Arc::new(TelemetryStore::new(telem_cfg)),
+            interceptor: Mutex::new(NetworkInterceptor::default()),
+            env_headers: Mutex::new(BTreeMap::new()),
+            env_script_id: AsyncMutex::new(None),
+            pending_permissions: Mutex::new(Vec::new()),
+            applied_permissions: Mutex::new(Vec::new()),
+            pending_storage_scripts: Mutex::new(Vec::new()),
+            _proxy_relay: Mutex::new(proxy_relay),
             intercept_id: AsyncMutex::new(None),
             load_notify: Notify::new(),
             disposed: AtomicBool::new(false),
@@ -849,6 +1014,7 @@ impl BidiSession {
     async fn apply_initial_options(
         &self,
         env_profile: Option<EnvProfile>,
+        permissions: Vec<PermissionGrant>,
         block_images: bool,
         block_media: bool,
         block_fonts: bool,
@@ -857,28 +1023,16 @@ impl BidiSession {
         if let Some(profile) = env_profile {
             self.set_env_overrides(profile).await?;
         }
+        if !permissions.is_empty() {
+            self.set_permissions(permissions).await?;
+        }
 
-        let mut blocked = Vec::new();
-        if block_images {
-            for ext in ["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "avif"] {
-                blocked.push(format!("*.{ext}"));
-                blocked.push(format!("*.{ext}?*"));
-            }
-        }
-        if block_media {
-            for ext in ["mp4", "webm", "ogg", "mp3", "wav", "m3u8", "mpd"] {
-                blocked.push(format!("*.{ext}"));
-                blocked.push(format!("*.{ext}?*"));
-            }
-        }
-        if block_fonts {
-            for ext in ["woff", "woff2", "ttf", "otf", "eot"] {
-                blocked.push(format!("*.{ext}"));
-                blocked.push(format!("*.{ext}?*"));
-            }
-        }
-        if !blocked.is_empty() {
-            self.set_blocked_urls(blocked).await?;
+        if block_images || block_media || block_fonts {
+            self.state
+                .interceptor
+                .lock()
+                .set_categories(block_images, block_media, block_fonts);
+            self.sync_intercept().await?;
         }
         if instant_animations {
             let _ = self.set_instant_animations(true).await;
@@ -898,8 +1052,8 @@ impl BidiSession {
     }
 
     async fn sync_intercept(&self) -> Result<()> {
-        let need_intercept =
-            !self.state.blocked_urls.lock().is_empty() || !self.state.route_mocks.lock().is_empty();
+        let need_intercept = self.state.interceptor.lock().needs_bidi_intercept()
+            || !self.state.env_headers.lock().is_empty();
         let mut guard = self.state.intercept_id.lock().await;
 
         if need_intercept && guard.is_none() {
@@ -937,14 +1091,7 @@ impl BidiSession {
     async fn collect_nav_info(&self) -> Result<NavInfo> {
         let url = self.current_url().await?;
         let title = self.title().await.unwrap_or_default();
-        let status = {
-            let events = self.state.network_events.lock();
-            events
-                .iter()
-                .rev()
-                .find(|ev| ev.url == url && ev.status.is_some())
-                .and_then(|ev| ev.status)
-        };
+        let status = self.state.telemetry.find_latest_status_for_url(&url);
         Ok(NavInfo {
             url,
             title,
@@ -1047,8 +1194,17 @@ impl DriverSession for BidiSession {
         bidi_capabilities()
     }
 
-    async fn new_context(&self, opts: ContextOptions) -> Result<Arc<dyn DriverSession>> {
+    async fn new_context(&self, mut opts: ContextOptions) -> Result<Arc<dyn DriverSession>> {
         self.ensure_alive()?;
+        let mut relay_opt: Option<ProxyRelay> = None;
+        if let Some(ref proxy) = opts.proxy
+            && proxy.needs_relay()
+        {
+            let relay = ProxyRelay::start(proxy).await?;
+            let rewritten = relay.browser_proxy_config(proxy.bypass.clone());
+            opts.proxy = Some(rewritten);
+            relay_opt = Some(relay);
+        }
         let uc = create_user_context(&self.conn, opts.proxy.as_ref()).await?;
         self.conn.isolated_contexts.write().insert(uc.clone());
         let created = self
@@ -1081,11 +1237,14 @@ impl DriverSession for BidiSession {
             true,
             false,
             opts.main_world_eval,
+            opts.telemetry_capacity,
+            relay_opt,
         );
 
         session
             .apply_initial_options(
                 opts.env_profile,
+                opts.permissions,
                 opts.block_images,
                 opts.block_media,
                 opts.block_fonts,
@@ -1121,6 +1280,8 @@ impl DriverSession for BidiSession {
             false,
             false,
             self.state.main_world_eval,
+            self.state.telemetry_capacity,
+            None,
         );
         self.conn
             .set_active_target(self.state.user_context.as_deref(), &target_id);
@@ -1212,6 +1373,30 @@ impl DriverSession for BidiSession {
 
     async fn navigate(&self, url: &str) -> Result<NavInfo> {
         self.ensure_alive()?;
+        if let Some(origin) = extract_http_origin(url) {
+            let pending = { self.state.pending_permissions.lock().clone() };
+            for g in pending {
+                if g.origin.is_none() || g.origin.as_deref() == Some(origin.as_str()) {
+                    let target_orig = g.origin.as_deref().unwrap_or(&origin);
+                    if send_bidi_permission(
+                        &self.conn,
+                        &g.name,
+                        g.state,
+                        target_orig,
+                        self.state.user_context.as_deref(),
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        let mut applied = self.state.applied_permissions.lock();
+                        let entry = (g.name, target_orig.to_string());
+                        if !applied.contains(&entry) {
+                            applied.push(entry);
+                        }
+                    }
+                }
+            }
+        }
         self.conn
             .send(
                 "browsingContext.navigate",
@@ -1896,44 +2081,156 @@ impl DriverSession for BidiSession {
                 )
                 .await?;
         }
+
+        let win_script = build_window_init_script(&profile, EngineKind::Firefox);
+        {
+            let mut prev = self.state.env_script_id.lock().await;
+            if let Some(old_id) = prev.take() {
+                let _ = self.remove_init_script(&old_id).await;
+            }
+            let new_id = self.add_init_script(&win_script).await?;
+            *prev = Some(new_id);
+        }
+
+        {
+            let mut hdrs = BTreeMap::new();
+            if !profile.user_agent.is_empty() {
+                hdrs.insert("User-Agent".to_string(), profile.user_agent.clone());
+            }
+            if !profile.accept_language.is_empty() {
+                hdrs.insert(
+                    "Accept-Language".to_string(),
+                    profile.accept_language.clone(),
+                );
+            }
+            if !profile.extra_headers.is_empty() {
+                hdrs = merge_headers_case_insensitive(&hdrs, &profile.extra_headers);
+            }
+            *self.state.env_headers.lock() = hdrs;
+        }
+        self.sync_intercept().await?;
+
+        if profile.geolocation.is_some() {
+            let _ = self
+                .set_permissions(vec![PermissionGrant {
+                    name: "geolocation".to_string(),
+                    state: PermissionState::Granted,
+                    origin: None,
+                }])
+                .await;
+        }
+
         Ok(())
+    }
+
+    async fn set_permissions(&self, permissions: Vec<PermissionGrant>) -> Result<()> {
+        self.ensure_alive()?;
+        let current_origin = self
+            .current_url()
+            .await
+            .ok()
+            .and_then(|u| extract_http_origin(&u));
+
+        for g in permissions {
+            if let Some(ref orig) = g.origin {
+                send_bidi_permission(
+                    &self.conn,
+                    &g.name,
+                    g.state,
+                    orig,
+                    self.state.user_context.as_deref(),
+                )
+                .await?;
+                let mut applied = self.state.applied_permissions.lock();
+                let entry = (g.name.clone(), orig.clone());
+                if !applied.contains(&entry) {
+                    applied.push(entry);
+                }
+            } else {
+                {
+                    let mut pending = self.state.pending_permissions.lock();
+                    pending.retain(|p| p.name != g.name || p.origin.is_some());
+                    pending.push(g.clone());
+                }
+                if let Some(ref cur_orig) = current_origin {
+                    send_bidi_permission(
+                        &self.conn,
+                        &g.name,
+                        g.state,
+                        cur_orig,
+                        self.state.user_context.as_deref(),
+                    )
+                    .await?;
+                    let mut applied = self.state.applied_permissions.lock();
+                    let entry = (g.name.clone(), cur_orig.clone());
+                    if !applied.contains(&entry) {
+                        applied.push(entry);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn reset_permissions(&self) -> Result<()> {
+        self.ensure_alive()?;
+        self.state.pending_permissions.lock().clear();
+        let applied: Vec<(String, String)> = {
+            let mut guard = self.state.applied_permissions.lock();
+            guard.drain(..).collect()
+        };
+        for (name, origin) in applied {
+            let _ = send_bidi_permission(
+                &self.conn,
+                &name,
+                PermissionState::Prompt,
+                &origin,
+                self.state.user_context.as_deref(),
+            )
+            .await;
+        }
+        Ok(())
+    }
+
+    async fn set_block_policy(&self, policy: BlockPolicy) -> Result<()> {
+        self.ensure_alive()?;
+        self.state.interceptor.lock().set_block_policy(policy)?;
+        self.sync_intercept().await
     }
 
     async fn set_blocked_urls(&self, patterns: Vec<String>) -> Result<()> {
         self.ensure_alive()?;
-        *self.state.blocked_urls.lock() = patterns;
+        self.state.interceptor.lock().set_blocked_urls(patterns)?;
         self.sync_intercept().await
     }
 
     async fn set_route_mock(&self, mock: RouteMock) -> Result<()> {
         self.ensure_alive()?;
-        {
-            let mut mocks = self.state.route_mocks.lock();
-            mocks.retain(|m| m.id != mock.id);
-            mocks.push(mock);
-        }
+        self.state.interceptor.lock().add_mock(mock)?;
+        self.sync_intercept().await
+    }
+
+    async fn set_route_rule(&self, rule: RouteRule) -> Result<()> {
+        self.ensure_alive()?;
+        self.state.interceptor.lock().add_rule(rule)?;
         self.sync_intercept().await
     }
 
     async fn clear_route_mocks(&self) -> Result<()> {
         self.ensure_alive()?;
-        self.state.route_mocks.lock().clear();
+        self.state.interceptor.lock().clear_rules();
         self.sync_intercept().await
     }
 
     async fn cookies(&self) -> Result<Vec<Cookie>> {
         self.ensure_alive()?;
+        let partition = match self.state.user_context {
+            Some(ref uc) => json!({ "type": "storageKey", "userContext": uc }),
+            None => json!({ "type": "storageKey" }),
+        };
         let res = self
             .conn
-            .send(
-                "storage.getCookies",
-                json!({
-                    "partition": {
-                        "type": "context",
-                        "context": self.ctx(),
-                    }
-                }),
-            )
+            .send("storage.getCookies", json!({ "partition": partition }))
             .await?;
         let arr = res["cookies"].as_array().cloned().unwrap_or_default();
         Ok(arr
@@ -1971,18 +2268,19 @@ impl DriverSession for BidiSession {
             {
                 cookie_obj["expiry"] = json!(exp as u64);
             }
-            if let Some(ss) = c.same_site {
-                cookie_obj["sameSite"] = json!(ss.to_ascii_lowercase());
+            if let Some(ss) = c.same_site.as_deref().and_then(normalize_bidi_same_site) {
+                cookie_obj["sameSite"] = json!(ss);
             }
+            let partition = match self.state.user_context {
+                Some(ref uc) => json!({ "type": "storageKey", "userContext": uc }),
+                None => json!({ "type": "storageKey" }),
+            };
             self.conn
                 .send(
                     "storage.setCookie",
                     json!({
                         "cookie": cookie_obj,
-                        "partition": {
-                            "type": "context",
-                            "context": self.ctx(),
-                        }
+                        "partition": partition,
                     }),
                 )
                 .await?;
@@ -1992,16 +2290,12 @@ impl DriverSession for BidiSession {
 
     async fn clear_cookies(&self) -> Result<()> {
         self.ensure_alive()?;
+        let partition = match self.state.user_context {
+            Some(ref uc) => json!({ "type": "storageKey", "userContext": uc }),
+            None => json!({ "type": "storageKey" }),
+        };
         self.conn
-            .send(
-                "storage.deleteCookies",
-                json!({
-                    "partition": {
-                        "type": "context",
-                        "context": self.ctx(),
-                    }
-                }),
-            )
+            .send("storage.deleteCookies", json!({ "partition": partition }))
             .await?;
         Ok(())
     }
@@ -2057,21 +2351,40 @@ impl DriverSession for BidiSession {
             .ok()
             .and_then(|v| v.as_str().map(ToString::to_string));
 
-        if let Some(cur) = current_origin {
-            for entry in state.origins {
-                if entry.origin == cur {
-                    let ls_json = serde_json::to_string(&entry.local_storage)?;
-                    let ss_json = serde_json::to_string(&entry.session_storage)?;
-                    let script = format!(
-                        r#"(() => {{
-                            const ls = {ls_json};
-                            for (const [k, v] of Object.entries(ls)) localStorage.setItem(k, v);
-                            const ss = {ss_json};
-                            for (const [k, v] of Object.entries(ss)) sessionStorage.setItem(k, v);
-                        }})()"#
-                    );
-                    self.eval_isolated(&script).await?;
-                }
+        for entry in state.origins {
+            if entry.local_storage.is_empty() && entry.session_storage.is_empty() {
+                continue;
+            }
+            let ls_json = serde_json::to_string(&entry.local_storage)?;
+            let ss_json = serde_json::to_string(&entry.session_storage)?;
+            if current_origin.as_deref() == Some(entry.origin.as_str())
+                && entry.origin != "null"
+            {
+                let script = format!(
+                    r#"(() => {{
+                        const ls = {ls_json};
+                        for (const [k, v] of Object.entries(ls)) localStorage.setItem(k, v);
+                        const ss = {ss_json};
+                        for (const [k, v] of Object.entries(ss)) sessionStorage.setItem(k, v);
+                    }})()"#
+                );
+                self.eval_isolated(&script).await?;
+            } else {
+                let origin_json = serde_json::to_string(&entry.origin)?;
+                let preload = format!(
+                    r#"(() => {{
+                        if (window.location.origin !== {origin_json}) return;
+                        const ls = {ls_json};
+                        for (const [k, v] of Object.entries(ls)) localStorage.setItem(k, v);
+                        const ss = {ss_json};
+                        for (const [k, v] of Object.entries(ss)) sessionStorage.setItem(k, v);
+                    }})()"#
+                );
+                let sid = self.add_init_script(&preload).await?;
+                self.state
+                    .pending_storage_scripts
+                    .lock()
+                    .push((entry.origin, sid));
             }
         }
         Ok(())
@@ -2079,20 +2392,43 @@ impl DriverSession for BidiSession {
 
     async fn console_logs(&self) -> Result<Vec<ConsoleEntry>> {
         self.ensure_alive()?;
-        Ok(self.state.console_logs.lock().iter().cloned().collect())
+        Ok(self.state.telemetry.snapshot_console())
+    }
+
+    async fn page_errors(&self) -> Result<Vec<PageError>> {
+        self.ensure_alive()?;
+        Ok(self.state.telemetry.snapshot_page_errors())
     }
 
     async fn network_events(&self) -> Result<Vec<NetworkEvent>> {
         self.ensure_alive()?;
-        let mut out: Vec<NetworkEvent> =
-            self.state.network_events.lock().iter().cloned().collect();
-        out.extend(self.state.pending_requests.lock().values().cloned());
-        Ok(out)
+        Ok(self.state.telemetry.snapshot_network())
+    }
+
+    async fn drain_console_logs(&self) -> Result<Vec<ConsoleEntry>> {
+        self.ensure_alive()?;
+        Ok(self.state.telemetry.drain_console())
+    }
+
+    async fn drain_page_errors(&self) -> Result<Vec<PageError>> {
+        self.ensure_alive()?;
+        Ok(self.state.telemetry.drain_page_errors())
+    }
+
+    async fn drain_network_events(&self) -> Result<Vec<NetworkEvent>> {
+        self.ensure_alive()?;
+        Ok(self.state.telemetry.drain_network())
+    }
+
+    async fn clear_telemetry(&self) -> Result<()> {
+        self.ensure_alive()?;
+        self.state.telemetry.clear();
+        Ok(())
     }
 
     async fn inflight_requests(&self) -> Result<usize> {
         self.ensure_alive()?;
-        Ok(self.state.inflight_requests.lock().len())
+        Ok(self.state.telemetry.inflight_count())
     }
 
     async fn document_ready_state(&self) -> Result<String> {
@@ -2108,6 +2444,34 @@ impl DriverSession for BidiSession {
 
         if self.state.is_root {
             self.conn.shutdown_all().await;
+        } else if self.state.owns_user_context
+            && let Some(ref uc) = self.state.user_context
+        {
+            let mut removed_cids = Vec::new();
+            self.conn.contexts.write().retain(|cid, st| {
+                if st.user_context.as_deref() == Some(uc.as_str()) {
+                    st.disposed.store(true, Ordering::SeqCst);
+                    removed_cids.push(cid.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if !removed_cids.is_empty() {
+                let mut parents = self.conn.context_parents.write();
+                parents.retain(|cid, parent| {
+                    !removed_cids.contains(cid) && !removed_cids.contains(parent)
+                });
+            }
+            self.conn.isolated_contexts.write().remove(uc);
+            self.conn
+                .active_targets
+                .write()
+                .remove(&context_scope_key(Some(uc)));
+            let _ = self
+                .conn
+                .send("browser.removeUserContext", json!({ "userContext": uc }))
+                .await;
         } else {
             self.conn
                 .clear_active_target_if_matches(self.state.user_context.as_deref(), self.ctx());
@@ -2115,22 +2479,58 @@ impl DriverSession for BidiSession {
                 .conn
                 .send("browsingContext.close", json!({ "context": self.ctx() }))
                 .await;
-            if self.state.owns_user_context
-                && let Some(ref uc) = self.state.user_context
-            {
-                self.conn.isolated_contexts.write().remove(uc);
-                self.conn
-                    .active_targets
-                    .write()
-                    .remove(&context_scope_key(Some(uc)));
-                let _ = self
-                    .conn
-                    .send("browser.removeUserContext", json!({ "userContext": uc }))
-                    .await;
-            }
         }
         Ok(())
     }
+}
+
+fn extract_http_origin(raw_url: &str) -> Option<String> {
+    let parsed = url::Url::parse(raw_url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let orig = parsed.origin().ascii_serialization();
+    if orig == "null" {
+        None
+    } else {
+        Some(orig)
+    }
+}
+
+async fn send_bidi_permission(
+    conn: &BidiConnection,
+    name: &str,
+    state: PermissionState,
+    origin: &str,
+    user_context: Option<&str>,
+) -> Result<()> {
+    let state_str = match state {
+        PermissionState::Granted => "granted",
+        PermissionState::Denied => "denied",
+        PermissionState::Prompt => "prompt",
+    };
+    let mut params = json!({
+        "descriptor": { "name": name },
+        "state": state_str,
+        "origin": origin,
+    });
+    if let Some(uc) = user_context {
+        params["userContext"] = json!(uc);
+    }
+    conn.send("permissions.setPermission", params).await?;
+    Ok(())
+}
+
+fn btree_to_bidi_headers(headers: &BTreeMap<String, String>) -> Vec<Value> {
+    headers
+        .iter()
+        .map(|(name, value)| {
+            json!({
+                "name": name,
+                "value": { "type": "string", "value": value }
+            })
+        })
+        .collect()
 }
 
 fn parse_bidi_script_result(res: &Value) -> Result<Value> {
@@ -2261,9 +2661,28 @@ fn map_webdriver_key(key: &str) -> String {
     }
 }
 
+fn normalize_bidi_same_site(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "strict" => Some("strict"),
+        "lax" => Some("lax"),
+        "none" => Some("none"),
+        "default" => Some("default"),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_bidi_same_site_validates_known_values() {
+        assert_eq!(normalize_bidi_same_site("Strict"), Some("strict"));
+        assert_eq!(normalize_bidi_same_site(" LAX "), Some("lax"));
+        assert_eq!(normalize_bidi_same_site("none"), Some("none"));
+        assert_eq!(normalize_bidi_same_site("Default"), Some("default"));
+        assert_eq!(normalize_bidi_same_site("bogus"), None);
+    }
 
     #[test]
     fn map_webdriver_key_covers_function_navigation_and_printable_keys() {

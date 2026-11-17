@@ -60,6 +60,40 @@ pub struct ProxyConfig {
     pub bypass: Vec<String>,
 }
 
+impl ProxyConfig {
+    /// Returns true if the proxy carries credentials requiring the local `ProxyRelay`.
+    pub fn needs_relay(&self) -> bool {
+        if self
+            .username
+            .as_deref()
+            .is_some_and(|u| !u.trim().is_empty())
+            || self.password.is_some()
+        {
+            return true;
+        }
+        if let Ok(parsed) = url::Url::parse(&self.server) {
+            return !parsed.username().is_empty() || parsed.password().is_some();
+        }
+        false
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionState {
+    Granted,
+    Denied,
+    Prompt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionGrant {
+    pub name: String,
+    pub state: PermissionState,
+    #[serde(default)]
+    pub origin: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum WebRtcPolicy {
@@ -117,6 +151,10 @@ pub struct EnvProfile {
     pub webgl_vendor: Option<String>,
     pub webgl_renderer: Option<String>,
     pub audio_sample_rate: Option<u32>,
+    #[serde(default)]
+    pub audio_base_latency: Option<f64>,
+    #[serde(default)]
+    pub audio_channel_count: Option<u32>,
     pub geolocation: Option<GeolocationConfig>,
     pub webrtc_policy: WebRtcPolicy,
     #[serde(default)]
@@ -146,6 +184,8 @@ impl Default for EnvProfile {
             webgl_vendor: None,
             webgl_renderer: None,
             audio_sample_rate: None,
+            audio_base_latency: None,
+            audio_channel_count: None,
             geolocation: None,
             webrtc_policy: WebRtcPolicy::Default,
             extra_headers: BTreeMap::new(),
@@ -171,6 +211,8 @@ pub struct LaunchOptions {
     pub extra_args: Vec<String>,
     #[serde(default)]
     pub extra_prefs: BTreeMap<String, Value>,
+    #[serde(default)]
+    pub telemetry_capacity: Option<usize>,
 }
 
 impl Default for LaunchOptions {
@@ -190,6 +232,7 @@ impl Default for LaunchOptions {
             launch_timeout_ms: 15_000,
             extra_args: Vec::new(),
             extra_prefs: BTreeMap::new(),
+            telemetry_capacity: None,
         }
     }
 }
@@ -203,6 +246,10 @@ pub struct ContextOptions {
     pub block_fonts: bool,
     pub instant_animations: bool,
     pub main_world_eval: bool,
+    #[serde(default)]
+    pub permissions: Vec<PermissionGrant>,
+    #[serde(default)]
+    pub telemetry_capacity: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -364,6 +411,7 @@ pub struct ScreenshotOpts {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RouteAction {
     Abort,
+    Continue,
     Fulfill {
         status: u16,
         headers: BTreeMap<String, String>,
@@ -413,6 +461,17 @@ pub struct ConsoleEntry {
     pub text: String,
     pub url: Option<String>,
     pub line: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PageError {
+    pub timestamp_ms: u64,
+    pub message: String,
+    pub name: Option<String>,
+    pub stack: Option<String>,
+    pub url: Option<String>,
+    pub line: Option<u32>,
+    pub column: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -489,10 +548,14 @@ pub trait DriverSession: Send + Sync {
     async fn pdf(&self) -> Result<Vec<u8>>;
     async fn set_instant_animations(&self, enabled: bool) -> Result<()>;
 
-    // Environment & Network Control (M2)
+    // Environment, Permissions & Network Control (M2)
     async fn set_env_overrides(&self, profile: EnvProfile) -> Result<()>;
+    async fn set_permissions(&self, permissions: Vec<PermissionGrant>) -> Result<()>;
+    async fn reset_permissions(&self) -> Result<()>;
+    async fn set_block_policy(&self, policy: crate::network::BlockPolicy) -> Result<()>;
     async fn set_blocked_urls(&self, patterns: Vec<String>) -> Result<()>;
     async fn set_route_mock(&self, mock: RouteMock) -> Result<()>;
+    async fn set_route_rule(&self, rule: crate::network::RouteRule) -> Result<()>;
     async fn clear_route_mocks(&self) -> Result<()>;
 
     // Cookies & Storage (M2)
@@ -504,7 +567,12 @@ pub trait DriverSession: Send + Sync {
 
     // Telemetry & Wait Helpers (M2/M3)
     async fn console_logs(&self) -> Result<Vec<ConsoleEntry>>;
+    async fn page_errors(&self) -> Result<Vec<PageError>>;
     async fn network_events(&self) -> Result<Vec<NetworkEvent>>;
+    async fn drain_console_logs(&self) -> Result<Vec<ConsoleEntry>>;
+    async fn drain_page_errors(&self) -> Result<Vec<PageError>>;
+    async fn drain_network_events(&self) -> Result<Vec<NetworkEvent>>;
+    async fn clear_telemetry(&self) -> Result<()>;
     async fn inflight_requests(&self) -> Result<usize>;
     async fn document_ready_state(&self) -> Result<String>;
 
@@ -527,38 +595,12 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 /// Simple glob/substring matcher (`*` matches any sequence of characters, `?` matches one char).
-/// If `pattern` contains no `*` or `?`, falls back to substring containment.
+/// Delegates to `crate::network::UrlPattern` (also supporting `exact:`, `prefix:`, `regex:`).
+#[allow(dead_code)]
 pub(crate) fn url_matches_pattern(pattern: &str, url: &str) -> bool {
-    if !pattern.contains('*') && !pattern.contains('?') {
-        return url.contains(pattern);
-    }
-    wildcard_match(pattern.as_bytes(), url.as_bytes())
-}
-
-fn wildcard_match(pat: &[u8], text: &[u8]) -> bool {
-    let (mut p, mut t) = (0usize, 0usize);
-    let (mut star_p, mut star_t) = (None, 0usize);
-
-    while t < text.len() {
-        if p < pat.len() && (pat[p] == b'?' || pat[p] == text[t]) {
-            p += 1;
-            t += 1;
-        } else if p < pat.len() && pat[p] == b'*' {
-            star_p = Some(p);
-            star_t = t;
-            p += 1;
-        } else if let Some(sp) = star_p {
-            p = sp + 1;
-            star_t += 1;
-            t = star_t;
-        } else {
-            return false;
-        }
-    }
-    while p < pat.len() && pat[p] == b'*' {
-        p += 1;
-    }
-    p == pat.len()
+    crate::network::UrlPattern::parse(pattern)
+        .map(|p| p.matches(url))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

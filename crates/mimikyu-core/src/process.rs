@@ -5,15 +5,15 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
-use tempfile::TempDir;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::discovery::{discover_browser, ChromiumFlavor, DiscoveredBrowser};
-use crate::driver::{EngineKind, LaunchOptions, ProfileMode};
+use crate::driver::{EngineKind, LaunchOptions, ProfileMode, WebRtcPolicy};
 use crate::error::{MimikyuError, Result};
+use crate::isolation::{EphemeralDir, ProfileLock};
 
 /// Owned browser child process isolated in its own POSIX process group (`setpgid(0, 0)`).
 ///
@@ -26,7 +26,8 @@ pub struct ProcessGuard {
     browser_version: String,
     ws_endpoint: String,
     profile_dir: PathBuf,
-    ephemeral_dir: Option<TempDir>,
+    ephemeral_dir: Option<EphemeralDir>,
+    profile_lock: Option<ProfileLock>,
     child: Option<Child>,
     stderr_drain: Option<JoinHandle<()>>,
     reaped: bool,
@@ -64,26 +65,26 @@ impl ProcessGuard {
         let browser =
             discover_browser(opts.engine, opts.headless, opts.binary_path.as_deref())?;
 
-        let (profile_dir, ephemeral_dir) = match &opts.profile_mode {
+        let (profile_dir, ephemeral_dir, profile_lock) = match &opts.profile_mode {
             ProfileMode::EphemeralDir | ProfileMode::VirtualContext => {
-                let temp = tempfile::Builder::new()
-                    .prefix("mimikyu-profile-")
-                    .tempdir()?;
-                let p = temp.path().to_path_buf();
-                (p, Some(temp))
+                let dir = EphemeralDir::new()?;
+                let p = dir.path().to_path_buf();
+                (p, Some(dir), None)
             }
             ProfileMode::Persistent(path) => {
-                fs::create_dir_all(path)?;
-                (path.clone(), None)
+                let lock = ProfileLock::try_acquire(path)?;
+                (path.clone(), None, Some(lock))
             }
         };
 
         match opts.engine {
             EngineKind::Chromium => {
-                Self::launch_chromium(&browser, opts, profile_dir, ephemeral_dir).await
+                Self::launch_chromium(&browser, opts, profile_dir, ephemeral_dir, profile_lock)
+                    .await
             }
             EngineKind::Firefox => {
-                Self::launch_firefox(&browser, opts, profile_dir, ephemeral_dir).await
+                Self::launch_firefox(&browser, opts, profile_dir, ephemeral_dir, profile_lock)
+                    .await
             }
         }
     }
@@ -92,7 +93,8 @@ impl ProcessGuard {
         browser: &DiscoveredBrowser,
         opts: &LaunchOptions,
         profile_dir: PathBuf,
-        ephemeral_dir: Option<TempDir>,
+        ephemeral_dir: Option<EphemeralDir>,
+        profile_lock: Option<ProfileLock>,
     ) -> Result<Self> {
         let mut args = build_chromium_args(browser, opts, &profile_dir);
         args.extend(opts.extra_args.iter().cloned());
@@ -139,6 +141,7 @@ impl ProcessGuard {
             ws_endpoint: String::new(),
             profile_dir: profile_dir.clone(),
             ephemeral_dir,
+            profile_lock,
             child: Some(child),
             stderr_drain: None,
             reaped: false,
@@ -161,7 +164,8 @@ impl ProcessGuard {
         browser: &DiscoveredBrowser,
         opts: &LaunchOptions,
         profile_dir: PathBuf,
-        ephemeral_dir: Option<TempDir>,
+        ephemeral_dir: Option<EphemeralDir>,
+        profile_lock: Option<ProfileLock>,
     ) -> Result<Self> {
         write_firefox_user_js(&profile_dir, opts)?;
         remove_stale_marker(&profile_dir.join("WebDriverBiDiServer.json"))?;
@@ -183,6 +187,13 @@ impl ProcessGuard {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(false);
+
+        if opts.profile_mode != ProfileMode::VirtualContext
+            && let Some(ref env) = opts.env_profile
+            && !env.timezone.is_empty()
+        {
+            cmd.env("TZ", &env.timezone);
+        }
 
         unsafe {
             cmd.pre_exec(|| {
@@ -216,6 +227,7 @@ impl ProcessGuard {
             ws_endpoint: String::new(),
             profile_dir: profile_dir.clone(),
             ephemeral_dir,
+            profile_lock,
             child: Some(child),
             stderr_drain: None,
             reaped: false,
@@ -239,6 +251,7 @@ impl ProcessGuard {
     pub async fn shutdown(&mut self, grace_timeout: Duration) -> Result<()> {
         if self.reaped {
             drop(self.ephemeral_dir.take());
+            drop(self.profile_lock.take());
             return Ok(());
         }
 
@@ -258,6 +271,7 @@ impl ProcessGuard {
                 }
                 self.reaped = true;
                 drop(self.ephemeral_dir.take());
+                drop(self.profile_lock.take());
                 return Ok(());
             }
 
@@ -279,6 +293,7 @@ impl ProcessGuard {
                 }
                 self.reaped = true;
                 drop(self.ephemeral_dir.take());
+                drop(self.profile_lock.take());
                 return Ok(());
             }
         }
@@ -299,6 +314,7 @@ impl ProcessGuard {
         wait_for_pgid_gone(self.pgid, Duration::from_millis(500)).await;
         self.reaped = true;
         drop(self.ephemeral_dir.take());
+        drop(self.profile_lock.take());
         Ok(())
     }
 }
@@ -310,6 +326,7 @@ impl Drop for ProcessGuard {
         }
         if self.reaped {
             drop(self.ephemeral_dir.take());
+            drop(self.profile_lock.take());
             return;
         }
 
@@ -337,6 +354,7 @@ impl Drop for ProcessGuard {
             if main_exited && is_pgid_gone(self.pgid) {
                 self.reaped = true;
                 drop(self.ephemeral_dir.take());
+                drop(self.profile_lock.take());
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -372,6 +390,7 @@ impl Drop for ProcessGuard {
 
         self.reaped = true;
         drop(self.ephemeral_dir.take());
+        drop(self.profile_lock.take());
     }
 }
 
@@ -441,22 +460,56 @@ pub fn build_chromium_args(
         args.push("--headless=new".to_string());
     }
 
-    if let Some(ref env) = opts.env_profile
-        && env.disable_automation_controlled
-    {
-        args.push("--disable-blink-features=AutomationControlled".to_string());
+    if let Some(ref env) = opts.env_profile {
+        if env.disable_automation_controlled {
+            args.push("--disable-blink-features=AutomationControlled".to_string());
+        }
+        if !env.locale.is_empty() {
+            args.push(format!("--lang={}", env.locale));
+        }
+        match env.webrtc_policy {
+            WebRtcPolicy::Default => {}
+            WebRtcPolicy::DisableNonProxiedUdp => {
+                args.push("--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string());
+            }
+            WebRtcPolicy::DisableAll => {
+                args.push("--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string());
+                args.push("--enforce-webrtc-ip-permission-check".to_string());
+            }
+        }
     }
 
     if let Some(ref proxy) = opts.proxy
         && opts.profile_mode != ProfileMode::VirtualContext
     {
-        args.push(format!("--proxy-server={}", proxy.server));
-        if !proxy.bypass.is_empty() {
-            args.push(format!("--proxy-bypass-list={}", proxy.bypass.join(",")));
-        }
+        args.push(format!(
+            "--proxy-server={}",
+            normalize_chromium_proxy_server(&proxy.server)
+        ));
+        let bypass_list = chromium_proxy_bypass_list(&proxy.bypass);
+        args.push(format!("--proxy-bypass-list={bypass_list}"));
     }
 
     args
+}
+
+pub(crate) fn normalize_chromium_proxy_server(raw: &str) -> String {
+    if let Some(idx) = raw.find("://") {
+        let scheme = &raw[..idx];
+        if scheme.eq_ignore_ascii_case("socks5h") {
+            return format!("socks5{}", &raw[idx..]);
+        }
+    }
+    raw.to_string()
+}
+
+pub(crate) fn chromium_proxy_bypass_list(bypass: &[String]) -> String {
+    let mut items = Vec::with_capacity(bypass.len() + 1);
+    if !bypass.iter().any(|b| b.eq_ignore_ascii_case("<-loopback>")) {
+        items.push("<-loopback>".to_string());
+    }
+    items.extend(bypass.iter().cloned());
+    items.join(",")
 }
 
 async fn drain_remaining_stderr(
@@ -682,11 +735,33 @@ pub fn write_firefox_user_js(profile_dir: &Path, opts: &LaunchOptions) -> Result
                 serde_json::to_string(&env.user_agent)?
             ));
         }
-        if !env.accept_language.is_empty() {
+        let accept_langs = if !env.languages.is_empty() {
+            env.languages.join(", ")
+        } else {
+            strip_q_weights(&env.accept_language)
+        };
+        if !accept_langs.is_empty() {
             prefs.push_str(&format!(
                 "user_pref(\"intl.accept_languages\", {});\n",
-                serde_json::to_string(&env.accept_language)?
+                serde_json::to_string(&accept_langs)?
             ));
+        }
+        if !env.locale.is_empty() {
+            prefs.push_str(&format!(
+                "user_pref(\"intl.locale.requested\", {});\n",
+                serde_json::to_string(&env.locale)?
+            ));
+        }
+        match env.webrtc_policy {
+            WebRtcPolicy::Default => {}
+            WebRtcPolicy::DisableNonProxiedUdp => {
+                prefs.push_str("user_pref(\"media.peerconnection.ice.default_address_only\", true);\n");
+                prefs.push_str("user_pref(\"media.peerconnection.ice.no_host\", true);\n");
+                prefs.push_str("user_pref(\"media.peerconnection.ice.proxy_only_if_behind_proxy\", true);\n");
+            }
+            WebRtcPolicy::DisableAll => {
+                prefs.push_str("user_pref(\"media.peerconnection.enabled\", false);\n");
+            }
         }
     }
 
@@ -709,12 +784,26 @@ pub fn write_firefox_user_js(profile_dir: &Path, opts: &LaunchOptions) -> Result
     Ok(())
 }
 
+fn strip_q_weights(raw: &str) -> String {
+    raw.split(',')
+        .filter_map(|part| {
+            let tag = part.split(';').next()?.trim();
+            if tag.is_empty() {
+                None
+            } else {
+                Some(tag.to_string())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn resolve_proxy_port(parsed: &url::Url) -> u16 {
     if let Some(port) = parsed.port_or_known_default() {
         return port;
     }
-    match parsed.scheme() {
-        "socks" | "socks4" | "socks5" => 1080,
+    match parsed.scheme().to_ascii_lowercase().as_str() {
+        "socks" | "socks4" | "socks5" | "socks5h" => 1080,
         _ => 8080,
     }
 }
@@ -729,8 +818,8 @@ fn append_firefox_proxy_prefs(
     let port = resolve_proxy_port(&parsed);
 
     prefs.push_str("user_pref(\"network.proxy.type\", 1);\n");
-    match parsed.scheme() {
-        "socks" | "socks5" => {
+    match parsed.scheme().to_ascii_lowercase().as_str() {
+        "socks" | "socks5" | "socks5h" => {
             prefs.push_str(&format!(
                 "user_pref(\"network.proxy.socks\", {});\n",
                 serde_json::to_string(host)?

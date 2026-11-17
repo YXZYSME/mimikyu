@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -18,16 +18,22 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
 
 use crate::driver::{
-    now_ms, url_matches_pattern, AxNode, BoundingBox, BrowserDriver, ConsoleEntry, ContextOptions,
-    Cookie, DriverCapabilities, DriverSession, EngineKind, EnvProfile, KeyEvent, KeyEventType,
+    now_ms, AxNode, BoundingBox, BrowserDriver, ConsoleEntry, ContextOptions, Cookie,
+    DriverCapabilities, DriverSession, EngineKind, EnvProfile, KeyEvent, KeyEventType,
     LaunchOptions, MouseButton, MouseEvent, MouseEventType, NavInfo, NetworkEvent, OriginStorage,
-    RouteAction, RouteMock, ScreenshotFormat, ScreenshotOpts, SessionInfo, StorageState, TabInfo,
-    WheelEvent,
+    PageError, PermissionGrant, PermissionState, RouteMock, ScreenshotFormat,
+    ScreenshotOpts, SessionInfo, StorageState, TabInfo, WheelEvent,
+};
+use crate::env_profile::{
+    build_window_init_script, build_worker_init_script, ProxyRelay,
 };
 use crate::error::{MimikyuError, Result};
-use crate::process::ProcessGuard;
+use crate::network::{
+    BlockPolicy, InterceptDecision, InterceptRequest, NetworkInterceptor, ResourceType, RouteRule,
+    TelemetryConfig, TelemetryStore,
+};
+use crate::process::{chromium_proxy_bypass_list, ProcessGuard};
 
-const MAX_TELEMETRY_ENTRIES: usize = 2048;
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct CdpDriver;
@@ -54,12 +60,22 @@ impl BrowserDriver for CdpDriver {
         cdp_capabilities()
     }
 
-    async fn launch(&self, opts: LaunchOptions) -> Result<Arc<dyn DriverSession>> {
+    async fn launch(&self, mut opts: LaunchOptions) -> Result<Arc<dyn DriverSession>> {
         if opts.engine != EngineKind::Chromium {
             return Err(MimikyuError::InvalidConfig(format!(
                 "CdpDriver cannot launch engine '{}'",
                 opts.engine
             )));
+        }
+
+        let mut root_relay: Option<ProxyRelay> = None;
+        if let Some(ref proxy) = opts.proxy
+            && proxy.needs_relay()
+        {
+            let relay = ProxyRelay::start(proxy).await?;
+            let rewritten = relay.browser_proxy_config(proxy.bypass.clone());
+            opts.proxy = Some(rewritten);
+            root_relay = Some(relay);
         }
 
         let process = ProcessGuard::launch(&opts).await?;
@@ -68,7 +84,7 @@ impl BrowserDriver for CdpDriver {
         let profile_dir = process.profile_dir().to_path_buf();
         let pid = process.pid();
 
-        let conn = CdpConnection::connect(&ws_url, process).await?;
+        let conn = CdpConnection::connect(&ws_url, process, root_relay).await?;
 
         // Enable target discovery
         let _ = conn
@@ -79,10 +95,9 @@ impl BrowserDriver for CdpDriver {
             crate::driver::ProfileMode::VirtualContext => {
                 let mut params = json!({});
                 if let Some(ref proxy) = opts.proxy {
-                    params["proxyServer"] = json!(proxy.server);
-                    if !proxy.bypass.is_empty() {
-                        params["proxyBypassList"] = json!(proxy.bypass.join(","));
-                    }
+                    params["proxyServer"] =
+                        json!(crate::process::normalize_chromium_proxy_server(&proxy.server));
+                    params["proxyBypassList"] = json!(chromium_proxy_bypass_list(&proxy.bypass));
                 }
                 let res = conn
                     .send_browser("Target.createBrowserContext", params)
@@ -175,12 +190,15 @@ impl BrowserDriver for CdpDriver {
             owns_context,
             true,
             opts.main_world_eval,
+            opts.telemetry_capacity,
+            None,
         )
         .await?;
 
         session
             .apply_initial_options(
                 opts.env_profile,
+                Vec::new(),
                 opts.block_images,
                 opts.block_media,
                 opts.block_fonts,
@@ -213,6 +231,7 @@ struct CdpConnection {
     isolated_contexts: RwLock<HashSet<String>>,
     active_targets: RwLock<HashMap<String, String>>,
     process: AsyncMutex<Option<ProcessGuard>>,
+    _root_proxy_relay: Mutex<Option<ProxyRelay>>,
     closed: AtomicBool,
     io_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
@@ -243,7 +262,11 @@ impl CdpConnection {
         }
     }
 
-    async fn connect(ws_url: &str, process: ProcessGuard) -> Result<Arc<Self>> {
+    async fn connect(
+        ws_url: &str,
+        process: ProcessGuard,
+        root_proxy_relay: Option<ProxyRelay>,
+    ) -> Result<Arc<Self>> {
         let mut ws_config = WebSocketConfig::default();
         ws_config.max_message_size = Some(128 * 1024 * 1024);
         ws_config.max_frame_size = Some(64 * 1024 * 1024);
@@ -263,6 +286,7 @@ impl CdpConnection {
             isolated_contexts: RwLock::new(HashSet::new()),
             active_targets: RwLock::new(HashMap::new()),
             process: AsyncMutex::new(Some(process)),
+            _root_proxy_relay: Mutex::new(root_proxy_relay),
             closed: AtomicBool::new(false),
             io_tasks: Mutex::new(Vec::new()),
         });
@@ -352,7 +376,33 @@ impl CdpConnection {
             let state = self.sessions.read().get(sid).cloned();
             if let Some(state) = state {
                 state.handle_event(self, method, params);
+            } else if method == "Target.attachedToTarget"
+                && params.get("waitingForDebugger").and_then(|v| v.as_bool()) == Some(true)
+                && let Some(child_sid) = params
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+            {
+                let conn_clone = Arc::clone(self);
+                tokio::spawn(async move {
+                    let _ = conn_clone
+                        .send_raw(Some(&child_sid), "Runtime.runIfWaitingForDebugger", json!({}))
+                        .await;
+                });
             }
+        } else if method == "Target.attachedToTarget"
+            && params.get("waitingForDebugger").and_then(|v| v.as_bool()) == Some(true)
+            && let Some(child_sid) = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .map(ToString::to_string)
+        {
+            let conn_clone = Arc::clone(self);
+            tokio::spawn(async move {
+                let _ = conn_clone
+                    .send_raw(Some(&child_sid), "Runtime.runIfWaitingForDebugger", json!({}))
+                    .await;
+            });
         }
     }
 
@@ -452,14 +502,18 @@ struct CdpSessionState {
     owns_context: bool,
     is_root: bool,
     main_world_eval: bool,
+    telemetry_capacity: Option<usize>,
     main_frame_id: Mutex<Option<String>>,
+    last_main_origin: Mutex<Option<String>>,
     isolated_worlds: Mutex<HashMap<String, i64>>,
-    console_logs: Mutex<VecDeque<ConsoleEntry>>,
-    network_events: Mutex<VecDeque<NetworkEvent>>,
-    pending_requests: Mutex<HashMap<String, NetworkEvent>>,
-    inflight_requests: Mutex<HashSet<String>>,
-    route_mocks: Mutex<Vec<RouteMock>>,
-    blocked_urls: Mutex<Vec<String>>,
+    telemetry: TelemetryStore,
+    interceptor: Mutex<NetworkInterceptor>,
+    fetch_enabled: AtomicBool,
+    env_script_id: AsyncMutex<Option<String>>,
+    worker_init_script: Mutex<Option<String>>,
+    worker_ua_params: Mutex<Option<Value>>,
+    pending_storage_scripts: Mutex<Vec<(String, String)>>,
+    _proxy_relay: Mutex<Option<ProxyRelay>>,
     load_notify: Notify,
     disposed: AtomicBool,
 }
@@ -474,6 +528,14 @@ impl CdpSessionState {
                     self.isolated_worlds.lock().remove(fid);
                     if frame.get("parentId").and_then(|v| v.as_str()).is_none() {
                         *self.main_frame_id.lock() = Some(fid.to_string());
+                        if let Some(u) = frame.get("url").and_then(|v| v.as_str())
+                            && let Ok(parsed) = url::Url::parse(u)
+                        {
+                            let origin = parsed.origin().ascii_serialization();
+                            if origin != "null" {
+                                *self.last_main_origin.lock() = Some(origin);
+                            }
+                        }
                     }
                 }
             }
@@ -486,7 +548,105 @@ impl CdpSessionState {
                 }
             }
             "Page.loadEventFired" | "Page.frameStoppedLoading" => {
+                if method == "Page.loadEventFired"
+                    && let Some(cur_origin) = self.last_main_origin.lock().clone()
+                {
+                    let to_remove: Vec<String> = {
+                        let mut pending = self.pending_storage_scripts.lock();
+                        let mut matched = Vec::new();
+                        pending.retain(|(orig, sid)| {
+                            if orig == &cur_origin {
+                                matched.push(sid.clone());
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        matched
+                    };
+                    if !to_remove.is_empty() {
+                        let conn_clone = Arc::clone(conn);
+                        let sid = self.session_id.clone();
+                        tokio::spawn(async move {
+                            for script_id in to_remove {
+                                let _ = conn_clone
+                                    .send_raw(
+                                        Some(&sid),
+                                        "Page.removeScriptToEvaluateOnNewDocument",
+                                        json!({ "identifier": script_id }),
+                                    )
+                                    .await;
+                            }
+                        });
+                    }
+                }
                 self.load_notify.notify_waiters();
+            }
+            "Target.attachedToTarget" => {
+                let target_type = params
+                    .get("targetInfo")
+                    .and_then(|t| t.get("type"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let waiting = params
+                    .get("waitingForDebugger")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if let Some(child_sid) = params
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+                {
+                    let is_worker = matches!(
+                        target_type,
+                        "worker" | "shared_worker" | "service_worker"
+                    );
+                    let worker_script = if is_worker {
+                        self.worker_init_script.lock().clone()
+                    } else {
+                        None
+                    };
+                    let worker_ua = if is_worker {
+                        self.worker_ua_params.lock().clone()
+                    } else {
+                        None
+                    };
+                    if is_worker || waiting {
+                        let conn_clone = Arc::clone(conn);
+                        tokio::spawn(async move {
+                            if let Some(ua) = worker_ua {
+                                let _ = conn_clone
+                                    .send_raw(
+                                        Some(&child_sid),
+                                        "Emulation.setUserAgentOverride",
+                                        ua,
+                                    )
+                                    .await;
+                            }
+                            if let Some(js) = worker_script {
+                                let _ = conn_clone
+                                    .send_raw(
+                                        Some(&child_sid),
+                                        "Runtime.evaluate",
+                                        json!({
+                                            "expression": js,
+                                            "silent": true,
+                                        }),
+                                    )
+                                    .await;
+                            }
+                            if waiting {
+                                let _ = conn_clone
+                                    .send_raw(
+                                        Some(&child_sid),
+                                        "Runtime.runIfWaitingForDebugger",
+                                        json!({}),
+                                    )
+                                    .await;
+                            }
+                        });
+                    }
+                }
             }
             "Runtime.consoleAPICalled" => {
                 let level = params
@@ -524,16 +684,88 @@ impl CdpSessionState {
                     .map(|t| t as u64)
                     .unwrap_or_else(now_ms);
 
-                let mut logs = self.console_logs.lock();
-                if logs.len() >= MAX_TELEMETRY_ENTRIES {
-                    logs.pop_front();
-                }
-                logs.push_back(ConsoleEntry {
+                self.telemetry.push_console(ConsoleEntry {
                     timestamp_ms,
                     level,
                     text,
                     url,
                     line,
+                });
+            }
+            "Runtime.exceptionThrown" => {
+                let timestamp_ms = params
+                    .get("timestamp")
+                    .and_then(|v| v.as_f64())
+                    .map(|t| t as u64)
+                    .unwrap_or_else(now_ms);
+                let details = &params["exceptionDetails"];
+                let exc = &details["exception"];
+                let name = exc
+                    .get("className")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let stack = exc
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string)
+                    .or_else(|| {
+                        details
+                            .get("stackTrace")
+                            .and_then(|st| st.get("callFrames"))
+                            .and_then(|cf| cf.as_array())
+                            .map(|arr| {
+                                arr.iter()
+                                    .map(|f| {
+                                        let fn_name = f
+                                            .get("functionName")
+                                            .and_then(|v| v.as_str())
+                                            .filter(|s| !s.is_empty())
+                                            .unwrap_or("<anonymous>");
+                                        let u = f.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                                        let ln =
+                                            f.get("lineNumber").and_then(|v| v.as_u64()).unwrap_or(0)
+                                                + 1;
+                                        let col = f
+                                            .get("columnNumber")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0)
+                                            + 1;
+                                        format!("    at {fn_name} ({u}:{ln}:{col})")
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("\n")
+                            })
+                            .filter(|s| !s.is_empty())
+                    });
+                let message = exc
+                    .get("description")
+                    .and_then(|v| v.as_str())
+                    .and_then(|d| d.lines().next())
+                    .or_else(|| details.get("text").and_then(|v| v.as_str()))
+                    .unwrap_or("Uncaught exception")
+                    .to_string();
+                let url = details
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string);
+                let line = details
+                    .get("lineNumber")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32 + 1);
+                let column = details
+                    .get("columnNumber")
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n as u32 + 1);
+
+                self.telemetry.push_page_error(PageError {
+                    timestamp_ms,
+                    message,
+                    name,
+                    stack,
+                    url,
+                    line,
+                    column,
                 });
             }
             "Network.requestWillBeSent" => {
@@ -558,9 +790,18 @@ impl CdpSessionState {
                     .to_string();
                 let request_headers = json_map_to_btree(req.get("headers"));
 
-                self.inflight_requests.lock().insert(req_id.to_string());
-                self.pending_requests.lock().insert(
-                    req_id.to_string(),
+                let redir = params.get("redirectResponse");
+                let redir_status = redir
+                    .and_then(|r| r.get("status"))
+                    .and_then(|v| v.as_u64())
+                    .map(|s| s as u16);
+                let redir_mime = redir
+                    .and_then(|r| r.get("mimeType"))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let redir_headers = json_map_to_btree(redir.and_then(|r| r.get("headers")));
+
+                self.telemetry.on_request_started(
                     NetworkEvent {
                         timestamp_ms: now_ms(),
                         request_id: req_id.to_string(),
@@ -574,6 +815,9 @@ impl CdpSessionState {
                         request_headers,
                         response_headers: BTreeMap::new(),
                     },
+                    redir_status,
+                    redir_mime,
+                    redir_headers,
                 );
             }
             "Network.responseReceived" => {
@@ -581,41 +825,34 @@ impl CdpSessionState {
                     return;
                 };
                 let resp = &params["response"];
-                if let Some(ev) = self.pending_requests.lock().get_mut(req_id) {
-                    ev.status = resp
-                        .get("status")
-                        .and_then(|v| v.as_u64())
-                        .map(|s| s as u16);
-                    ev.mime_type = resp
-                        .get("mimeType")
-                        .and_then(|v| v.as_str())
-                        .map(ToString::to_string);
-                    ev.response_headers = json_map_to_btree(resp.get("headers"));
-                }
+                let status = resp
+                    .get("status")
+                    .and_then(|v| v.as_u64())
+                    .map(|s| s as u16);
+                let mime_type = resp
+                    .get("mimeType")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let response_headers = json_map_to_btree(resp.get("headers"));
+                self.telemetry
+                    .on_response_received(req_id, status, mime_type, response_headers);
             }
             "Network.loadingFinished" => {
                 let Some(req_id) = params.get("requestId").and_then(|v| v.as_str()) else {
                     return;
                 };
-                self.inflight_requests.lock().remove(req_id);
-                if let Some(ev) = self.pending_requests.lock().remove(req_id) {
-                    self.push_network_event(ev);
-                }
+                self.telemetry.on_request_finished(req_id);
             }
             "Network.loadingFailed" => {
                 let Some(req_id) = params.get("requestId").and_then(|v| v.as_str()) else {
                     return;
                 };
-                self.inflight_requests.lock().remove(req_id);
-                if let Some(mut ev) = self.pending_requests.lock().remove(req_id) {
-                    ev.failed = true;
-                    ev.error_text = params
-                        .get("errorText")
-                        .and_then(|v| v.as_str())
-                        .or_else(|| params.get("blockedReason").and_then(|v| v.as_str()))
-                        .map(ToString::to_string);
-                    self.push_network_event(ev);
-                }
+                let error_text = params
+                    .get("errorText")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| params.get("blockedReason").and_then(|v| v.as_str()))
+                    .map(ToString::to_string);
+                self.telemetry.on_request_failed(req_id, error_text);
             }
             "Fetch.requestPaused" => {
                 let Some(fetch_id) = params
@@ -631,33 +868,39 @@ impl CdpSessionState {
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
-                let req_headers = json_map_to_btree(params.get("request").and_then(|r| r.get("headers")));
-                let matched = {
-                    let mocks = self.route_mocks.lock();
-                    mocks
-                        .iter()
-                        .find(|m| url_matches_pattern(&m.url_pattern, &url))
-                        .cloned()
-                };
+                let req_headers =
+                    json_map_to_btree(params.get("request").and_then(|r| r.get("headers")));
+                let resource_type_raw = params
+                    .get("resourceType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("Other");
+                let resource_type = ResourceType::from_cdp(resource_type_raw);
+
+                let decision = self.interceptor.lock().decide(&InterceptRequest {
+                    url: &url,
+                    resource_type,
+                    headers: &req_headers,
+                });
+
                 let conn_clone = Arc::clone(conn);
                 let sid = self.session_id.clone();
 
                 tokio::spawn(async move {
-                    match matched.map(|m| m.action) {
-                        Some(RouteAction::Abort) => {
+                    match decision {
+                        InterceptDecision::Block { reason } => {
                             let _ = conn_clone
                                 .send_raw(
                                     Some(&sid),
                                     "Fetch.failRequest",
-                                    json!({ "requestId": fetch_id, "errorReason": "Aborted" }),
+                                    json!({ "requestId": fetch_id, "errorReason": reason }),
                                 )
                                 .await;
                         }
-                        Some(RouteAction::Fulfill {
+                        InterceptDecision::Fulfill {
                             status,
                             headers,
                             body,
-                        }) => {
+                        } => {
                             let hdrs: Vec<Value> = headers
                                 .into_iter()
                                 .map(|(name, value)| json!({ "name": name, "value": value }))
@@ -675,24 +918,30 @@ impl CdpSessionState {
                                 )
                                 .await;
                         }
-                        Some(RouteAction::ContinueWithHeaders { headers }) => {
-                            let mut merged = req_headers;
-                            for (k, v) in headers {
-                                merged.insert(k, v);
-                            }
-                            let hdrs: Vec<Value> = merged
+                        InterceptDecision::ModifyHeaders { headers } => {
+                            let hdrs: Vec<Value> = headers
                                 .into_iter()
                                 .map(|(name, value)| json!({ "name": name, "value": value }))
                                 .collect();
-                            let _ = conn_clone
+                            if let Err(e) = conn_clone
                                 .send_raw(
                                     Some(&sid),
                                     "Fetch.continueRequest",
                                     json!({ "requestId": fetch_id, "headers": hdrs }),
                                 )
-                                .await;
+                                .await
+                            {
+                                warn!(target: "mimikyu::cdp::fetch", "Fetch.continueRequest(ModifyHeaders) failed: {e}");
+                                let _ = conn_clone
+                                    .send_raw(
+                                        Some(&sid),
+                                        "Fetch.continueRequest",
+                                        json!({ "requestId": fetch_id }),
+                                    )
+                                    .await;
+                            }
                         }
-                        None => {
+                        InterceptDecision::Continue => {
                             let _ = conn_clone
                                 .send_raw(
                                     Some(&sid),
@@ -707,14 +956,6 @@ impl CdpSessionState {
             _ => {}
         }
     }
-
-    fn push_network_event(&self, ev: NetworkEvent) {
-        let mut events = self.network_events.lock();
-        if events.len() >= MAX_TELEMETRY_ENTRIES {
-            events.pop_front();
-        }
-        events.push_back(ev);
-    }
 }
 
 pub struct CdpSession {
@@ -724,6 +965,7 @@ pub struct CdpSession {
 }
 
 impl CdpSession {
+    #[allow(clippy::too_many_arguments)]
     async fn create(
         conn: Arc<CdpConnection>,
         info: SessionInfo,
@@ -731,7 +973,12 @@ impl CdpSession {
         owns_context: bool,
         is_root: bool,
         main_world_eval: bool,
+        telemetry_capacity: Option<usize>,
+        proxy_relay: Option<ProxyRelay>,
     ) -> Result<Arc<Self>> {
+        let telem_cfg = telemetry_capacity
+            .map(TelemetryConfig::with_capacity)
+            .unwrap_or_default();
         let state = Arc::new(CdpSessionState {
             session_id: info.session_id.clone(),
             target_id: info.target_id.clone(),
@@ -739,14 +986,18 @@ impl CdpSession {
             owns_context,
             is_root,
             main_world_eval,
+            telemetry_capacity,
             main_frame_id: Mutex::new(None),
+            last_main_origin: Mutex::new(None),
             isolated_worlds: Mutex::new(HashMap::new()),
-            console_logs: Mutex::new(VecDeque::with_capacity(128)),
-            network_events: Mutex::new(VecDeque::with_capacity(256)),
-            pending_requests: Mutex::new(HashMap::new()),
-            inflight_requests: Mutex::new(HashSet::new()),
-            route_mocks: Mutex::new(Vec::new()),
-            blocked_urls: Mutex::new(Vec::new()),
+            telemetry: TelemetryStore::new(telem_cfg),
+            interceptor: Mutex::new(NetworkInterceptor::default()),
+            fetch_enabled: AtomicBool::new(false),
+            env_script_id: AsyncMutex::new(None),
+            worker_init_script: Mutex::new(None),
+            worker_ua_params: Mutex::new(None),
+            pending_storage_scripts: Mutex::new(Vec::new()),
+            _proxy_relay: Mutex::new(proxy_relay),
             load_notify: Notify::new(),
             disposed: AtomicBool::new(false),
         });
@@ -757,13 +1008,29 @@ impl CdpSession {
 
         let session = Arc::new(Self { conn, info, state });
 
-        session.call("Page.enable", json!({})).await?;
-        session.call("Runtime.enable", json!({})).await?;
-        session.call("DOM.enable", json!({})).await?;
-        session.call("Network.enable", json!({})).await?;
-        let _ = session.call("Accessibility.enable", json!({})).await;
+        let (page_res, runtime_res, dom_res, net_res, _ax_res, frame_tree_res, _attach_res) = tokio::join!(
+            session.call("Page.enable", json!({})),
+            session.call("Runtime.enable", json!({})),
+            session.call("DOM.enable", json!({})),
+            session.call("Network.enable", json!({})),
+            session.call("Accessibility.enable", json!({})),
+            session.call("Page.getFrameTree", json!({})),
+            session.call(
+                "Target.setAutoAttach",
+                json!({
+                    "autoAttach": true,
+                    "waitForDebuggerOnStart": true,
+                    "flatten": true,
+                }),
+            ),
+        );
 
-        if let Ok(tree) = session.call("Page.getFrameTree", json!({})).await
+        page_res?;
+        runtime_res?;
+        dom_res?;
+        net_res?;
+
+        if let Ok(tree) = frame_tree_res
             && let Some(fid) = tree["frameTree"]["frame"]["id"].as_str()
         {
             *session.state.main_frame_id.lock() = Some(fid.to_string());
@@ -775,6 +1042,7 @@ impl CdpSession {
     async fn apply_initial_options(
         &self,
         env_profile: Option<EnvProfile>,
+        permissions: Vec<PermissionGrant>,
         block_images: bool,
         block_media: bool,
         block_fonts: bool,
@@ -783,31 +1051,42 @@ impl CdpSession {
         if let Some(profile) = env_profile {
             self.set_env_overrides(profile).await?;
         }
+        if !permissions.is_empty() {
+            self.set_permissions(permissions).await?;
+        }
 
-        let mut blocked = Vec::new();
-        if block_images {
-            for ext in ["png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "avif"] {
-                blocked.push(format!("*.{ext}"));
-                blocked.push(format!("*.{ext}?*"));
-            }
-        }
-        if block_media {
-            for ext in ["mp4", "webm", "ogg", "mp3", "wav", "m3u8", "mpd"] {
-                blocked.push(format!("*.{ext}"));
-                blocked.push(format!("*.{ext}?*"));
-            }
-        }
-        if block_fonts {
-            for ext in ["woff", "woff2", "ttf", "otf", "eot"] {
-                blocked.push(format!("*.{ext}"));
-                blocked.push(format!("*.{ext}?*"));
-            }
-        }
-        if !blocked.is_empty() {
-            self.set_blocked_urls(blocked).await?;
+        if block_images || block_media || block_fonts {
+            self.state
+                .interceptor
+                .lock()
+                .set_categories(block_images, block_media, block_fonts);
+            self.sync_cdp_network().await?;
         }
         if instant_animations {
             let _ = self.set_instant_animations(true).await;
+        }
+        Ok(())
+    }
+
+    async fn sync_cdp_network(&self) -> Result<()> {
+        self.ensure_alive()?;
+        let (globs, fetch_patterns) = {
+            let guard = self.state.interceptor.lock();
+            (
+                guard.blocker().cdp_blocked_url_globs(),
+                guard.cdp_fetch_patterns(),
+            )
+        };
+
+        self.call("Network.setBlockedURLs", json!({ "urls": globs }))
+            .await?;
+
+        if let Some(patterns) = fetch_patterns {
+            self.call("Fetch.enable", json!({ "patterns": patterns }))
+                .await?;
+            self.state.fetch_enabled.store(true, Ordering::SeqCst);
+        } else if self.state.fetch_enabled.swap(false, Ordering::SeqCst) {
+            let _ = self.call("Fetch.disable", json!({})).await;
         }
         Ok(())
     }
@@ -894,14 +1173,7 @@ impl CdpSession {
     async fn collect_nav_info(&self, frame_id: Option<String>) -> Result<NavInfo> {
         let url = self.current_url().await?;
         let title = self.title().await.unwrap_or_default();
-        let status = {
-            let events = self.state.network_events.lock();
-            events
-                .iter()
-                .rev()
-                .find(|ev| ev.url == url && ev.status.is_some())
-                .and_then(|ev| ev.status)
-        };
+        let status = self.state.telemetry.find_latest_status_for_url(&url);
         Ok(NavInfo {
             url,
             title,
@@ -948,12 +1220,19 @@ impl DriverSession for CdpSession {
 
     async fn new_context(&self, opts: ContextOptions) -> Result<Arc<dyn DriverSession>> {
         self.ensure_alive()?;
+        let mut relay_opt: Option<ProxyRelay> = None;
         let mut params = json!({});
         if let Some(ref proxy) = opts.proxy {
-            params["proxyServer"] = json!(proxy.server);
-            if !proxy.bypass.is_empty() {
-                params["proxyBypassList"] = json!(proxy.bypass.join(","));
-            }
+            let effective = if proxy.needs_relay() {
+                let relay = ProxyRelay::start(proxy).await?;
+                let cfg = relay.browser_proxy_config(proxy.bypass.clone());
+                relay_opt = Some(relay);
+                cfg
+            } else {
+                proxy.clone()
+            };
+            params["proxyServer"] = json!(crate::process::normalize_chromium_proxy_server(&effective.server));
+            params["proxyBypassList"] = json!(chromium_proxy_bypass_list(&effective.bypass));
         }
         let res = self
             .conn
@@ -1011,12 +1290,15 @@ impl DriverSession for CdpSession {
             true,
             false,
             opts.main_world_eval,
+            opts.telemetry_capacity,
+            relay_opt,
         )
         .await?;
 
         session
             .apply_initial_options(
                 opts.env_profile,
+                opts.permissions,
                 opts.block_images,
                 opts.block_media,
                 opts.block_fonts,
@@ -1072,6 +1354,8 @@ impl DriverSession for CdpSession {
             false,
             false,
             self.state.main_world_eval,
+            self.state.telemetry_capacity,
+            None,
         )
         .await?;
         self.conn
@@ -1810,10 +2094,24 @@ impl DriverSession for CdpSession {
     }
 
     async fn set_env_overrides(&self, profile: EnvProfile) -> Result<()> {
-        if !profile.user_agent.is_empty() || profile.user_agent_metadata.is_some() {
-            let mut ua_params = json!({
+        self.ensure_alive()?;
+
+        let ua_params = if !profile.user_agent.is_empty() || profile.user_agent_metadata.is_some()
+        {
+            let accept_lang = if !profile.languages.is_empty() {
+                profile.languages.join(",")
+            } else {
+                profile
+                    .accept_language
+                    .split(',')
+                    .filter_map(|p| p.split(';').next().map(str::trim))
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let mut p = json!({
                 "userAgent": if profile.user_agent.is_empty() { "Mozilla/5.0" } else { &profile.user_agent },
-                "acceptLanguage": profile.accept_language,
+                "acceptLanguage": accept_lang,
                 "platform": profile.platform,
             });
             if let Some(ref meta) = profile.user_agent_metadata {
@@ -1827,7 +2125,7 @@ impl DriverSession for CdpSession {
                     .iter()
                     .map(|b| json!({ "brand": b.brand, "version": b.version }))
                     .collect();
-                ua_params["userAgentMetadata"] = json!({
+                p["userAgentMetadata"] = json!({
                     "brands": brands,
                     "fullVersionList": full_list,
                     "platform": meta.platform,
@@ -1839,27 +2137,52 @@ impl DriverSession for CdpSession {
                     "wow64": meta.wow64,
                 });
             }
-            self.call("Emulation.setUserAgentOverride", ua_params)
+            Some(p)
+        } else {
+            None
+        };
+
+        *self.state.worker_ua_params.lock() = ua_params.clone();
+        *self.state.worker_init_script.lock() =
+            Some(build_worker_init_script(&profile, EngineKind::Chromium, false));
+
+        let win_script = build_window_init_script(&profile, EngineKind::Chromium);
+        {
+            let mut prev = self.state.env_script_id.lock().await;
+            if let Some(old_id) = prev.take() {
+                let _ = self.remove_init_script(&old_id).await;
+            }
+            let new_id = self.add_init_script(&win_script).await?;
+            *prev = Some(new_id);
+        }
+
+        let ua_fut = async {
+            if let Some(p) = ua_params {
+                self.call("Emulation.setUserAgentOverride", p).await?;
+            }
+            Ok::<_, MimikyuError>(())
+        };
+        let tz_fut = async {
+            if !profile.timezone.is_empty() {
+                self.call(
+                    "Emulation.setTimezoneOverride",
+                    json!({ "timezoneId": profile.timezone }),
+                )
                 .await?;
-        }
-
-        if !profile.timezone.is_empty() {
-            self.call(
-                "Emulation.setTimezoneOverride",
-                json!({ "timezoneId": profile.timezone }),
-            )
-            .await?;
-        }
-
-        if !profile.locale.is_empty() {
-            self.call(
-                "Emulation.setLocaleOverride",
-                json!({ "locale": profile.locale }),
-            )
-            .await?;
-        }
-
-        self.call(
+            }
+            Ok::<_, MimikyuError>(())
+        };
+        let loc_fut = async {
+            if !profile.locale.is_empty() {
+                self.call(
+                    "Emulation.setLocaleOverride",
+                    json!({ "locale": profile.locale }),
+                )
+                .await?;
+            }
+            Ok::<_, MimikyuError>(())
+        };
+        let metrics_fut = self.call(
             "Emulation.setDeviceMetricsOverride",
             json!({
                 "width": profile.viewport_width,
@@ -1869,64 +2192,144 @@ impl DriverSession for CdpSession {
                 "screenWidth": profile.screen_width,
                 "screenHeight": profile.screen_height,
             }),
-        )
-        .await?;
-
-        if let Some(ref geo) = profile.geolocation {
-            self.call(
-                "Emulation.setGeolocationOverride",
-                json!({
-                    "latitude": geo.latitude,
-                    "longitude": geo.longitude,
-                    "accuracy": geo.accuracy,
-                }),
-            )
-            .await?;
-        }
-
-        if !profile.extra_headers.is_empty() {
+        );
+        let geo_fut = async {
+            if let Some(ref geo) = profile.geolocation {
+                self.call(
+                    "Emulation.setGeolocationOverride",
+                    json!({
+                        "latitude": geo.latitude,
+                        "longitude": geo.longitude,
+                        "accuracy": geo.accuracy,
+                    }),
+                )
+                .await?;
+            }
+            Ok::<_, MimikyuError>(())
+        };
+        let hc_fut = async {
+            if profile.hardware_concurrency > 0 {
+                let _ = self
+                    .call(
+                        "Emulation.setHardwareConcurrencyOverride",
+                        json!({ "hardwareConcurrency": profile.hardware_concurrency }),
+                    )
+                    .await;
+            }
+            Ok::<_, MimikyuError>(())
+        };
+        let hdr_fut = async {
             self.call(
                 "Network.setExtraHTTPHeaders",
                 json!({ "headers": profile.extra_headers }),
             )
             .await?;
+            Ok::<_, MimikyuError>(())
+        };
+
+        tokio::try_join!(ua_fut, tz_fut, loc_fut, metrics_fut, geo_fut, hc_fut, hdr_fut)?;
+
+        if profile.geolocation.is_some() {
+            let _ = self
+                .set_permissions(vec![PermissionGrant {
+                    name: "geolocation".to_string(),
+                    state: PermissionState::Granted,
+                    origin: None,
+                }])
+                .await;
         }
 
         Ok(())
+    }
+
+    async fn set_permissions(&self, permissions: Vec<PermissionGrant>) -> Result<()> {
+        self.ensure_alive()?;
+        for g in permissions {
+            let setting = match g.state {
+                PermissionState::Granted => "granted",
+                PermissionState::Denied => "denied",
+                PermissionState::Prompt => "prompt",
+            };
+            let mut params = json!({
+                "permission": { "name": g.name },
+                "setting": setting,
+            });
+            if let Some(ref orig) = g.origin {
+                params["origin"] = json!(orig);
+            }
+            if let Some(ref ctx_id) = self.state.context_id {
+                params["browserContextId"] = json!(ctx_id);
+            }
+            if let Err(err) = self.conn.send_browser("Browser.setPermission", params).await {
+                if g.state == PermissionState::Granted {
+                    let mut gp = json!({ "permissions": [g.name] });
+                    if let Some(ref orig) = g.origin {
+                        gp["origin"] = json!(orig);
+                    }
+                    if let Some(ref ctx_id) = self.state.context_id {
+                        gp["browserContextId"] = json!(ctx_id);
+                    }
+                    self.conn.send_browser("Browser.grantPermissions", gp).await?;
+                } else {
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    async fn reset_permissions(&self) -> Result<()> {
+        self.ensure_alive()?;
+        let mut params = json!({});
+        if let Some(ref ctx_id) = self.state.context_id {
+            params["browserContextId"] = json!(ctx_id);
+        }
+        self.conn
+            .send_browser("Browser.resetPermissions", params)
+            .await?;
+        Ok(())
+    }
+
+    async fn set_block_policy(&self, policy: BlockPolicy) -> Result<()> {
+        self.ensure_alive()?;
+        self.state.interceptor.lock().set_block_policy(policy)?;
+        self.sync_cdp_network().await
     }
 
     async fn set_blocked_urls(&self, patterns: Vec<String>) -> Result<()> {
-        *self.state.blocked_urls.lock() = patterns.clone();
-        self.call("Network.setBlockedURLs", json!({ "urls": patterns }))
-            .await?;
-        Ok(())
+        self.ensure_alive()?;
+        self.state.interceptor.lock().set_blocked_urls(patterns)?;
+        self.sync_cdp_network().await
     }
 
     async fn set_route_mock(&self, mock: RouteMock) -> Result<()> {
-        let should_enable = {
-            let mut mocks = self.state.route_mocks.lock();
-            mocks.retain(|m| m.id != mock.id);
-            mocks.push(mock);
-            !mocks.is_empty()
-        };
-        if should_enable {
-            self.call(
-                "Fetch.enable",
-                json!({ "patterns": [{ "urlPattern": "*", "requestStage": "Request" }] }),
-            )
-            .await?;
-        }
-        Ok(())
+        self.ensure_alive()?;
+        self.state.interceptor.lock().add_mock(mock)?;
+        self.sync_cdp_network().await
+    }
+
+    async fn set_route_rule(&self, rule: RouteRule) -> Result<()> {
+        self.ensure_alive()?;
+        self.state.interceptor.lock().add_rule(rule)?;
+        self.sync_cdp_network().await
     }
 
     async fn clear_route_mocks(&self) -> Result<()> {
-        self.state.route_mocks.lock().clear();
-        let _ = self.call("Fetch.disable", json!({})).await;
-        Ok(())
+        self.ensure_alive()?;
+        self.state.interceptor.lock().clear_rules();
+        self.sync_cdp_network().await
     }
 
     async fn cookies(&self) -> Result<Vec<Cookie>> {
-        let res = self.call("Network.getCookies", json!({})).await?;
+        self.ensure_alive()?;
+        let storage_params = match self.state.context_id {
+            Some(ref ctx_id) => json!({ "browserContextId": ctx_id }),
+            None => json!({}),
+        };
+        let res = match self.call("Storage.getCookies", storage_params).await {
+            Ok(v) => v,
+            Err(_) => self.call("Network.getCookies", json!({})).await?,
+        };
         let arr = res["cookies"].as_array().cloned().unwrap_or_default();
         Ok(arr
             .into_iter()
@@ -1944,6 +2347,7 @@ impl DriverSession for CdpSession {
     }
 
     async fn set_cookies(&self, cookies: Vec<Cookie>) -> Result<()> {
+        self.ensure_alive()?;
         if cookies.is_empty() {
             return Ok(());
         }
@@ -1958,22 +2362,40 @@ impl DriverSession for CdpSession {
                     "httpOnly": c.http_only,
                     "secure": c.secure,
                 });
-                if let Some(exp) = c.expires {
+                if let Some(exp) = c.expires
+                    && exp.is_finite()
+                    && exp > 0.0
+                {
                     obj["expires"] = json!(exp);
                 }
-                if let Some(ss) = c.same_site {
-                    obj["sameSite"] = json!(ss);
+                if let Some(ss) = c.same_site
+                    && let Some(norm) = normalize_cdp_same_site(&ss)
+                {
+                    obj["sameSite"] = json!(norm);
                 }
                 obj
             })
             .collect();
-        self.call("Network.setCookies", json!({ "cookies": mapped }))
-            .await?;
+        let mut storage_params = json!({ "cookies": mapped });
+        if let Some(ref ctx_id) = self.state.context_id {
+            storage_params["browserContextId"] = json!(ctx_id);
+        }
+        if self.call("Storage.setCookies", storage_params).await.is_err() {
+            self.call("Network.setCookies", json!({ "cookies": mapped }))
+                .await?;
+        }
         Ok(())
     }
 
     async fn clear_cookies(&self) -> Result<()> {
-        self.call("Network.clearBrowserCookies", json!({})).await?;
+        self.ensure_alive()?;
+        let storage_params = match self.state.context_id {
+            Some(ref ctx_id) => json!({ "browserContextId": ctx_id }),
+            None => json!({}),
+        };
+        if self.call("Storage.clearCookies", storage_params).await.is_err() {
+            self.call("Network.clearBrowserCookies", json!({})).await?;
+        }
         Ok(())
     }
 
@@ -2022,21 +2444,40 @@ impl DriverSession for CdpSession {
             .ok()
             .and_then(|v| v.as_str().map(ToString::to_string));
 
-        if let Some(cur) = current_origin {
-            for entry in state.origins {
-                if entry.origin == cur {
-                    let ls_json = serde_json::to_string(&entry.local_storage)?;
-                    let ss_json = serde_json::to_string(&entry.session_storage)?;
-                    let script = format!(
-                        r#"(() => {{
-                            const ls = {ls_json};
-                            for (const [k, v] of Object.entries(ls)) localStorage.setItem(k, v);
-                            const ss = {ss_json};
-                            for (const [k, v] of Object.entries(ss)) sessionStorage.setItem(k, v);
-                        }})()"#
-                    );
-                    self.eval_isolated(&script).await?;
-                }
+        for entry in state.origins {
+            if entry.local_storage.is_empty() && entry.session_storage.is_empty() {
+                continue;
+            }
+            let ls_json = serde_json::to_string(&entry.local_storage)?;
+            let ss_json = serde_json::to_string(&entry.session_storage)?;
+            if current_origin.as_deref() == Some(entry.origin.as_str())
+                && entry.origin != "null"
+            {
+                let script = format!(
+                    r#"(() => {{
+                        const ls = {ls_json};
+                        for (const [k, v] of Object.entries(ls)) localStorage.setItem(k, v);
+                        const ss = {ss_json};
+                        for (const [k, v] of Object.entries(ss)) sessionStorage.setItem(k, v);
+                    }})()"#
+                );
+                self.eval_isolated(&script).await?;
+            } else {
+                let origin_json = serde_json::to_string(&entry.origin)?;
+                let preload = format!(
+                    r#"(() => {{
+                        if (window.location.origin !== {origin_json}) return;
+                        const ls = {ls_json};
+                        for (const [k, v] of Object.entries(ls)) localStorage.setItem(k, v);
+                        const ss = {ss_json};
+                        for (const [k, v] of Object.entries(ss)) sessionStorage.setItem(k, v);
+                    }})()"#
+                );
+                let sid = self.add_init_script(&preload).await?;
+                self.state
+                    .pending_storage_scripts
+                    .lock()
+                    .push((entry.origin, sid));
             }
         }
         Ok(())
@@ -2044,20 +2485,43 @@ impl DriverSession for CdpSession {
 
     async fn console_logs(&self) -> Result<Vec<ConsoleEntry>> {
         self.ensure_alive()?;
-        Ok(self.state.console_logs.lock().iter().cloned().collect())
+        Ok(self.state.telemetry.snapshot_console())
+    }
+
+    async fn page_errors(&self) -> Result<Vec<PageError>> {
+        self.ensure_alive()?;
+        Ok(self.state.telemetry.snapshot_page_errors())
     }
 
     async fn network_events(&self) -> Result<Vec<NetworkEvent>> {
         self.ensure_alive()?;
-        let mut out: Vec<NetworkEvent> =
-            self.state.network_events.lock().iter().cloned().collect();
-        out.extend(self.state.pending_requests.lock().values().cloned());
-        Ok(out)
+        Ok(self.state.telemetry.snapshot_network())
+    }
+
+    async fn drain_console_logs(&self) -> Result<Vec<ConsoleEntry>> {
+        self.ensure_alive()?;
+        Ok(self.state.telemetry.drain_console())
+    }
+
+    async fn drain_page_errors(&self) -> Result<Vec<PageError>> {
+        self.ensure_alive()?;
+        Ok(self.state.telemetry.drain_page_errors())
+    }
+
+    async fn drain_network_events(&self) -> Result<Vec<NetworkEvent>> {
+        self.ensure_alive()?;
+        Ok(self.state.telemetry.drain_network())
+    }
+
+    async fn clear_telemetry(&self) -> Result<()> {
+        self.ensure_alive()?;
+        self.state.telemetry.clear();
+        Ok(())
     }
 
     async fn inflight_requests(&self) -> Result<usize> {
         self.ensure_alive()?;
-        Ok(self.state.inflight_requests.lock().len())
+        Ok(self.state.telemetry.inflight_count())
     }
 
     async fn document_ready_state(&self) -> Result<String> {
@@ -2075,6 +2539,14 @@ impl DriverSession for CdpSession {
             self.conn.shutdown_all().await;
         } else if self.state.owns_context {
             if let Some(ref ctx_id) = self.state.context_id {
+                self.conn.sessions.write().retain(|_, st| {
+                    if st.context_id.as_deref() == Some(ctx_id.as_str()) {
+                        st.disposed.store(true, Ordering::SeqCst);
+                        false
+                    } else {
+                        true
+                    }
+                });
                 self.conn.isolated_contexts.write().remove(ctx_id);
                 self.conn
                     .active_targets
@@ -2123,6 +2595,15 @@ impl DriverSession for CdpSession {
             }
         }
         Ok(())
+    }
+}
+
+fn normalize_cdp_same_site(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "strict" => Some("Strict"),
+        "lax" => Some("Lax"),
+        "none" => Some("None"),
+        _ => None,
     }
 }
 
