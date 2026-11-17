@@ -156,6 +156,27 @@ impl TestServer {
                             br#"<!doctype html><html><head><title>Isolation</title></head><body><div id="iso">isolated</div></body></html>"#
                                 .to_vec(),
                         ),
+                        ("GET", "/iframe-page") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Iframe Host</title></head>
+<body>
+  <img src="/blocked.png" alt="blocked" />
+  <iframe id="subframe" src="/subframe"></iframe>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/subframe") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html><html><head><title>Subframe</title></head><body><p id="sub-ok">subframe-loaded</p><img src="/blocked.png" alt="sub-blocked" /></body></html>"#
+                                .to_vec(),
+                        ),
                         _ => (
                             "404 Not Found",
                             "text/plain",

@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -97,7 +97,9 @@ impl BrowserDriver for BidiDriver {
                     "log.entryAdded",
                     "network.beforeRequestSent",
                     "network.responseCompleted",
-                    "browsingContext.load"
+                    "browsingContext.load",
+                    "browsingContext.contextCreated",
+                    "browsingContext.contextDestroyed"
                 ]
             }),
         )
@@ -112,6 +114,7 @@ impl BrowserDriver for BidiDriver {
         let (user_context, owns_user_context, target_id) = match opts.profile_mode {
             ProfileMode::VirtualContext => {
                 let uc = create_user_context(&conn, opts.proxy.as_ref()).await?;
+                conn.isolated_contexts.write().insert(uc.clone());
                 // Must use type: "window" (type: "tab" with default background:false hangs in headless firefox-1497).
                 let created = conn
                     .send(
@@ -155,6 +158,8 @@ impl BrowserDriver for BidiDriver {
                 (None, false, ctx_id)
             }
         };
+
+        conn.set_active_target(user_context.as_deref(), &target_id);
 
         let info = SessionInfo {
             session_id: bidi_session_id,
@@ -221,11 +226,21 @@ async fn create_user_context(
         })
 }
 
+fn resolve_proxy_port(parsed: &url::Url) -> u16 {
+    if let Some(port) = parsed.port_or_known_default() {
+        return port;
+    }
+    match parsed.scheme() {
+        "socks" | "socks4" | "socks5" => 1080,
+        _ => 8080,
+    }
+}
+
 fn proxy_to_bidi_json(proxy: &ProxyConfig) -> Result<Value> {
     let parsed = url::Url::parse(&proxy.server)
         .or_else(|_| url::Url::parse(&format!("http://{}", proxy.server)))?;
     let host = parsed.host_str().unwrap_or("127.0.0.1");
-    let port = parsed.port().unwrap_or(8080);
+    let port = resolve_proxy_port(&parsed);
     let host_port = format!("{host}:{port}");
 
     let mut obj = json!({
@@ -256,12 +271,51 @@ struct BidiConnection {
     write_tx: mpsc::UnboundedSender<String>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
     contexts: RwLock<HashMap<String, Arc<BidiContextState>>>,
+    context_parents: RwLock<HashMap<String, String>>,
+    isolated_contexts: RwLock<HashSet<String>>,
+    active_targets: RwLock<HashMap<String, String>>,
     process: AsyncMutex<Option<ProcessGuard>>,
     closed: AtomicBool,
     io_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
+fn context_scope_key(user_context: Option<&str>) -> String {
+    user_context.unwrap_or("default").to_string()
+}
+
 impl BidiConnection {
+    fn set_active_target(&self, user_context: Option<&str>, target_id: &str) {
+        self.active_targets
+            .write()
+            .insert(context_scope_key(user_context), target_id.to_string());
+    }
+
+    fn active_target_for(&self, user_context: Option<&str>) -> Option<String> {
+        self.active_targets
+            .read()
+            .get(&context_scope_key(user_context))
+            .cloned()
+    }
+
+    fn resolve_context_state(&self, cid: &str) -> Option<Arc<BidiContextState>> {
+        let contexts = self.contexts.read();
+        if let Some(state) = contexts.get(cid) {
+            return Some(Arc::clone(state));
+        }
+        let parents = self.context_parents.read();
+        let mut cur = cid;
+        for _ in 0..64 {
+            let Some(parent) = parents.get(cur) else {
+                break;
+            };
+            if let Some(state) = contexts.get(parent.as_str()) {
+                return Some(Arc::clone(state));
+            }
+            cur = parent.as_str();
+        }
+        None
+    }
+
     async fn connect(ws_url: &str, process: ProcessGuard) -> Result<Arc<Self>> {
         let mut ws_config = WebSocketConfig::default();
         ws_config.max_message_size = Some(128 * 1024 * 1024);
@@ -279,6 +333,9 @@ impl BidiConnection {
             write_tx,
             pending: Mutex::new(HashMap::new()),
             contexts: RwLock::new(HashMap::new()),
+            context_parents: RwLock::new(HashMap::new()),
+            isolated_contexts: RwLock::new(HashSet::new()),
+            active_targets: RwLock::new(HashMap::new()),
             process: AsyncMutex::new(Some(process)),
             closed: AtomicBool::new(false),
             io_tasks: Mutex::new(Vec::new()),
@@ -293,27 +350,35 @@ impl BidiConnection {
             let _ = sink.close().await;
         });
 
-        let conn_reader = Arc::clone(&conn);
+        let weak_conn: Weak<Self> = Arc::downgrade(&conn);
         let read_handle = tokio::spawn(async move {
             while let Some(item) = stream.next().await {
-                match item {
-                    Ok(Message::Text(text)) => {
-                        conn_reader.handle_incoming(&text);
-                    }
+                let text_owned: String;
+                let text_ref: &str = match &item {
+                    Ok(Message::Text(text)) => text.as_str(),
                     Ok(Message::Binary(bin)) => {
-                        if let Ok(text) = std::str::from_utf8(&bin) {
-                            conn_reader.handle_incoming(text);
-                        }
+                        let Ok(s) = std::str::from_utf8(bin) else {
+                            continue;
+                        };
+                        text_owned = s.to_string();
+                        &text_owned
                     }
                     Ok(Message::Close(_)) => break,
-                    Ok(_) => {}
+                    Ok(_) => continue,
                     Err(e) => {
                         debug!("BiDi WS read error: {e}");
                         break;
                     }
-                }
+                };
+                let Some(conn_reader) = weak_conn.upgrade() else {
+                    break;
+                };
+                conn_reader.handle_incoming(text_ref);
+                drop(conn_reader);
             }
-            conn_reader.fail_all_pending("BiDi WebSocket connection closed");
+            if let Some(conn_reader) = weak_conn.upgrade() {
+                conn_reader.fail_all_pending("BiDi WebSocket connection closed");
+            }
         });
 
         {
@@ -364,6 +429,25 @@ impl BidiConnection {
                     return;
                 };
                 let params = val.get("params").cloned().unwrap_or(Value::Null);
+
+                if method == "browsingContext.contextCreated" {
+                    if let (Some(cid), Some(parent)) = (
+                        params.get("context").and_then(|v| v.as_str()),
+                        params.get("parent").and_then(|v| v.as_str()),
+                    ) {
+                        self.context_parents
+                            .write()
+                            .insert(cid.to_string(), parent.to_string());
+                    }
+                    return;
+                }
+                if method == "browsingContext.contextDestroyed" {
+                    if let Some(cid) = params.get("context").and_then(|v| v.as_str()) {
+                        self.context_parents.write().remove(cid);
+                    }
+                    return;
+                }
+
                 let ctx_id = params
                     .get("context")
                     .and_then(|v| v.as_str())
@@ -372,14 +456,24 @@ impl BidiConnection {
                             .get("source")
                             .and_then(|s| s.get("context"))
                             .and_then(|v| v.as_str())
-                    })
-                    .map(ToString::to_string);
+                    });
 
-                if let Some(cid) = ctx_id {
-                    let state = self.contexts.read().get(&cid).cloned();
-                    if let Some(state) = state {
-                        state.handle_event(self, method, params);
-                    }
+                if let Some(state) = ctx_id.and_then(|cid| self.resolve_context_state(cid)) {
+                    state.handle_event(self, method, params);
+                } else if method == "network.beforeRequestSent"
+                    && params.get("isBlocked").and_then(|v| v.as_bool()) == Some(true)
+                    && let Some(req_id) = params
+                        .get("request")
+                        .and_then(|r| r.get("request"))
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string)
+                {
+                    let conn_clone = Arc::clone(self);
+                    tokio::spawn(async move {
+                        let _ = conn_clone
+                            .send("network.continueRequest", json!({ "request": req_id }))
+                            .await;
+                    });
                 }
             }
             _ => {}
@@ -387,18 +481,14 @@ impl BidiConnection {
     }
 
     fn fail_all_pending(&self, reason: &str) {
-        self.closed.store(true, Ordering::SeqCst);
         let mut pending = self.pending.lock();
+        self.closed.store(true, Ordering::SeqCst);
         for (_, tx) in pending.drain() {
             let _ = tx.send(Err(MimikyuError::Transport(reason.to_string())));
         }
     }
 
     async fn send(&self, method: &str, params: Value) -> Result<Value> {
-        if self.closed.load(Ordering::SeqCst) {
-            return Err(MimikyuError::Disposed);
-        }
-
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let payload = json!({
             "id": id,
@@ -407,7 +497,13 @@ impl BidiConnection {
         });
 
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().insert(id, tx);
+        {
+            let mut pending = self.pending.lock();
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(MimikyuError::Disposed);
+            }
+            pending.insert(id, tx);
+        }
 
         let serialized = serde_json::to_string(&payload)?;
         if self.write_tx.send(serialized).is_err() {
@@ -439,7 +535,7 @@ impl BidiConnection {
             self.send("browser.close", json!({})),
         )
         .await;
-        self.closed.store(true, Ordering::SeqCst);
+        self.fail_all_pending("BiDi connection shut down");
         {
             let tasks = self.io_tasks.lock();
             for h in tasks.iter() {
@@ -946,6 +1042,7 @@ impl DriverSession for BidiSession {
     async fn new_context(&self, opts: ContextOptions) -> Result<Arc<dyn DriverSession>> {
         self.ensure_alive()?;
         let uc = create_user_context(&self.conn, opts.proxy.as_ref()).await?;
+        self.conn.isolated_contexts.write().insert(uc.clone());
         let created = self
             .conn
             .send(
@@ -963,6 +1060,7 @@ impl DriverSession for BidiSession {
                 message: "browsingContext.create missing context".to_string(),
             })?
             .to_string();
+        self.conn.set_active_target(Some(&uc), &target_id);
 
         let mut info = self.info.clone();
         info.context_id = Some(uc.clone());
@@ -1006,7 +1104,7 @@ impl DriverSession for BidiSession {
             .to_string();
 
         let mut info = self.info.clone();
-        info.target_id = target_id;
+        info.target_id = target_id.clone();
 
         let session = BidiSession::create(
             Arc::clone(&self.conn),
@@ -1016,6 +1114,8 @@ impl DriverSession for BidiSession {
             false,
             self.state.main_world_eval,
         );
+        self.conn
+            .set_active_target(self.state.user_context.as_deref(), &target_id);
 
         if let Some(u) = url
             && u != "about:blank"
@@ -1029,19 +1129,49 @@ impl DriverSession for BidiSession {
         self.ensure_alive()?;
         let tree = self.conn.send("browsingContext.getTree", json!({})).await?;
         let contexts = tree["contexts"].as_array().cloned().unwrap_or_default();
+        let active_tid = self
+            .conn
+            .active_target_for(self.state.user_context.as_deref());
         let mut out = Vec::new();
         for c in contexts {
-            if let Some(ref uc) = self.state.user_context
-                && c["userContext"].as_str() != Some(uc.as_str())
+            let ctx_uc = c["userContext"].as_str();
+            if let Some(ref uc) = self.state.user_context {
+                if ctx_uc != Some(uc.as_str()) {
+                    continue;
+                }
+            } else if let Some(uc) = ctx_uc
+                && self.conn.isolated_contexts.read().contains(uc)
             {
                 continue;
             }
             let tid = c["context"].as_str().unwrap_or_default().to_string();
-            let active = tid == self.ctx();
+            let active = active_tid
+                .as_deref()
+                .map(|a| a == tid)
+                .unwrap_or_else(|| tid == self.ctx());
+            let title = match self
+                .conn
+                .send(
+                    "script.evaluate",
+                    json!({
+                        "expression": "document.title",
+                        "target": { "context": tid, "sandbox": ISOLATED_SANDBOX },
+                        "awaitPromise": false,
+                        "resultOwnership": "none",
+                    }),
+                )
+                .await
+            {
+                Ok(res) => parse_bidi_script_result(&res)
+                    .ok()
+                    .and_then(|v| v.as_str().map(ToString::to_string))
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
+            };
             out.push(TabInfo {
                 target_id: tid,
                 url: c["url"].as_str().unwrap_or_default().to_string(),
-                title: String::new(),
+                title,
                 active,
             });
         }
@@ -1053,6 +1183,8 @@ impl DriverSession for BidiSession {
         self.conn
             .send("browsingContext.activate", json!({ "context": target_id }))
             .await?;
+        self.conn
+            .set_active_target(self.state.user_context.as_deref(), target_id);
         Ok(())
     }
 
@@ -1706,8 +1838,7 @@ impl DriverSession for BidiSession {
             .await?;
 
         if !profile.timezone.is_empty() {
-            let _ = self
-                .conn
+            self.conn
                 .send(
                     "emulation.setTimezoneOverride",
                     json!({
@@ -1715,11 +1846,10 @@ impl DriverSession for BidiSession {
                         "contexts": [self.ctx()],
                     }),
                 )
-                .await;
+                .await?;
         }
         if !profile.locale.is_empty() {
-            let _ = self
-                .conn
+            self.conn
                 .send(
                     "emulation.setLocaleOverride",
                     json!({
@@ -1727,11 +1857,10 @@ impl DriverSession for BidiSession {
                         "contexts": [self.ctx()],
                     }),
                 )
-                .await;
+                .await?;
         }
         if let Some(ref geo) = profile.geolocation {
-            let _ = self
-                .conn
+            self.conn
                 .send(
                     "emulation.setGeolocationOverride",
                     json!({
@@ -1743,7 +1872,7 @@ impl DriverSession for BidiSession {
                         "contexts": [self.ctx()],
                     }),
                 )
-                .await;
+                .await?;
         }
         Ok(())
     }
@@ -1814,7 +1943,10 @@ impl DriverSession for BidiSession {
                 "httpOnly": c.http_only,
                 "secure": c.secure,
             });
-            if let Some(exp) = c.expires {
+            if let Some(exp) = c.expires
+                && exp.is_finite()
+                && exp > 0.0
+            {
                 cookie_obj["expiry"] = json!(exp as u64);
             }
             if let Some(ss) = c.same_site {
@@ -1962,6 +2094,7 @@ impl DriverSession for BidiSession {
             if self.state.owns_user_context
                 && let Some(ref uc) = self.state.user_context
             {
+                self.conn.isolated_contexts.write().remove(uc);
                 let _ = self
                     .conn
                     .send("browser.removeUserContext", json!({ "userContext": uc }))

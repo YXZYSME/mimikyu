@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -97,6 +97,7 @@ impl BrowserDriver for CdpDriver {
                         }
                     })?
                     .to_string();
+                conn.isolated_contexts.write().insert(ctx_id.clone());
                 (Some(ctx_id), true)
             }
             _ => (None, false),
@@ -154,6 +155,8 @@ impl BrowserDriver for CdpDriver {
             })?
             .to_string();
 
+        conn.set_active_target(context_id.as_deref(), &target_id);
+
         let info = SessionInfo {
             session_id: cdp_session_id.clone(),
             engine: EngineKind::Chromium,
@@ -207,12 +210,31 @@ struct CdpConnection {
     write_tx: mpsc::UnboundedSender<String>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
     sessions: RwLock<HashMap<String, Arc<CdpSessionState>>>,
+    isolated_contexts: RwLock<HashSet<String>>,
+    active_targets: RwLock<HashMap<String, String>>,
     process: AsyncMutex<Option<ProcessGuard>>,
     closed: AtomicBool,
     io_tasks: Mutex<Vec<JoinHandle<()>>>,
 }
 
+fn context_scope_key(context_id: Option<&str>) -> String {
+    context_id.unwrap_or("__default__").to_string()
+}
+
 impl CdpConnection {
+    fn set_active_target(&self, context_id: Option<&str>, target_id: &str) {
+        self.active_targets
+            .write()
+            .insert(context_scope_key(context_id), target_id.to_string());
+    }
+
+    fn active_target_for(&self, context_id: Option<&str>) -> Option<String> {
+        self.active_targets
+            .read()
+            .get(&context_scope_key(context_id))
+            .cloned()
+    }
+
     async fn connect(ws_url: &str, process: ProcessGuard) -> Result<Arc<Self>> {
         let mut ws_config = WebSocketConfig::default();
         ws_config.max_message_size = Some(128 * 1024 * 1024);
@@ -230,6 +252,8 @@ impl CdpConnection {
             write_tx,
             pending: Mutex::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
+            isolated_contexts: RwLock::new(HashSet::new()),
+            active_targets: RwLock::new(HashMap::new()),
             process: AsyncMutex::new(Some(process)),
             closed: AtomicBool::new(false),
             io_tasks: Mutex::new(Vec::new()),
@@ -244,27 +268,35 @@ impl CdpConnection {
             let _ = sink.close().await;
         });
 
-        let conn_reader = Arc::clone(&conn);
+        let weak_conn: Weak<Self> = Arc::downgrade(&conn);
         let read_handle = tokio::spawn(async move {
             while let Some(item) = stream.next().await {
-                match item {
-                    Ok(Message::Text(text)) => {
-                        conn_reader.handle_incoming(&text);
-                    }
+                let text_owned: String;
+                let text_ref: &str = match &item {
+                    Ok(Message::Text(text)) => text.as_str(),
                     Ok(Message::Binary(bin)) => {
-                        if let Ok(text) = std::str::from_utf8(&bin) {
-                            conn_reader.handle_incoming(text);
-                        }
+                        let Ok(s) = std::str::from_utf8(bin) else {
+                            continue;
+                        };
+                        text_owned = s.to_string();
+                        &text_owned
                     }
                     Ok(Message::Close(_)) => break,
-                    Ok(_) => {}
+                    Ok(_) => continue,
                     Err(e) => {
                         debug!("CDP WS read error: {e}");
                         break;
                     }
-                }
+                };
+                let Some(conn_reader) = weak_conn.upgrade() else {
+                    break;
+                };
+                conn_reader.handle_incoming(text_ref);
+                drop(conn_reader);
             }
-            conn_reader.fail_all_pending("CDP WebSocket connection closed");
+            if let Some(conn_reader) = weak_conn.upgrade() {
+                conn_reader.fail_all_pending("CDP WebSocket connection closed");
+            }
         });
 
         {
@@ -317,8 +349,8 @@ impl CdpConnection {
     }
 
     fn fail_all_pending(&self, reason: &str) {
-        self.closed.store(true, Ordering::SeqCst);
         let mut pending = self.pending.lock();
+        self.closed.store(true, Ordering::SeqCst);
         for (_, tx) in pending.drain() {
             let _ = tx.send(Err(MimikyuError::Transport(reason.to_string())));
         }
@@ -330,10 +362,6 @@ impl CdpConnection {
         method: &str,
         params: Value,
     ) -> Result<Value> {
-        if self.closed.load(Ordering::SeqCst) {
-            return Err(MimikyuError::Disposed);
-        }
-
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut payload = json!({
             "id": id,
@@ -345,7 +373,13 @@ impl CdpConnection {
         }
 
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().insert(id, tx);
+        {
+            let mut pending = self.pending.lock();
+            if self.closed.load(Ordering::SeqCst) {
+                return Err(MimikyuError::Disposed);
+            }
+            pending.insert(id, tx);
+        }
 
         let serialized = serde_json::to_string(&payload)?;
         if self.write_tx.send(serialized).is_err() {
@@ -380,7 +414,7 @@ impl CdpConnection {
             self.send_browser("Browser.close", json!({})),
         )
         .await;
-        self.closed.store(true, Ordering::SeqCst);
+        self.fail_all_pending("CDP session shut down");
         {
             let tasks = self.io_tasks.lock();
             for h in tasks.iter() {
@@ -832,10 +866,10 @@ impl CdpSession {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {
             let notified = self.state.load_notify.notified();
-            if let Ok(state) = self.document_ready_state().await
-                && state == "complete"
-            {
-                return Ok(());
+            match self.document_ready_state().await {
+                Ok(state) if state == "complete" => return Ok(()),
+                Err(e @ (MimikyuError::Disposed | MimikyuError::Transport(_))) => return Err(e),
+                _ => {}
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
@@ -924,6 +958,7 @@ impl DriverSession for CdpSession {
                 message: "Target.createBrowserContext missing browserContextId".to_string(),
             })?
             .to_string();
+        self.conn.isolated_contexts.write().insert(ctx_id.clone());
 
         let tgt_res = self
             .conn
@@ -939,6 +974,7 @@ impl DriverSession for CdpSession {
                 message: "Target.createTarget missing targetId".to_string(),
             })?
             .to_string();
+        self.conn.set_active_target(Some(&ctx_id), &target_id);
 
         let attach_res = self
             .conn
@@ -1019,7 +1055,7 @@ impl DriverSession for CdpSession {
 
         let mut info = self.info.clone();
         info.session_id = cdp_session_id;
-        info.target_id = target_id;
+        info.target_id = target_id.clone();
 
         let session = CdpSession::create(
             Arc::clone(&self.conn),
@@ -1030,6 +1066,8 @@ impl DriverSession for CdpSession {
             self.state.main_world_eval,
         )
         .await?;
+        self.conn
+            .set_active_target(self.state.context_id.as_deref(), &target_id);
 
         if initial_url != "about:blank" {
             let _ = session.wait_for_load_complete().await;
@@ -1041,18 +1079,29 @@ impl DriverSession for CdpSession {
         self.ensure_alive()?;
         let res = self.conn.send_browser("Target.getTargets", json!({})).await?;
         let targets = res["targetInfos"].as_array().cloned().unwrap_or_default();
+        let active_tid = self
+            .conn
+            .active_target_for(self.state.context_id.as_deref());
         let mut out = Vec::new();
         for t in targets {
             if t["type"].as_str() != Some("page") {
                 continue;
             }
-            if let Some(ref ctx_id) = self.state.context_id
-                && t["browserContextId"].as_str() != Some(ctx_id.as_str())
+            let target_ctx = t["browserContextId"].as_str();
+            if let Some(ref ctx_id) = self.state.context_id {
+                if target_ctx != Some(ctx_id.as_str()) {
+                    continue;
+                }
+            } else if let Some(tc) = target_ctx
+                && self.conn.isolated_contexts.read().contains(tc)
             {
                 continue;
             }
             let target_id = t["targetId"].as_str().unwrap_or_default().to_string();
-            let active = target_id == self.state.target_id;
+            let active = active_tid
+                .as_deref()
+                .map(|a| a == target_id)
+                .unwrap_or_else(|| target_id == self.state.target_id);
             out.push(TabInfo {
                 target_id,
                 url: t["url"].as_str().unwrap_or_default().to_string(),
@@ -1068,6 +1117,8 @@ impl DriverSession for CdpSession {
         self.conn
             .send_browser("Target.activateTarget", json!({ "targetId": target_id }))
             .await?;
+        self.conn
+            .set_active_target(self.state.context_id.as_deref(), target_id);
         Ok(())
     }
 
@@ -1525,23 +1576,54 @@ impl DriverSession for CdpSession {
     }
 
     async fn dispatch_key(&self, ev: KeyEvent) -> Result<()> {
+        let spec = named_key_cdp_spec(&ev.key);
+
+        if ev.event_type == KeyEventType::Char
+            && let Some((cdp_key, default_code, default_vk, default_text)) = spec
+        {
+            let code = ev.code.as_deref().unwrap_or(default_code);
+            let vk = ev.windows_virtual_key_code.unwrap_or(default_vk);
+            let mut down_params = json!({
+                "type": "rawKeyDown",
+                "key": cdp_key,
+                "code": code,
+                "windowsVirtualKeyCode": vk,
+                "modifiers": ev.modifiers,
+            });
+            if let Some(txt) = ev.text.as_deref().or(default_text) {
+                down_params["text"] = json!(txt);
+            }
+            self.call("Input.dispatchKeyEvent", down_params).await?;
+
+            let up_params = json!({
+                "type": "keyUp",
+                "key": cdp_key,
+                "code": code,
+                "windowsVirtualKeyCode": vk,
+                "modifiers": ev.modifiers,
+            });
+            self.call("Input.dispatchKeyEvent", up_params).await?;
+            return Ok(());
+        }
+
         let ev_type = match ev.event_type {
             KeyEventType::Down => "keyDown",
             KeyEventType::Up => "keyUp",
             KeyEventType::Char => "char",
         };
+        let key_str = spec.map(|s| s.0).unwrap_or(ev.key.as_str());
         let mut params = json!({
             "type": ev_type,
-            "key": ev.key,
+            "key": key_str,
             "modifiers": ev.modifiers,
         });
-        if let Some(ref code) = ev.code {
+        if let Some(code) = ev.code.as_deref().or_else(|| spec.map(|s| s.1)) {
             params["code"] = json!(code);
         }
         if let Some(ref text) = ev.text {
             params["text"] = json!(text);
         }
-        if let Some(vk) = ev.windows_virtual_key_code {
+        if let Some(vk) = ev.windows_virtual_key_code.or_else(|| spec.map(|s| s.2)) {
             params["windowsVirtualKeyCode"] = json!(vk);
         }
         self.call("Input.dispatchKeyEvent", params).await?;
@@ -1928,6 +2010,7 @@ impl DriverSession for CdpSession {
             self.conn.shutdown_all().await;
         } else if self.state.owns_context {
             if let Some(ref ctx_id) = self.state.context_id {
+                self.conn.isolated_contexts.write().remove(ctx_id);
                 let _ = self
                     .conn
                     .send_browser(
@@ -2028,4 +2111,68 @@ fn quad_to_bbox(quad: &Value) -> Option<BoundingBox> {
         width: (max_x - min_x).max(0.0),
         height: (max_y - min_y).max(0.0),
     })
+}
+
+fn named_key_cdp_spec(key: &str) -> Option<(&'static str, &'static str, u32, Option<&'static str>)> {
+    match key {
+        "Cancel" => Some(("Cancel", "Cancel", 3, None)),
+        "Help" => Some(("Help", "Help", 47, None)),
+        "Backspace" => Some(("Backspace", "Backspace", 8, None)),
+        "Tab" => Some(("Tab", "Tab", 9, None)),
+        "Clear" => Some(("Clear", "NumpadClear", 12, None)),
+        "Enter" | "Return" => Some(("Enter", "Enter", 13, Some("\r"))),
+        "Shift" => Some(("Shift", "ShiftLeft", 16, None)),
+        "Control" => Some(("Control", "ControlLeft", 17, None)),
+        "Alt" => Some(("Alt", "AltLeft", 18, None)),
+        "Pause" => Some(("Pause", "Pause", 19, None)),
+        "Escape" => Some(("Escape", "Escape", 27, None)),
+        "Space" => Some((" ", "Space", 32, Some(" "))),
+        "PageUp" => Some(("PageUp", "PageUp", 33, None)),
+        "PageDown" => Some(("PageDown", "PageDown", 34, None)),
+        "End" => Some(("End", "End", 35, None)),
+        "Home" => Some(("Home", "Home", 36, None)),
+        "ArrowLeft" => Some(("ArrowLeft", "ArrowLeft", 37, None)),
+        "ArrowUp" => Some(("ArrowUp", "ArrowUp", 38, None)),
+        "ArrowRight" => Some(("ArrowRight", "ArrowRight", 39, None)),
+        "ArrowDown" => Some(("ArrowDown", "ArrowDown", 40, None)),
+        "Insert" => Some(("Insert", "Insert", 45, None)),
+        "Delete" => Some(("Delete", "Delete", 46, None)),
+        "Meta" => Some(("Meta", "MetaLeft", 91, None)),
+        "F1" => Some(("F1", "F1", 112, None)),
+        "F2" => Some(("F2", "F2", 113, None)),
+        "F3" => Some(("F3", "F3", 114, None)),
+        "F4" => Some(("F4", "F4", 115, None)),
+        "F5" => Some(("F5", "F5", 116, None)),
+        "F6" => Some(("F6", "F6", 117, None)),
+        "F7" => Some(("F7", "F7", 118, None)),
+        "F8" => Some(("F8", "F8", 119, None)),
+        "F9" => Some(("F9", "F9", 120, None)),
+        "F10" => Some(("F10", "F10", 121, None)),
+        "F11" => Some(("F11", "F11", 122, None)),
+        "F12" => Some(("F12", "F12", 123, None)),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_key_cdp_spec_covers_editing_and_ignores_printable() {
+        assert_eq!(
+            named_key_cdp_spec("Backspace"),
+            Some(("Backspace", "Backspace", 8, None))
+        );
+        assert_eq!(
+            named_key_cdp_spec("Enter"),
+            Some(("Enter", "Enter", 13, Some("\r")))
+        );
+        assert_eq!(
+            named_key_cdp_spec("ArrowLeft"),
+            Some(("ArrowLeft", "ArrowLeft", 37, None))
+        );
+        assert_eq!(named_key_cdp_spec("a"), None);
+        assert_eq!(named_key_cdp_spec("!"), None);
+    }
 }

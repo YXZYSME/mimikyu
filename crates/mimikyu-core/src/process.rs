@@ -142,7 +142,7 @@ impl ProcessGuard {
             reaped: false,
         };
 
-        match wait_for_chromium_ws(stderr, &profile_dir, timeout_dur).await {
+        match wait_for_chromium_ws(guard.child.as_mut(), stderr, &profile_dir, timeout_dur).await {
             Ok((ws_url, drain_task)) => {
                 guard.ws_endpoint = ws_url;
                 guard.stderr_drain = Some(drain_task);
@@ -218,7 +218,7 @@ impl ProcessGuard {
             reaped: false,
         };
 
-        match wait_for_firefox_ws(stderr, &profile_dir, timeout_dur).await {
+        match wait_for_firefox_ws(guard.child.as_mut(), stderr, &profile_dir, timeout_dur).await {
             Ok((ws_url, drain_task)) => {
                 guard.ws_endpoint = ws_url;
                 guard.stderr_drain = Some(drain_task);
@@ -244,6 +244,12 @@ impl ProcessGuard {
                 && let Ok(Ok(_status)) = tokio::time::timeout(grace_timeout, child.wait()).await
             {
                 wait_for_pgid_gone(self.pgid, Duration::from_millis(300)).await;
+                if !is_pgid_gone(self.pgid) {
+                    unsafe {
+                        libc::kill(-self.pgid, libc::SIGKILL);
+                    }
+                    wait_for_pgid_gone(self.pgid, Duration::from_millis(500)).await;
+                }
                 if let Some(h) = self.stderr_drain.take() {
                     h.abort();
                 }
@@ -259,6 +265,12 @@ impl ProcessGuard {
                 tokio::time::timeout(Duration::from_millis(1000), child.wait()).await
             {
                 wait_for_pgid_gone(self.pgid, Duration::from_millis(300)).await;
+                if !is_pgid_gone(self.pgid) {
+                    unsafe {
+                        libc::kill(-self.pgid, libc::SIGKILL);
+                    }
+                    wait_for_pgid_gone(self.pgid, Duration::from_millis(500)).await;
+                }
                 if let Some(h) = self.stderr_drain.take() {
                     h.abort();
                 }
@@ -444,7 +456,22 @@ pub fn build_chromium_args(
     args
 }
 
+async fn drain_remaining_stderr(
+    reader: &mut Option<tokio::io::Lines<BufReader<tokio::process::ChildStderr>>>,
+    collected_stderr: &mut Vec<String>,
+) {
+    if let Some(lines) = reader {
+        while collected_stderr.len() < 20 {
+            match tokio::time::timeout(Duration::from_millis(20), lines.next_line()).await {
+                Ok(Ok(Some(line))) => collected_stderr.push(line),
+                _ => break,
+            }
+        }
+    }
+}
+
 async fn wait_for_chromium_ws(
+    mut child: Option<&mut Child>,
     stderr: Option<tokio::process::ChildStderr>,
     profile_dir: &Path,
     timeout: Duration,
@@ -458,6 +485,16 @@ async fn wait_for_chromium_ws(
         if let Some(ws) = try_read_devtools_active_port(&active_port_path) {
             let drain = spawn_stderr_drain(reader);
             return Ok((ws, drain));
+        }
+
+        if let Some(c) = child.as_deref_mut()
+            && let Ok(Some(status)) = c.try_wait()
+        {
+            drain_remaining_stderr(&mut reader, &mut collected_stderr).await;
+            let tail = collected_stderr.join(" | ");
+            return Err(MimikyuError::LaunchFailed(format!(
+                "Chromium exited immediately with {status} before publishing DevTools WS endpoint ({tail})"
+            )));
         }
 
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -487,6 +524,14 @@ async fn wait_for_chromium_ws(
                 }
                 Ok(Ok(None)) => {
                     reader = None;
+                    if let Some(c) = child.as_deref_mut()
+                        && let Ok(Some(status)) = c.try_wait()
+                    {
+                        let tail = collected_stderr.join(" | ");
+                        return Err(MimikyuError::LaunchFailed(format!(
+                            "Chromium exited immediately with {status} before publishing DevTools WS endpoint ({tail})"
+                        )));
+                    }
                 }
                 Ok(Err(e)) => {
                     warn!("error reading Chromium stderr: {e}");
@@ -515,6 +560,7 @@ fn try_read_devtools_active_port(path: &Path) -> Option<String> {
 }
 
 async fn wait_for_firefox_ws(
+    mut child: Option<&mut Child>,
     stderr: Option<tokio::process::ChildStderr>,
     profile_dir: &Path,
     timeout: Duration,
@@ -528,6 +574,16 @@ async fn wait_for_firefox_ws(
         if let Some(ws) = try_read_firefox_bidi_json(&bidi_file) {
             let drain = spawn_stderr_drain(reader);
             return Ok((ws, drain));
+        }
+
+        if let Some(c) = child.as_deref_mut()
+            && let Ok(Some(status)) = c.try_wait()
+        {
+            drain_remaining_stderr(&mut reader, &mut collected_stderr).await;
+            let tail = collected_stderr.join(" | ");
+            return Err(MimikyuError::LaunchFailed(format!(
+                "Firefox exited immediately with {status} before publishing WebDriver BiDi endpoint ({tail})"
+            )));
         }
 
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -560,6 +616,14 @@ async fn wait_for_firefox_ws(
                 }
                 Ok(Ok(None)) => {
                     reader = None;
+                    if let Some(c) = child.as_deref_mut()
+                        && let Ok(Some(status)) = c.try_wait()
+                    {
+                        let tail = collected_stderr.join(" | ");
+                        return Err(MimikyuError::LaunchFailed(format!(
+                            "Firefox exited immediately with {status} before publishing WebDriver BiDi endpoint ({tail})"
+                        )));
+                    }
                 }
                 Ok(Err(e)) => {
                     warn!("error reading Firefox stderr: {e}");
@@ -634,6 +698,16 @@ pub fn write_firefox_user_js(profile_dir: &Path, opts: &LaunchOptions) -> Result
     Ok(())
 }
 
+fn resolve_proxy_port(parsed: &url::Url) -> u16 {
+    if let Some(port) = parsed.port_or_known_default() {
+        return port;
+    }
+    match parsed.scheme() {
+        "socks" | "socks4" | "socks5" => 1080,
+        _ => 8080,
+    }
+}
+
 fn append_firefox_proxy_prefs(
     prefs: &mut String,
     server: &str,
@@ -641,7 +715,7 @@ fn append_firefox_proxy_prefs(
 ) -> Result<()> {
     let parsed = url::Url::parse(server).or_else(|_| url::Url::parse(&format!("http://{server}")))?;
     let host = parsed.host_str().unwrap_or("127.0.0.1");
-    let port = parsed.port().unwrap_or(8080);
+    let port = resolve_proxy_port(&parsed);
 
     prefs.push_str("user_pref(\"network.proxy.type\", 1);\n");
     match parsed.scheme() {
@@ -849,6 +923,30 @@ mod tests {
         let content = fs::read_to_string(dir.path().join("user.js")).expect("read user.js");
         assert!(content.contains("user_pref(\"browser.sessionhistory.max_entries\", 50);"));
         assert!(content.contains("user_pref(\"toolkit.telemetry.enabled\", false);"));
+    }
+
+    #[test]
+    fn resolve_proxy_port_uses_scheme_defaults() {
+        assert_eq!(
+            resolve_proxy_port(&url::Url::parse("http://proxy.local").unwrap()),
+            80
+        );
+        assert_eq!(
+            resolve_proxy_port(&url::Url::parse("https://proxy.local").unwrap()),
+            443
+        );
+        assert_eq!(
+            resolve_proxy_port(&url::Url::parse("socks5://proxy.local").unwrap()),
+            1080
+        );
+        assert_eq!(
+            resolve_proxy_port(&url::Url::parse("socks4://proxy.local").unwrap()),
+            1080
+        );
+        assert_eq!(
+            resolve_proxy_port(&url::Url::parse("http://proxy.local:3128").unwrap()),
+            3128
+        );
     }
 }
 

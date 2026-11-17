@@ -163,6 +163,24 @@ async fn exercise_engine_full(engine: EngineKind) {
         .expect("read #inp value");
     assert_eq!(inp_val, "mimikyu!");
 
+    // 6a. Editing key parity: KeyEventType::Char("Backspace") deletes trailing '!' on both engines
+    session
+        .dispatch_key(KeyEvent {
+            event_type: KeyEventType::Char,
+            key: "Backspace".to_string(),
+            code: None,
+            text: None,
+            windows_virtual_key_code: None,
+            modifiers: 0,
+        })
+        .await
+        .expect("dispatch_key Backspace");
+    let inp_after_bs = session
+        .eval_isolated("document.getElementById('inp').value")
+        .await
+        .expect("read #inp value after backspace");
+    assert_eq!(inp_after_bs, "mimikyu");
+
     // 6b. File input upload
     let tmp_file = tempfile::NamedTempFile::new().expect("temp file");
     std::fs::write(tmp_file.path(), b"hello-upload").expect("write temp file");
@@ -176,7 +194,19 @@ async fn exercise_engine_full(engine: EngineKind) {
         .expect("files length");
     assert_eq!(file_count, 1);
 
-    // 6c. Env overrides & instant animations
+    // 6c. Env overrides & instant animations + invalid timezone error propagation
+    let bad_tz_err = session
+        .set_env_overrides(EnvProfile {
+            timezone: "Invalid/DoesNotExist".to_string(),
+            ..Default::default()
+        })
+        .await
+        .expect_err("invalid timezone should return Err");
+    assert!(
+        matches!(bad_tz_err, MimikyuError::Protocol { .. }),
+        "expected Protocol error for invalid timezone, got {bad_tz_err:?}"
+    );
+
     let env_prof = EnvProfile {
         viewport_width: 1024,
         viewport_height: 768,
@@ -198,7 +228,7 @@ async fn exercise_engine_full(engine: EngineKind) {
         .await
         .expect("set_instant_animations");
 
-    // 6d. Tabs: new_tab, list_tabs, activate_tab
+    // 6d. Tabs: new_tab, list_tabs (title + active tracking), activate_tab
     let tab2 = session
         .new_tab(Some(&server.url("/target")))
         .await
@@ -206,10 +236,34 @@ async fn exercise_engine_full(engine: EngineKind) {
     assert_eq!(tab2.title().await.expect("tab2 title"), "Redirect Target");
     let tabs = session.list_tabs().await.expect("list_tabs");
     assert!(tabs.len() >= 2, "expected at least 2 tabs, got {tabs:?}");
+    let t2_info = tabs
+        .iter()
+        .find(|t| t.target_id == tab2.info().target_id)
+        .expect("tab2 present in list_tabs");
+    assert!(t2_info.active, "newly created tab2 should be active: {tabs:?}");
+    assert_eq!(t2_info.title, "Redirect Target");
+
     session
         .activate_tab(&session.info().target_id)
         .await
-        .expect("activate_tab");
+        .expect("activate_tab back to root");
+    let tabs_after_act = session.list_tabs().await.expect("list_tabs after activate");
+    let root_info = tabs_after_act
+        .iter()
+        .find(|t| t.target_id == session.info().target_id)
+        .expect("root tab present");
+    assert!(
+        root_info.active,
+        "root tab should be active after activate_tab: {tabs_after_act:?}"
+    );
+    assert!(
+        !tabs_after_act
+            .iter()
+            .find(|t| t.target_id == tab2.info().target_id)
+            .expect("tab2 present")
+            .active,
+        "tab2 should no longer be active"
+    );
     tab2.dispose().await.expect("dispose tab2");
 
     // 7. Screenshot & PDF
@@ -284,6 +338,17 @@ async fn exercise_engine_full(engine: EngineKind) {
         !b_cookies.iter().any(|c| c.name == "ctx_cookie"),
         "ctx_b should not see ctx_a's cookie"
     );
+
+    // Verify list_tabs() isolation between root and VirtualContext sessions
+    let root_tabs = session.list_tabs().await.expect("root list_tabs");
+    assert!(
+        !root_tabs.iter().any(|t| t.target_id == ctx_a.info().target_id || t.target_id == ctx_b.info().target_id),
+        "root list_tabs() must not leak virtual context tabs: {root_tabs:?}"
+    );
+    let ctx_a_tabs = ctx_a.list_tabs().await.expect("ctx_a list_tabs");
+    assert_eq!(ctx_a_tabs.len(), 1, "ctx_a should see only its own tab: {ctx_a_tabs:?}");
+    assert_eq!(ctx_a_tabs[0].target_id, ctx_a.info().target_id);
+    assert!(ctx_a_tabs[0].active);
 
     ctx_a.dispose().await.expect("dispose ctx_a");
     ctx_b.dispose().await.expect("dispose ctx_b");
@@ -402,6 +467,32 @@ async fn exercise_engine_full(engine: EngineKind) {
     assert!(
         hits.iter().any(|h| h.contains("/api/real")),
         "/api/real should hit server; hits={hits:?}"
+    );
+
+    // 11b. Blocked URLs + Route Mock with <iframe> subframe navigation (must not hang in BiDi or CDP)
+    let iframe_nav = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        session.navigate(&server.url("/iframe-page")),
+    )
+    .await
+    .expect("iframe navigation with active intercept must not hang")
+    .expect("navigate /iframe-page");
+    assert_eq!(iframe_nav.title, "Iframe Host");
+
+    let sub_text = session
+        .eval_isolated("document.getElementById('subframe').contentDocument.getElementById('sub-ok').textContent")
+        .await
+        .expect("read subframe DOM");
+    assert_eq!(sub_text, "subframe-loaded");
+
+    let hits_after_iframe = server.hits();
+    assert!(
+        hits_after_iframe.iter().any(|h| h.contains("/subframe")),
+        "subframe request should reach server; hits={hits_after_iframe:?}"
+    );
+    assert!(
+        !hits_after_iframe.iter().any(|h| h.contains("/blocked.png")),
+        "blocked.png inside iframe must still be blocked; hits={hits_after_iframe:?}"
     );
 
     // 12. Dispose & verify zero orphan process group

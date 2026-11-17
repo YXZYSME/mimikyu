@@ -115,6 +115,15 @@ pub fn discover_browser(
         }
         let flavor_guess = classify_flavor(engine, &path, "");
         if engine == EngineKind::Chromium && !headless && flavor_guess == ChromiumFlavor::HeadlessShell {
+            if first_headed_error.is_none() {
+                first_headed_error = Some(MimikyuError::Unsupported {
+                    engine: engine.to_string(),
+                    feature: format!(
+                        "headed mode is unsupported by headless-only binary '{}'",
+                        path.display()
+                    ),
+                });
+            }
             continue;
         }
         match validate_and_probe(engine, &path, source) {
@@ -428,85 +437,196 @@ fn probe_version(path: &Path) -> Result<String> {
     Ok(version_line.to_string())
 }
 
+fn playwright_headless_shell_subpaths() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            &[
+                "chrome-headless-shell-mac-arm64/chrome-headless-shell",
+                "chrome-mac-arm64/headless_shell",
+                "chrome-headless-shell-mac-x64/chrome-headless-shell",
+                "chrome-mac/headless_shell",
+            ]
+        } else {
+            &[
+                "chrome-headless-shell-mac-x64/chrome-headless-shell",
+                "chrome-mac/headless_shell",
+                "chrome-headless-shell-mac-arm64/chrome-headless-shell",
+                "chrome-mac-arm64/headless_shell",
+            ]
+        }
+    } else if cfg!(target_arch = "aarch64") {
+        &[
+            "chrome-headless-shell-linux-arm64/chrome-headless-shell",
+            "chrome-headless-shell-linux/chrome-headless-shell",
+            "chrome-linux/headless_shell",
+            "chrome-headless-shell-linux-x64/chrome-headless-shell",
+        ]
+    } else {
+        &[
+            "chrome-headless-shell-linux-x64/chrome-headless-shell",
+            "chrome-headless-shell-linux/chrome-headless-shell",
+            "chrome-linux/headless_shell",
+            "chrome-headless-shell-linux-arm64/chrome-headless-shell",
+        ]
+    }
+}
+
+fn puppeteer_headless_shell_subpaths() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            &[
+                "chrome-headless-shell-mac-arm64/chrome-headless-shell",
+                "chrome-headless-shell-mac-x64/chrome-headless-shell",
+            ]
+        } else {
+            &[
+                "chrome-headless-shell-mac-x64/chrome-headless-shell",
+                "chrome-headless-shell-mac-arm64/chrome-headless-shell",
+            ]
+        }
+    } else if cfg!(target_arch = "aarch64") {
+        &[
+            "chrome-headless-shell-linux-arm64/chrome-headless-shell",
+            "chrome-headless-shell-linux64/chrome-headless-shell",
+        ]
+    } else {
+        &[
+            "chrome-headless-shell-linux64/chrome-headless-shell",
+            "chrome-headless-shell-linux-arm64/chrome-headless-shell",
+        ]
+    }
+}
+
+fn playwright_chromium_subpaths() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            &[
+                "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium",
+                "chrome-mac/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+            ]
+        } else {
+            &[
+                "chrome-mac/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+                "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium",
+            ]
+        }
+    } else {
+        &["chrome-linux/chrome", "chrome-linux64/chrome"]
+    }
+}
+
+fn puppeteer_chromium_subpaths() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            &[
+                "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+            ]
+        } else {
+            &[
+                "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+            ]
+        }
+    } else {
+        &["chrome-linux64/chrome", "chrome-linux/chrome"]
+    }
+}
+
+fn system_chromium_paths() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &[
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        ]
+    } else {
+        &[
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+        ]
+    }
+}
+
+fn playwright_firefox_subpaths() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &[
+            "firefox/Nightly.app/Contents/MacOS/firefox",
+            "firefox/Firefox.app/Contents/MacOS/firefox",
+            "firefox/firefox",
+        ]
+    } else {
+        &[
+            "firefox/firefox",
+            "firefox/Nightly.app/Contents/MacOS/firefox",
+            "firefox/Firefox.app/Contents/MacOS/firefox",
+        ]
+    }
+}
+
+fn system_firefox_paths() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &[
+            "/Applications/Firefox.app/Contents/MacOS/firefox",
+            "/Applications/Firefox Nightly.app/Contents/MacOS/firefox",
+        ]
+    } else {
+        &["/usr/bin/firefox", "/usr/local/bin/firefox"]
+    }
+}
+
 fn collect_candidates(engine: EngineKind) -> Vec<(PathBuf, DiscoverySource)> {
     let mut out = Vec::new();
 
     match engine {
         EngineKind::Chromium => {
-            // 1. Playwright chrome-headless-shell (newest-first)
+            // 1. Playwright chrome-headless-shell (newest-first, host OS/arch prioritized)
             for root in playwright_cache_roots() {
                 for dir in sorted_prefixed_dirs(&root, "chromium_headless_shell-") {
-                    for sub in [
-                        "chrome-headless-shell-mac-arm64/chrome-headless-shell",
-                        "chrome-headless-shell-mac-x64/chrome-headless-shell",
-                        "chrome-headless-shell-linux/chrome-headless-shell",
-                        "chrome-headless-shell-linux-x64/chrome-headless-shell",
-                        "chrome-headless-shell-linux-arm64/chrome-headless-shell",
-                        "chrome-mac/headless_shell",
-                        "chrome-mac-arm64/headless_shell",
-                        "chrome-linux/headless_shell",
-                    ] {
+                    for sub in playwright_headless_shell_subpaths() {
                         out.push((dir.join(sub), DiscoverySource::PlaywrightCache));
                     }
                 }
             }
 
-            // 2. Puppeteer chrome-headless-shell (newest-first)
+            // 2. Puppeteer chrome-headless-shell (newest-first, host OS/arch prioritized)
             for root in puppeteer_cache_roots() {
                 let chs_root = root.join("chrome-headless-shell");
                 for dir in sorted_versioned_dirs(&chs_root) {
-                    for sub in [
-                        "chrome-headless-shell-mac-arm64/chrome-headless-shell",
-                        "chrome-headless-shell-mac-x64/chrome-headless-shell",
-                        "chrome-headless-shell-linux64/chrome-headless-shell",
-                        "chrome-headless-shell-linux-arm64/chrome-headless-shell",
-                    ] {
+                    for sub in puppeteer_headless_shell_subpaths() {
                         out.push((dir.join(sub), DiscoverySource::PuppeteerCache));
                     }
                 }
             }
 
-            // 3. Playwright full Chromium / Chrome for Testing (newest-first)
+            // 3. Playwright full Chromium / Chrome for Testing (newest-first, host OS/arch prioritized)
             for root in playwright_cache_roots() {
                 for dir in sorted_prefixed_dirs(&root, "chromium-") {
-                    for sub in [
-                        "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
-                        "chrome-mac/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
-                        "chrome-mac-arm64/Chromium.app/Contents/MacOS/Chromium",
-                        "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
-                        "chrome-linux/chrome",
-                        "chrome-linux64/chrome",
-                    ] {
+                    for sub in playwright_chromium_subpaths() {
                         out.push((dir.join(sub), DiscoverySource::PlaywrightCache));
                     }
                 }
             }
 
-            // 4. Puppeteer Chrome for Testing (newest-first)
+            // 4. Puppeteer Chrome for Testing (newest-first, host OS/arch prioritized)
             for root in puppeteer_cache_roots() {
                 let chrome_root = root.join("chrome");
                 for dir in sorted_versioned_dirs(&chrome_root) {
-                    for sub in [
-                        "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
-                        "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
-                        "chrome-linux64/chrome",
-                    ] {
+                    for sub in puppeteer_chromium_subpaths() {
                         out.push((dir.join(sub), DiscoverySource::PuppeteerCache));
                     }
                 }
             }
 
             // 5. System installs & PATH
-            for p in [
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-                "/Applications/Chromium.app/Contents/MacOS/Chromium",
-                "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
-                "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
-                "/usr/bin/google-chrome",
-                "/usr/bin/google-chrome-stable",
-                "/usr/bin/chromium",
-                "/usr/bin/chromium-browser",
-            ] {
+            for p in system_chromium_paths() {
                 out.push((PathBuf::from(p), DiscoverySource::SystemInstall));
             }
 
@@ -523,26 +643,17 @@ fn collect_candidates(engine: EngineKind) -> Vec<(PathBuf, DiscoverySource)> {
             }
         }
         EngineKind::Firefox => {
-            // 1. Playwright Firefox (newest-first)
+            // 1. Playwright Firefox (newest-first, host OS prioritized)
             for root in playwright_cache_roots() {
                 for dir in sorted_prefixed_dirs(&root, "firefox-") {
-                    for sub in [
-                        "firefox/Nightly.app/Contents/MacOS/firefox",
-                        "firefox/Firefox.app/Contents/MacOS/firefox",
-                        "firefox/firefox",
-                    ] {
+                    for sub in playwright_firefox_subpaths() {
                         out.push((dir.join(sub), DiscoverySource::PlaywrightCache));
                     }
                 }
             }
 
             // 2. System installs & PATH
-            for p in [
-                "/Applications/Firefox.app/Contents/MacOS/firefox",
-                "/Applications/Firefox Nightly.app/Contents/MacOS/firefox",
-                "/usr/bin/firefox",
-                "/usr/local/bin/firefox",
-            ] {
+            for p in system_firefox_paths() {
                 out.push((PathBuf::from(p), DiscoverySource::SystemInstall));
             }
 
