@@ -98,6 +98,8 @@ impl ProcessGuard {
         args.extend(opts.extra_args.iter().cloned());
         args.push("about:blank".to_string());
 
+        remove_stale_marker(&profile_dir.join("DevToolsActivePort"))?;
+
         let mut cmd = Command::new(&browser.path);
         cmd.args(&args)
             .stdin(Stdio::null())
@@ -162,6 +164,7 @@ impl ProcessGuard {
         ephemeral_dir: Option<TempDir>,
     ) -> Result<Self> {
         write_firefox_user_js(&profile_dir, opts)?;
+        remove_stale_marker(&profile_dir.join("WebDriverBiDiServer.json"))?;
 
         let mut args = Vec::new();
         if opts.headless {
@@ -544,6 +547,14 @@ async fn wait_for_chromium_ws(
         } else {
             tokio::time::sleep(step).await;
         }
+    }
+}
+
+fn remove_stale_marker(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(MimikyuError::Io(e)),
     }
 }
 

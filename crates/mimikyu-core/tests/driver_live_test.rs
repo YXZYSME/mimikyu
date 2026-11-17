@@ -285,6 +285,95 @@ async fn exercise_engine_full(engine: EngineKind) {
         "printable key without text and Space must insert 'Z ok'"
     );
 
+    // 6a-3. Function keys (F1, F12) & Shift+a Char parity on both engines
+    session
+        .eval_isolated(
+            "window.__keyEvents = []; document.addEventListener('keydown', (e) => { window.__keyEvents.push(e.key + ':' + e.shiftKey); });",
+        )
+        .await
+        .expect("attach keydown listener");
+    session
+        .dispatch_key(KeyEvent {
+            event_type: KeyEventType::Char,
+            key: "F1".to_string(),
+            code: None,
+            text: None,
+            windows_virtual_key_code: None,
+            modifiers: 0,
+        })
+        .await
+        .expect("dispatch_key F1");
+    session
+        .dispatch_key(KeyEvent {
+            event_type: KeyEventType::Char,
+            key: "F12".to_string(),
+            code: None,
+            text: None,
+            windows_virtual_key_code: None,
+            modifiers: 0,
+        })
+        .await
+        .expect("dispatch_key F12");
+    session
+        .dispatch_key(KeyEvent {
+            event_type: KeyEventType::Down,
+            key: "Shift".to_string(),
+            code: None,
+            text: None,
+            windows_virtual_key_code: None,
+            modifiers: 0,
+        })
+        .await
+        .expect("dispatch_key Shift down");
+    session
+        .dispatch_key(KeyEvent {
+            event_type: KeyEventType::Char,
+            key: "a".to_string(),
+            code: None,
+            text: None,
+            windows_virtual_key_code: None,
+            modifiers: 8,
+        })
+        .await
+        .expect("dispatch_key Shift+a Char");
+    session
+        .dispatch_key(KeyEvent {
+            event_type: KeyEventType::Up,
+            key: "Shift".to_string(),
+            code: None,
+            text: None,
+            windows_virtual_key_code: None,
+            modifiers: 0,
+        })
+        .await
+        .expect("dispatch_key Shift up");
+
+    let key_events = session
+        .eval_isolated("window.__keyEvents")
+        .await
+        .expect("read __keyEvents");
+    let key_events_arr = key_events.as_array().expect("__keyEvents array");
+    assert!(
+        key_events_arr.iter().any(|v| v.as_str() == Some("F1:false")),
+        "expected F1 keydown event on {engine}: {key_events_arr:?}"
+    );
+    assert!(
+        key_events_arr.iter().any(|v| v.as_str() == Some("F12:false")),
+        "expected F12 keydown event on {engine}: {key_events_arr:?}"
+    );
+    assert!(
+        key_events_arr.iter().any(|v| v.as_str() == Some("A:true")),
+        "expected Shift+a keydown 'A:true' on {engine}: {key_events_arr:?}"
+    );
+    let inp2_after_shift = session
+        .eval_isolated("document.getElementById('inp2').value")
+        .await
+        .expect("read #inp2 after Shift+a");
+    assert_eq!(
+        inp2_after_shift, "Z okA",
+        "Shift+a Char must insert 'A' on {engine}"
+    );
+
     // Navigate back to / for subsequent checks (#file-inp, screenshot, etc.)
     session
         .navigate(&server.url("/"))

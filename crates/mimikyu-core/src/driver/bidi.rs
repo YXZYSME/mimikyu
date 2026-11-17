@@ -2244,7 +2244,45 @@ fn map_webdriver_key(key: &str) -> String {
         "ArrowDown" => "\u{E015}".to_string(),
         "Insert" => "\u{E016}".to_string(),
         "Delete" => "\u{E017}".to_string(),
+        "F1" => "\u{E031}".to_string(),
+        "F2" => "\u{E032}".to_string(),
+        "F3" => "\u{E033}".to_string(),
+        "F4" => "\u{E034}".to_string(),
+        "F5" => "\u{E035}".to_string(),
+        "F6" => "\u{E036}".to_string(),
+        "F7" => "\u{E037}".to_string(),
+        "F8" => "\u{E038}".to_string(),
+        "F9" => "\u{E039}".to_string(),
+        "F10" => "\u{E03A}".to_string(),
+        "F11" => "\u{E03B}".to_string(),
+        "F12" => "\u{E03C}".to_string(),
         "Meta" => "\u{E03D}".to_string(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_webdriver_key_covers_function_navigation_and_printable_keys() {
+        assert_eq!(map_webdriver_key("F1"), "\u{E031}");
+        assert_eq!(map_webdriver_key("F2"), "\u{E032}");
+        assert_eq!(map_webdriver_key("F3"), "\u{E033}");
+        assert_eq!(map_webdriver_key("F4"), "\u{E034}");
+        assert_eq!(map_webdriver_key("F5"), "\u{E035}");
+        assert_eq!(map_webdriver_key("F6"), "\u{E036}");
+        assert_eq!(map_webdriver_key("F7"), "\u{E037}");
+        assert_eq!(map_webdriver_key("F8"), "\u{E038}");
+        assert_eq!(map_webdriver_key("F9"), "\u{E039}");
+        assert_eq!(map_webdriver_key("F10"), "\u{E03A}");
+        assert_eq!(map_webdriver_key("F11"), "\u{E03B}");
+        assert_eq!(map_webdriver_key("F12"), "\u{E03C}");
+        assert_eq!(map_webdriver_key("Enter"), "\u{E007}");
+        assert_eq!(map_webdriver_key("Space"), "\u{E00D}");
+        assert_eq!(map_webdriver_key("Meta"), "\u{E03D}");
+        assert_eq!(map_webdriver_key("a"), "a");
+        assert_eq!(map_webdriver_key("é"), "é");
     }
 }

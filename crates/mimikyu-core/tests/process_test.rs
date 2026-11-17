@@ -183,3 +183,110 @@ async fn process_launch_fails_fast_on_immediate_exit() {
         "immediate exit should fail fast, took {elapsed:?}"
     );
 }
+
+async fn assert_persistent_profile_relaunch(engine: EngineKind) {
+    let driver = driver_for(engine);
+    let root = tempfile::tempdir().expect("tempdir");
+
+    // 1. Relaunch into same persistent profile dir after explicit dispose()
+    let path_dispose = root.path().join("persist-dispose");
+    std::fs::create_dir_all(&path_dispose).expect("create persist-dispose dir");
+    std::fs::write(path_dispose.join("user_sentinel.txt"), b"persist-dispose")
+        .expect("write sentinel");
+
+    let opts_dispose = LaunchOptions {
+        engine,
+        headless: true,
+        profile_mode: ProfileMode::Persistent(path_dispose.clone()),
+        ..Default::default()
+    };
+
+    let s1 = driver
+        .launch(opts_dispose.clone())
+        .await
+        .expect("launch s1 persistent (dispose)");
+    let pid1 = s1.info().pid.expect("pid1");
+    assert_eq!(
+        s1.eval_isolated("1 + 1").await.expect("s1 eval"),
+        serde_json::json!(2)
+    );
+    s1.dispose().await.expect("dispose s1");
+    assert_pgid_gone(pid1 as libc::pid_t);
+    assert!(path_dispose.exists(), "persistent dir must remain after dispose");
+    assert_eq!(
+        std::fs::read(path_dispose.join("user_sentinel.txt")).expect("read sentinel"),
+        b"persist-dispose"
+    );
+
+    let s2 = driver
+        .launch(opts_dispose)
+        .await
+        .expect("relaunch s2 into persistent dir after dispose");
+    let pid2 = s2.info().pid.expect("pid2");
+    assert_eq!(
+        s2.eval_isolated("2 + 2").await.expect("s2 eval"),
+        serde_json::json!(4)
+    );
+    s2.dispose().await.expect("dispose s2");
+    assert_pgid_gone(pid2 as libc::pid_t);
+    assert_eq!(
+        std::fs::read(path_dispose.join("user_sentinel.txt")).expect("read sentinel after s2"),
+        b"persist-dispose"
+    );
+
+    // 2. Relaunch into same persistent profile dir after RAII drop() (without dispose)
+    let path_drop = root.path().join("persist-drop");
+    std::fs::create_dir_all(&path_drop).expect("create persist-drop dir");
+    std::fs::write(path_drop.join("user_sentinel.txt"), b"persist-drop")
+        .expect("write sentinel drop");
+
+    let opts_drop = LaunchOptions {
+        engine,
+        headless: true,
+        profile_mode: ProfileMode::Persistent(path_drop.clone()),
+        ..Default::default()
+    };
+
+    let d1 = driver
+        .launch(opts_drop.clone())
+        .await
+        .expect("launch d1 persistent (drop)");
+    let dpid1 = d1.info().pid.expect("dpid1");
+    assert_eq!(
+        d1.eval_isolated("3 + 3").await.expect("d1 eval"),
+        serde_json::json!(6)
+    );
+    drop(d1);
+    assert_pgid_gone(dpid1 as libc::pid_t);
+    assert!(path_drop.exists(), "persistent dir must remain after drop");
+    assert_eq!(
+        std::fs::read(path_drop.join("user_sentinel.txt")).expect("read sentinel drop"),
+        b"persist-drop"
+    );
+
+    let d2 = driver
+        .launch(opts_drop)
+        .await
+        .expect("relaunch d2 into persistent dir after drop");
+    let dpid2 = d2.info().pid.expect("dpid2");
+    assert_eq!(
+        d2.eval_isolated("4 + 4").await.expect("d2 eval"),
+        serde_json::json!(8)
+    );
+    drop(d2);
+    assert_pgid_gone(dpid2 as libc::pid_t);
+    assert_eq!(
+        std::fs::read(path_drop.join("user_sentinel.txt")).expect("read sentinel after d2"),
+        b"persist-drop"
+    );
+}
+
+#[tokio::test]
+async fn persistent_profile_relaunch_after_dispose_and_drop_chromium() {
+    assert_persistent_profile_relaunch(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn persistent_profile_relaunch_after_dispose_and_drop_firefox() {
+    assert_persistent_profile_relaunch(EngineKind::Firefox).await;
+}

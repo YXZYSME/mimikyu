@@ -3,11 +3,12 @@ use std::env;
 use std::fs;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::process::CommandExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::driver::EngineKind;
@@ -338,8 +339,33 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
+static PROBE_LOCK: Mutex<()> = Mutex::new(());
+
 /// Probe `<binary> --version` ONLY (never `--help`) in an isolated process group with a 5000ms timeout.
 fn probe_version(path: &Path) -> Result<String> {
+    let _guard = PROBE_LOCK.lock();
+    let mut last_err = None;
+    for attempt in 0..3 {
+        match probe_version_once(path) {
+            Ok(version) => return Ok(version),
+            Err(ProbeError::SignalCrash(err)) if attempt < 2 => {
+                last_err = Some(err);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(ProbeError::SignalCrash(err)) | Err(ProbeError::Fatal(err)) => return Err(err),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        MimikyuError::LaunchFailed(format!("{} --version failed", path.display()))
+    }))
+}
+
+enum ProbeError {
+    SignalCrash(MimikyuError),
+    Fatal(MimikyuError),
+}
+
+fn probe_version_once(path: &Path) -> std::result::Result<String, ProbeError> {
     let mut cmd = Command::new(path);
     cmd.arg("--version")
         .stdin(Stdio::null())
@@ -357,7 +383,10 @@ fn probe_version(path: &Path) -> Result<String> {
     }
 
     let mut child = cmd.spawn().map_err(|e| {
-        MimikyuError::LaunchFailed(format!("failed to spawn {} --version: {e}", path.display()))
+        ProbeError::Fatal(MimikyuError::LaunchFailed(format!(
+            "failed to spawn {} --version: {e}",
+            path.display()
+        )))
     })?;
 
     let pgid = child.id() as libc::pid_t;
@@ -391,10 +420,10 @@ fn probe_version(path: &Path) -> Result<String> {
                     let _ = child.wait();
                     let _ = out_handle.join();
                     let _ = err_handle.join();
-                    return Err(MimikyuError::Timeout {
+                    return Err(ProbeError::Fatal(MimikyuError::Timeout {
                         timeout_ms: VERSION_PROBE_TIMEOUT.as_millis() as u64,
                         operation: format!("{} --version", path.display()),
-                    });
+                    }));
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -405,7 +434,7 @@ fn probe_version(path: &Path) -> Result<String> {
                 let _ = child.wait();
                 let _ = out_handle.join();
                 let _ = err_handle.join();
-                return Err(MimikyuError::Io(e));
+                return Err(ProbeError::Fatal(MimikyuError::Io(e)));
             }
         }
     };
@@ -415,11 +444,15 @@ fn probe_version(path: &Path) -> Result<String> {
 
     if !status.success() {
         let stderr_str = String::from_utf8_lossy(&stderr_bytes);
-        return Err(MimikyuError::LaunchFailed(format!(
+        let err = MimikyuError::LaunchFailed(format!(
             "{} --version exited with {status}: {}",
             path.display(),
             stderr_str.trim()
-        )));
+        ));
+        if status.signal().is_some() {
+            return Err(ProbeError::SignalCrash(err));
+        }
+        return Err(ProbeError::Fatal(err));
     }
 
     let stdout_str = String::from_utf8_lossy(&stdout_bytes);
@@ -428,10 +461,10 @@ fn probe_version(path: &Path) -> Result<String> {
         .map(str::trim)
         .find(|line| !line.is_empty())
         .ok_or_else(|| {
-            MimikyuError::LaunchFailed(format!(
+            ProbeError::Fatal(MimikyuError::LaunchFailed(format!(
                 "{} --version produced empty stdout",
                 path.display()
-            ))
+            )))
         })?;
 
     Ok(version_line.to_string())

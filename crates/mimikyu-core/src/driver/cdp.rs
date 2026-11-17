@@ -1599,37 +1599,74 @@ impl DriverSession for CdpSession {
     async fn dispatch_key(&self, ev: KeyEvent) -> Result<()> {
         let spec = named_key_cdp_spec(&ev.key);
 
-        if ev.event_type == KeyEventType::Char
-            && let Some((cdp_key, default_code, default_vk, default_text)) = spec
-        {
-            let code = ev.code.as_deref().unwrap_or(default_code);
-            let vk = ev.windows_virtual_key_code.unwrap_or(default_vk);
-            let text = ev.text.as_deref().or(default_text);
-            let down_type = if text.is_some() {
+        if ev.event_type == KeyEventType::Char {
+            if let Some((cdp_key, default_code, default_vk, default_text)) = spec {
+                let code = ev.code.as_deref().unwrap_or(default_code);
+                let vk = ev.windows_virtual_key_code.unwrap_or(default_vk);
+                let text = ev.text.as_deref().or(default_text);
+                let down_type = if text.is_some() {
+                    "keyDown"
+                } else {
+                    "rawKeyDown"
+                };
+                let mut down_params = json!({
+                    "type": down_type,
+                    "key": cdp_key,
+                    "code": code,
+                    "windowsVirtualKeyCode": vk,
+                    "modifiers": ev.modifiers,
+                });
+                if let Some(txt) = text {
+                    down_params["text"] = json!(txt);
+                    down_params["unmodifiedText"] = json!(txt);
+                }
+                self.call("Input.dispatchKeyEvent", down_params).await?;
+
+                let up_params = json!({
+                    "type": "keyUp",
+                    "key": cdp_key,
+                    "code": code,
+                    "windowsVirtualKeyCode": vk,
+                    "modifiers": ev.modifiers,
+                });
+                self.call("Input.dispatchKeyEvent", up_params).await?;
+                return Ok(());
+            }
+
+            let (resolved_key, resolved_text) = resolve_cdp_char_key_and_text(&ev);
+            let down_type = if resolved_text.is_some() {
                 "keyDown"
             } else {
                 "rawKeyDown"
             };
             let mut down_params = json!({
                 "type": down_type,
-                "key": cdp_key,
-                "code": code,
-                "windowsVirtualKeyCode": vk,
+                "key": resolved_key,
                 "modifiers": ev.modifiers,
             });
-            if let Some(txt) = text {
+            if let Some(ref code) = ev.code {
+                down_params["code"] = json!(code);
+            }
+            if let Some(vk) = ev.windows_virtual_key_code {
+                down_params["windowsVirtualKeyCode"] = json!(vk);
+            }
+            if let Some(ref txt) = resolved_text {
                 down_params["text"] = json!(txt);
-                down_params["unmodifiedText"] = json!(txt);
+                down_params["unmodifiedText"] = json!(ev.key);
             }
             self.call("Input.dispatchKeyEvent", down_params).await?;
 
-            let up_params = json!({
+            let mut up_params = json!({
                 "type": "keyUp",
-                "key": cdp_key,
-                "code": code,
-                "windowsVirtualKeyCode": vk,
+                "key": resolved_key,
                 "modifiers": ev.modifiers,
             });
+            if let Some(ref code) = ev.code {
+                up_params["code"] = json!(code);
+            }
+            if let Some(vk) = ev.windows_virtual_key_code {
+                up_params["windowsVirtualKeyCode"] = json!(vk);
+            }
             self.call("Input.dispatchKeyEvent", up_params).await?;
             return Ok(());
         }
@@ -1637,7 +1674,7 @@ impl DriverSession for CdpSession {
         let ev_type = match ev.event_type {
             KeyEventType::Down => "keyDown",
             KeyEventType::Up => "keyUp",
-            KeyEventType::Char => "char",
+            KeyEventType::Char => unreachable!(),
         };
         let key_str = spec.map(|s| s.0).unwrap_or(ev.key.as_str());
         let mut params = json!({
@@ -1648,12 +1685,7 @@ impl DriverSession for CdpSession {
         if let Some(code) = ev.code.as_deref().or_else(|| spec.map(|s| s.1)) {
             params["code"] = json!(code);
         }
-        let fallback_text = if ev.event_type == KeyEventType::Char && ev.key.chars().count() == 1 {
-            Some(ev.key.as_str())
-        } else {
-            None
-        };
-        if let Some(text) = ev.text.as_deref().or(fallback_text) {
+        if let Some(ref text) = ev.text {
             params["text"] = json!(text);
         }
         if let Some(vk) = ev.windows_virtual_key_code.or_else(|| spec.map(|s| s.2)) {
@@ -2061,14 +2093,14 @@ impl DriverSession for CdpSession {
                 self.state.context_id.as_deref(),
                 &self.state.target_id,
             );
-            if self
+            if let Ok(res) = self
                 .conn
                 .send_browser(
                     "Target.closeTarget",
                     json!({ "targetId": self.state.target_id }),
                 )
                 .await
-                .is_ok()
+                && res.get("success").and_then(|v| v.as_bool()) != Some(false)
             {
                 for _ in 0..50 {
                     let Ok(res) = self.conn.send_browser("Target.getTargets", json!({})).await
@@ -2175,6 +2207,31 @@ fn quad_to_bbox(quad: &Value) -> Option<BoundingBox> {
     })
 }
 
+fn resolve_cdp_char_key_and_text(ev: &KeyEvent) -> (String, Option<String>) {
+    let shift_active = ev.modifiers & 8 != 0;
+    let mut chars = ev.key.chars();
+    let single_char = match (chars.next(), chars.next()) {
+        (Some(ch), None) => Some(ch),
+        _ => None,
+    };
+
+    let resolved_key = if shift_active
+        && let Some(ch) = single_char
+        && ch.is_ascii_lowercase()
+    {
+        ch.to_ascii_uppercase().to_string()
+    } else {
+        ev.key.clone()
+    };
+
+    let resolved_text = ev
+        .text
+        .clone()
+        .or_else(|| single_char.map(|_| resolved_key.clone()));
+
+    (resolved_key, resolved_text)
+}
+
 fn named_key_cdp_spec(key: &str) -> Option<(&'static str, &'static str, u32, Option<&'static str>)> {
     match key {
         "Cancel" => Some(("Cancel", "Cancel", 3, None)),
@@ -2242,8 +2299,52 @@ mod tests {
             named_key_cdp_spec("ArrowLeft"),
             Some(("ArrowLeft", "ArrowLeft", 37, None))
         );
+        assert_eq!(named_key_cdp_spec("F1"), Some(("F1", "F1", 112, None)));
+        assert_eq!(named_key_cdp_spec("F12"), Some(("F12", "F12", 123, None)));
         assert_eq!(named_key_cdp_spec("a"), None);
         assert_eq!(named_key_cdp_spec("!"), None);
         assert_eq!(named_key_cdp_spec(" "), None);
+    }
+
+    #[test]
+    fn resolve_cdp_char_key_and_text_normalizes_shift_ascii_letter() {
+        let shifted = KeyEvent {
+            event_type: KeyEventType::Char,
+            key: "a".to_string(),
+            code: None,
+            text: None,
+            windows_virtual_key_code: None,
+            modifiers: 8,
+        };
+        assert_eq!(
+            resolve_cdp_char_key_and_text(&shifted),
+            ("A".to_string(), Some("A".to_string()))
+        );
+
+        let plain = KeyEvent {
+            event_type: KeyEventType::Char,
+            key: "é".to_string(),
+            code: None,
+            text: None,
+            windows_virtual_key_code: None,
+            modifiers: 0,
+        };
+        assert_eq!(
+            resolve_cdp_char_key_and_text(&plain),
+            ("é".to_string(), Some("é".to_string()))
+        );
+
+        let explicit_text = KeyEvent {
+            event_type: KeyEventType::Char,
+            key: "a".to_string(),
+            code: None,
+            text: Some("custom".to_string()),
+            windows_virtual_key_code: None,
+            modifiers: 8,
+        };
+        assert_eq!(
+            resolve_cdp_char_key_and_text(&explicit_text),
+            ("A".to_string(), Some("custom".to_string()))
+        );
     }
 }
