@@ -108,6 +108,7 @@ impl ProcessGuard {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(false);
+        configure_proxy_env(&mut cmd, opts.proxy.as_ref());
 
         unsafe {
             cmd.pre_exec(|| {
@@ -187,6 +188,8 @@ impl ProcessGuard {
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .kill_on_drop(false);
+        apply_firefox_crashreporter_env(&mut cmd);
+        configure_proxy_env(&mut cmd, opts.proxy.as_ref());
 
         if opts.profile_mode != ProfileMode::VirtualContext
             && let Some(ref env) = opts.env_profile
@@ -488,9 +491,32 @@ pub fn build_chromium_args(
         ));
         let bypass_list = chromium_proxy_bypass_list(&proxy.bypass);
         args.push(format!("--proxy-bypass-list={bypass_list}"));
+    } else if opts.proxy.is_none() && opts.profile_mode != ProfileMode::VirtualContext {
+        args.push("--no-proxy-server".to_string());
     }
 
     args
+}
+
+fn apply_firefox_crashreporter_env(cmd: &mut Command) {
+    cmd.env("MOZ_CRASHREPORTER_DISABLE", "1")
+        .env("MOZ_CRASHREPORTER", "0")
+        .env("MOZ_CRASHREPORTER_NO_REPORT", "1");
+}
+
+fn configure_proxy_env(cmd: &mut Command, proxy: Option<&crate::driver::ProxyConfig>) {
+    if proxy.is_none() {
+        for var in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            cmd.env_remove(var);
+        }
+    }
 }
 
 pub(crate) fn normalize_chromium_proxy_server(raw: &str) -> String {
@@ -769,6 +795,8 @@ pub fn write_firefox_user_js(profile_dir: &Path, opts: &LaunchOptions) -> Result
         && opts.profile_mode != ProfileMode::VirtualContext
     {
         append_firefox_proxy_prefs(&mut prefs, &proxy.server, &proxy.bypass)?;
+    } else if opts.proxy.is_none() && opts.profile_mode != ProfileMode::VirtualContext {
+        prefs.push_str("user_pref(\"network.proxy.type\", 0);\n");
     }
 
     let extra: &BTreeMap<String, Value> = &opts.extra_prefs;
@@ -813,7 +841,7 @@ fn append_firefox_proxy_prefs(
     server: &str,
     bypass: &[String],
 ) -> Result<()> {
-    let parsed = url::Url::parse(server).or_else(|_| url::Url::parse(&format!("http://{server}")))?;
+    let parsed = crate::driver::parse_proxy_url(server)?;
     let host = parsed.host_str().unwrap_or("127.0.0.1");
     let port = resolve_proxy_port(&parsed);
 
@@ -1047,6 +1075,131 @@ mod tests {
             resolve_proxy_port(&url::Url::parse("http://proxy.local:3128").unwrap()),
             3128
         );
+    }
+
+    #[test]
+    fn build_chromium_args_sets_no_proxy_server_when_no_proxy_unless_virtual() {
+        let hs = DiscoveredBrowser {
+            engine: EngineKind::Chromium,
+            kind: ChromiumFlavor::HeadlessShell,
+            path: PathBuf::from("/tmp/chrome-headless-shell"),
+            version: "143.0".to_string(),
+            source: DiscoverySource::PlaywrightCache,
+            supports_headed: false,
+            supports_headless: true,
+        };
+
+        let opts_ephem = LaunchOptions {
+            engine: EngineKind::Chromium,
+            profile_mode: ProfileMode::EphemeralDir,
+            proxy: None,
+            ..Default::default()
+        };
+        let args_ephem = build_chromium_args(&hs, &opts_ephem, Path::new("/tmp/prof"));
+        assert!(args_ephem.contains(&"--no-proxy-server".to_string()));
+
+        let opts_virtual = LaunchOptions {
+            engine: EngineKind::Chromium,
+            profile_mode: ProfileMode::VirtualContext,
+            proxy: None,
+            ..Default::default()
+        };
+        let args_virtual = build_chromium_args(&hs, &opts_virtual, Path::new("/tmp/prof"));
+        assert!(!args_virtual.contains(&"--no-proxy-server".to_string()));
+
+        let opts_proxy = LaunchOptions {
+            engine: EngineKind::Chromium,
+            profile_mode: ProfileMode::EphemeralDir,
+            proxy: Some(crate::driver::ProxyConfig {
+                server: "http://127.0.0.1:8080".to_string(),
+                username: None,
+                password: None,
+                bypass: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        let args_proxy = build_chromium_args(&hs, &opts_proxy, Path::new("/tmp/prof"));
+        assert!(!args_proxy.contains(&"--no-proxy-server".to_string()));
+        assert!(args_proxy.contains(&"--proxy-server=http://127.0.0.1:8080".to_string()));
+    }
+
+    #[test]
+    fn write_firefox_user_js_disables_proxy_when_none_and_parses_schemeless() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts_none = LaunchOptions {
+            engine: EngineKind::Firefox,
+            profile_mode: ProfileMode::EphemeralDir,
+            proxy: None,
+            ..Default::default()
+        };
+        write_firefox_user_js(dir.path(), &opts_none).unwrap();
+        let content_none = fs::read_to_string(dir.path().join("user.js")).unwrap();
+        assert!(content_none.contains("user_pref(\"network.proxy.type\", 0);"));
+
+        let opts_virtual = LaunchOptions {
+            engine: EngineKind::Firefox,
+            profile_mode: ProfileMode::VirtualContext,
+            proxy: None,
+            ..Default::default()
+        };
+        write_firefox_user_js(dir.path(), &opts_virtual).unwrap();
+        let content_virtual = fs::read_to_string(dir.path().join("user.js")).unwrap();
+        assert!(!content_virtual.contains("user_pref(\"network.proxy.type\", 0);"));
+
+        let opts_schemeless = LaunchOptions {
+            engine: EngineKind::Firefox,
+            profile_mode: ProfileMode::EphemeralDir,
+            proxy: Some(crate::driver::ProxyConfig {
+                server: "user:pass@127.0.0.1:8888".to_string(),
+                username: None,
+                password: None,
+                bypass: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        write_firefox_user_js(dir.path(), &opts_schemeless).unwrap();
+        let content_proxy = fs::read_to_string(dir.path().join("user.js")).unwrap();
+        assert!(content_proxy.contains("user_pref(\"network.proxy.type\", 1);"));
+        assert!(content_proxy.contains("user_pref(\"network.proxy.http\", \"127.0.0.1\");"));
+        assert!(content_proxy.contains("user_pref(\"network.proxy.http_port\", 8888);"));
+    }
+
+    #[test]
+    fn firefox_crashreporter_and_proxy_env_helpers_set_and_strip_expected_vars() {
+        use std::collections::HashMap;
+        use std::ffi::OsStr;
+
+        let mut cmd = Command::new("firefox");
+        apply_firefox_crashreporter_env(&mut cmd);
+        configure_proxy_env(&mut cmd, None);
+
+        let envs: HashMap<&OsStr, Option<&OsStr>> = cmd.as_std().get_envs().collect();
+        assert_eq!(
+            envs.get(OsStr::new("MOZ_CRASHREPORTER_DISABLE")),
+            Some(&Some(OsStr::new("1")))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("MOZ_CRASHREPORTER")),
+            Some(&Some(OsStr::new("0")))
+        );
+        assert_eq!(
+            envs.get(OsStr::new("MOZ_CRASHREPORTER_NO_REPORT")),
+            Some(&Some(OsStr::new("1")))
+        );
+        for var in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            assert_eq!(
+                envs.get(OsStr::new(var)),
+                Some(&None),
+                "expected {var} to be explicitly removed"
+            );
+        }
     }
 }
 

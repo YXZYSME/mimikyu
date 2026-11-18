@@ -291,7 +291,13 @@ fn validate_and_probe(
             path.display()
         )));
     }
-    let version = probe_version(path)?;
+    let version = match engine {
+        EngineKind::Firefox => match read_firefox_metadata_version(path) {
+            Some(v) => v,
+            None => probe_version(engine, path)?,
+        },
+        EngineKind::Chromium => probe_version(engine, path)?,
+    };
     let kind = classify_flavor(engine, path, &version);
     let supports_headed = kind != ChromiumFlavor::HeadlessShell;
     Ok(DiscoveredBrowser {
@@ -339,16 +345,181 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
+fn read_firefox_metadata_version(path: &Path) -> Option<String> {
+    let mut candidates = vec![path.to_path_buf()];
+    if let Ok(canon) = fs::canonicalize(path)
+        && canon != path
+    {
+        candidates.push(canon);
+    }
+
+    // Pass 1: application.ini (<exe_dir>/application.ini, then <exe_dir>/../Resources/application.ini)
+    for cand in &candidates {
+        let Some(exe_dir) = cand.parent() else {
+            continue;
+        };
+        let exe_dir = if exe_dir.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            exe_dir
+        };
+        let mut ini_paths = vec![exe_dir.join("application.ini")];
+        if let Some(contents_dir) = exe_dir.parent() {
+            ini_paths.push(contents_dir.join("Resources").join("application.ini"));
+        }
+        for ini_path in ini_paths {
+            if let Ok(content) = fs::read_to_string(&ini_path)
+                && let Some(ver) = parse_application_ini(&content)
+            {
+                return Some(ver);
+            }
+        }
+    }
+
+    // Pass 2: macOS bundle Info.plist (<exe_dir>/../Info.plist)
+    for cand in &candidates {
+        let Some(exe_dir) = cand.parent() else {
+            continue;
+        };
+        let is_macos_bundle = cfg!(target_os = "macos")
+            || exe_dir.file_name().and_then(|s| s.to_str()) == Some("MacOS");
+        if !is_macos_bundle {
+            continue;
+        }
+        if let Some(contents_dir) = exe_dir.parent() {
+            let plist_path = contents_dir.join("Info.plist");
+            if let Ok(content) = fs::read_to_string(&plist_path)
+                && let Some(ver) = parse_firefox_info_plist(&content)
+            {
+                return Some(ver);
+            }
+        }
+    }
+
+    None
+}
+
+fn parse_application_ini(content: &str) -> Option<String> {
+    let mut in_app_section = false;
+    let mut vendor: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut version: Option<String> = None;
+
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with(';') || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') && line.ends_with(']') {
+            let section = line[1..line.len() - 1].trim();
+            in_app_section = section.eq_ignore_ascii_case("App");
+            continue;
+        }
+        if !in_app_section {
+            continue;
+        }
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
+        let key = k.trim();
+        let val = v.trim();
+        if val.is_empty() {
+            continue;
+        }
+        if key.eq_ignore_ascii_case("Vendor") {
+            vendor = Some(val.to_string());
+        } else if key.eq_ignore_ascii_case("Name") {
+            name = Some(val.to_string());
+        } else if key.eq_ignore_ascii_case("Version") {
+            version = Some(val.to_string());
+        }
+    }
+
+    let ver = version?;
+    match (vendor, name) {
+        (Some(v), Some(n)) => Some(format!("{v} {n} {ver}")),
+        (None, Some(n)) => Some(format!("{n} {ver}")),
+        _ => Some(ver),
+    }
+}
+
+fn parse_firefox_info_plist(content: &str) -> Option<String> {
+    let short_ver = extract_plist_string_value(content, "CFBundleShortVersionString");
+    let bundle_ver = extract_plist_string_value(content, "CFBundleVersion");
+    let bundle_name = extract_plist_string_value(content, "CFBundleName");
+    let get_info = extract_plist_string_value(content, "CFBundleGetInfoString");
+
+    if let Some(ver) = short_ver.or(bundle_ver) {
+        if let Some(name) = bundle_name {
+            Some(format!("{name} {ver}"))
+        } else {
+            Some(ver)
+        }
+    } else {
+        get_info
+    }
+}
+
+fn extract_plist_string_value(content: &str, target_key: &str) -> Option<String> {
+    let mut rest = content;
+    while let Some(key_start) = rest.find("<key>") {
+        let after_open = &rest[key_start + "<key>".len()..];
+        let Some(key_end) = after_open.find("</key>") else {
+            break;
+        };
+        let key_text = unescape_xml_entities(after_open[..key_end].trim());
+        rest = &after_open[key_end + "</key>".len()..];
+
+        if key_text == target_key {
+            let trimmed_rest = rest.trim_start();
+            // Only match a direct <string> value (no intervening <key> or other tag before <string>).
+            let next_tag_is_string = trimmed_rest.starts_with("<string>");
+            if !next_tag_is_string {
+                // Skip XML comments if any between <key> and <string>
+                let mut probe = trimmed_rest;
+                while probe.starts_with("<!--") {
+                    if let Some(end_cmt) = probe.find("-->") {
+                        probe = probe[end_cmt + 3..].trim_start();
+                    } else {
+                        break;
+                    }
+                }
+                if !probe.starts_with("<string>") {
+                    continue;
+                }
+                let after_str = &probe["<string>".len()..];
+                let str_end = after_str.find("</string>")?;
+                let val = unescape_xml_entities(after_str[..str_end].trim());
+                return if val.is_empty() { None } else { Some(val) };
+            }
+            let after_str = &trimmed_rest["<string>".len()..];
+            let str_end = after_str.find("</string>")?;
+            let val = unescape_xml_entities(after_str[..str_end].trim());
+            return if val.is_empty() { None } else { Some(val) };
+        }
+    }
+    None
+}
+
+fn unescape_xml_entities(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
 static PROBE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Probe `<binary> --version` ONLY (never `--help`) in an isolated process group with a 5000ms timeout.
-fn probe_version(path: &Path) -> Result<String> {
+fn probe_version(engine: EngineKind, path: &Path) -> Result<String> {
     let _guard = PROBE_LOCK.lock();
+    let max_attempts = if engine == EngineKind::Firefox { 1 } else { 3 };
     let mut last_err = None;
-    for attempt in 0..3 {
-        match probe_version_once(path) {
+    for attempt in 0..max_attempts {
+        match probe_version_once(engine, path) {
             Ok(version) => return Ok(version),
-            Err(ProbeError::SignalCrash(err)) if attempt < 2 => {
+            Err(ProbeError::SignalCrash(err)) if attempt + 1 < max_attempts => {
                 last_err = Some(err);
                 std::thread::sleep(Duration::from_millis(50));
             }
@@ -365,12 +536,18 @@ enum ProbeError {
     Fatal(MimikyuError),
 }
 
-fn probe_version_once(path: &Path) -> std::result::Result<String, ProbeError> {
+fn probe_version_once(engine: EngineKind, path: &Path) -> std::result::Result<String, ProbeError> {
     let mut cmd = Command::new(path);
     cmd.arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    if engine == EngineKind::Firefox {
+        cmd.env("MOZ_CRASHREPORTER_DISABLE", "1")
+            .env("MOZ_CRASHREPORTER", "0")
+            .env("MOZ_CRASHREPORTER_NO_REPORT", "1");
+    }
 
     // Isolate into its own process group so timeouts can SIGKILL the whole subtree cleanly.
     unsafe {
@@ -863,6 +1040,78 @@ mod tests {
         let v1 = parse_numeric_tuple("155.0.8059.39");
         let v2 = parse_numeric_tuple("148.0.7778.97");
         assert!(v1 > v2);
+    }
+
+    #[test]
+    fn parse_application_ini_extracts_app_section_only() {
+        let ini = r#"
+; This Source Code Form is subject to the terms of the Mozilla Public
+[App]
+Vendor=Mozilla
+Name=Firefox
+RemotingName=firefox-default
+CodeName=Nightly
+Version=144.0.2
+BuildID=20251104
+
+[Gecko]
+MinVersion=144.0.2
+MaxVersion=144.0.2
+Version=99.9.9
+"#;
+        assert_eq!(
+            parse_application_ini(ini).as_deref(),
+            Some("Mozilla Firefox 144.0.2")
+        );
+
+        let no_vendor = "[App]\nName=Firefox\nVersion=140.0\n";
+        assert_eq!(
+            parse_application_ini(no_vendor).as_deref(),
+            Some("Firefox 140.0")
+        );
+
+        let only_gecko = "[Gecko]\nVersion=1.0\n";
+        assert_eq!(parse_application_ini(only_gecko), None);
+    }
+
+    #[test]
+    fn parse_firefox_info_plist_extracts_short_version_and_fallbacks() {
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>CFBundleGetInfoString</key>
+    <string>Nightly 144.0.2</string>
+    <key>CFBundleName</key>
+    <string>Nightly</string>
+    <key>CFBundleShortVersionString</key>
+    <string>144.0.2</string>
+    <key>CFBundleVersion</key>
+    <string>14425.11.4</string>
+</dict>
+</plist>"#;
+        assert_eq!(
+            parse_firefox_info_plist(plist).as_deref(),
+            Some("Nightly 144.0.2")
+        );
+
+        let plist_no_short = r#"<dict>
+            <key>CFBundleShortVersionString</key>
+            <key>CFBundleVersion</key>
+            <string>14500.1</string>
+        </dict>"#;
+        assert_eq!(
+            parse_firefox_info_plist(plist_no_short).as_deref(),
+            Some("14500.1")
+        );
+
+        let plist_info_only = r#"<dict>
+            <key>CFBundleGetInfoString</key>
+            <string>Firefox &amp; Nightly 1.0</string>
+        </dict>"#;
+        assert_eq!(
+            parse_firefox_info_plist(plist_info_only).as_deref(),
+            Some("Firefox & Nightly 1.0")
+        );
     }
 }
 

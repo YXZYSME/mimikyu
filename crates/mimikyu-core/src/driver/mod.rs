@@ -71,10 +71,85 @@ impl ProxyConfig {
         {
             return true;
         }
-        if let Ok(parsed) = url::Url::parse(&self.server) {
+        if let Ok(parsed) = parse_proxy_url(&self.server) {
             return !parsed.username().is_empty() || parsed.password().is_some();
         }
         false
+    }
+
+    /// Validate and normalize a user-supplied proxy URL.
+    ///
+    /// Schemeless values (`host:port` or `user:pass@host:port`) must specify an explicit `:port`
+    /// and are normalized to `http://...` so downstream `url::Url::parse` calls never misread
+    /// `user:` or `host:` as a URL scheme.
+    pub fn parse_normalized(raw: &str) -> Result<Self> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(MimikyuError::InvalidConfig(
+                "proxy URL cannot be empty or contain whitespace/control characters".to_string(),
+            ));
+        }
+
+        let normalized = if trimmed.contains("://") {
+            trimmed.to_string()
+        } else {
+            let host_port = trimmed.rsplit_once('@').map(|(_, hp)| hp).unwrap_or(trimmed);
+            let valid_host_port = if let Some(rest) = host_port.strip_prefix('[') {
+                rest.rsplit_once("]:")
+                    .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok_and(|n| n > 0))
+            } else {
+                !host_port.contains('[')
+                    && !host_port.contains(']')
+                    && host_port
+                        .rsplit_once(':')
+                        .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok_and(|n| n > 0))
+            };
+            if !valid_host_port {
+                return Err(MimikyuError::InvalidConfig(format!(
+                    "invalid proxy '{trimmed}': schemeless proxies must be host:port or user:pass@host:port"
+                )));
+            }
+            format!("http://{trimmed}")
+        };
+
+        let parsed = url::Url::parse(&normalized)?;
+        let scheme = parsed.scheme().to_ascii_lowercase();
+        if !matches!(
+            scheme.as_str(),
+            "http" | "https" | "socks" | "socks4" | "socks5" | "socks5h"
+        ) {
+            return Err(MimikyuError::InvalidConfig(format!(
+                "unsupported proxy scheme '{}' in '{trimmed}'",
+                parsed.scheme()
+            )));
+        }
+        if parsed.host_str().is_none_or(|h| h.trim().is_empty()) {
+            return Err(MimikyuError::InvalidConfig(format!(
+                "proxy '{trimmed}' is missing a host"
+            )));
+        }
+        if parsed.port() == Some(0) {
+            return Err(MimikyuError::InvalidConfig(format!(
+                "proxy '{trimmed}' has invalid port 0"
+            )));
+        }
+
+        Ok(Self {
+            server: normalized,
+            username: None,
+            password: None,
+            bypass: Vec::new(),
+        })
+    }
+}
+
+/// Parse a proxy URL, normalizing schemeless `host:port` / `user:pass@host:port` to `http://...`.
+pub(crate) fn parse_proxy_url(raw: &str) -> std::result::Result<url::Url, url::ParseError> {
+    let trimmed = raw.trim();
+    if trimmed.contains("://") {
+        url::Url::parse(trimmed)
+    } else {
+        url::Url::parse(&format!("http://{trimmed}"))
     }
 }
 
@@ -740,6 +815,69 @@ mod tests {
             height: 10.0,
         }
         .is_visible());
+    }
+
+    #[test]
+    fn proxy_config_needs_relay_handles_schemeless_credentials() {
+        for raw in [
+            "user:pass@127.0.0.1:8080",
+            "123:pass@proxy.local:8080",
+            "user@host:8080",
+            ":pass@host:8080",
+            "http://user:pass@127.0.0.1:8080",
+            "socks5h://u:p@127.0.0.1:1080",
+        ] {
+            let cfg = ProxyConfig {
+                server: raw.to_string(),
+                username: None,
+                password: None,
+                bypass: Vec::new(),
+            };
+            assert!(cfg.needs_relay(), "expected needs_relay=true for {raw}");
+        }
+
+        for raw in ["127.0.0.1:8080", "http://127.0.0.1:8080", "socks5://127.0.0.1:1080"] {
+            let cfg = ProxyConfig {
+                server: raw.to_string(),
+                username: None,
+                password: None,
+                bypass: Vec::new(),
+            };
+            assert!(!cfg.needs_relay(), "expected needs_relay=false for {raw}");
+        }
+    }
+
+    #[test]
+    fn proxy_config_parse_normalized_accepts_schemeless_and_rejects_malformed() {
+        let p1 = ProxyConfig::parse_normalized("127.0.0.1:8080").unwrap();
+        assert_eq!(p1.server, "http://127.0.0.1:8080");
+        assert!(!p1.needs_relay());
+
+        let p2 = ProxyConfig::parse_normalized("user:pass@proxy.local:8080").unwrap();
+        assert_eq!(p2.server, "http://user:pass@proxy.local:8080");
+        assert!(p2.needs_relay());
+
+        let p3 = ProxyConfig::parse_normalized("[::1]:8080").unwrap();
+        assert_eq!(p3.server, "http://[::1]:8080");
+
+        let p4 = ProxyConfig::parse_normalized("socks5h://u:p@127.0.0.1:1080").unwrap();
+        assert_eq!(p4.server, "socks5h://u:p@127.0.0.1:1080");
+        assert!(p4.needs_relay());
+
+        for bad in [
+            "",
+            "   ",
+            "not-a-valid-proxy",
+            "ftp://127.0.0.1:9999",
+            "http://127.0.0.1:0",
+            "proxy.local:0",
+            "user:pass@proxy.local",
+        ] {
+            assert!(
+                ProxyConfig::parse_normalized(bad).is_err(),
+                "expected error for invalid proxy {bad:?}"
+            );
+        }
     }
 }
 

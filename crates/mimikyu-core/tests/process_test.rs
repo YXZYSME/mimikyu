@@ -290,3 +290,124 @@ async fn persistent_profile_relaunch_after_dispose_and_drop_chromium() {
 async fn persistent_profile_relaunch_after_dispose_and_drop_firefox() {
     assert_persistent_profile_relaunch(EngineKind::Firefox).await;
 }
+
+#[tokio::test]
+async fn process_guard_shutdown_reaps_chromium_and_firefox() {
+    for engine in [EngineKind::Chromium, EngineKind::Firefox] {
+        let opts = LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            ..Default::default()
+        };
+        let mut guard = ProcessGuard::launch(&opts)
+            .await
+            .unwrap_or_else(|e| panic!("launch {engine}: {e}"));
+        let pgid = guard.pgid();
+        let profile_dir = guard.profile_dir().to_path_buf();
+        assert!(profile_dir.exists());
+
+        guard
+            .shutdown(Duration::from_millis(1500))
+            .await
+            .unwrap_or_else(|e| panic!("shutdown {engine}: {e}"));
+        assert_pgid_gone(pgid);
+        assert!(
+            !profile_dir.exists(),
+            "ephemeral profile_dir {:?} should be deleted after shutdown",
+            profile_dir
+        );
+    }
+}
+
+#[tokio::test]
+async fn firefox_launch_sets_crashreporter_env_and_strips_inherited_proxy_env() {
+    let exe = std::env::current_exe().expect("current_exe");
+    let out = std::process::Command::new(exe)
+        .arg("--exact")
+        .arg("firefox_launch_sets_crashreporter_env_and_strips_inherited_proxy_env_child")
+        .env("MIMIKYU_TEST_PROXY_STRIP_CHILD", "1")
+        .env("HTTP_PROXY", "http://127.0.0.1:9")
+        .env("HTTPS_PROXY", "http://127.0.0.1:9")
+        .env("http_proxy", "http://127.0.0.1:9")
+        .env("https_proxy", "http://127.0.0.1:9")
+        .env("ALL_PROXY", "socks5://127.0.0.1:9")
+        .env("all_proxy", "socks5://127.0.0.1:9")
+        .output()
+        .expect("spawn child test");
+    assert!(
+        out.status.success(),
+        "child env-stripping verification failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[tokio::test]
+async fn firefox_launch_sets_crashreporter_env_and_strips_inherited_proxy_env_child() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if std::env::var_os("MIMIKYU_TEST_PROXY_STRIP_CHILD").is_none() {
+        return;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let bin = dir.path().join("mock-firefox");
+    let ini = dir.path().join("application.ini");
+    let env_dump = dir.path().join("child_env.txt");
+
+    std::fs::write(&ini, "[App]\nVendor=Mozilla\nName=Firefox\nVersion=144.0.2\n").unwrap();
+    let script = format!(
+        r#"#!/bin/sh
+cat <<EOF > "{dump}"
+MOZ_CRASHREPORTER_DISABLE=${{MOZ_CRASHREPORTER_DISABLE:-UNSET}}
+MOZ_CRASHREPORTER=${{MOZ_CRASHREPORTER:-UNSET}}
+MOZ_CRASHREPORTER_NO_REPORT=${{MOZ_CRASHREPORTER_NO_REPORT:-UNSET}}
+HTTP_PROXY=${{HTTP_PROXY:-UNSET}}
+HTTPS_PROXY=${{HTTPS_PROXY:-UNSET}}
+http_proxy=${{http_proxy:-UNSET}}
+https_proxy=${{https_proxy:-UNSET}}
+ALL_PROXY=${{ALL_PROXY:-UNSET}}
+all_proxy=${{all_proxy:-UNSET}}
+EOF
+echo "WebDriver BiDi listening on ws://127.0.0.1:44444" >&2
+sleep 10
+"#,
+        dump = env_dump.display()
+    );
+    std::fs::write(&bin, script).unwrap();
+    let mut perms = std::fs::metadata(&bin).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&bin, perms).unwrap();
+
+    let mut guard = ProcessGuard::launch(&LaunchOptions {
+        engine: EngineKind::Firefox,
+        binary_path: Some(bin),
+        proxy: None,
+        ..Default::default()
+    })
+    .await
+    .expect("launch mock firefox");
+
+    let pgid = guard.pgid();
+    let dump = std::fs::read_to_string(&env_dump).expect("read child_env.txt");
+    guard
+        .shutdown(Duration::from_millis(1500))
+        .await
+        .expect("shutdown mock firefox");
+    assert_pgid_gone(pgid);
+
+    assert!(dump.contains("MOZ_CRASHREPORTER_DISABLE=1\n"), "dump={dump}");
+    assert!(dump.contains("MOZ_CRASHREPORTER=0\n"), "dump={dump}");
+    assert!(dump.contains("MOZ_CRASHREPORTER_NO_REPORT=1\n"), "dump={dump}");
+    for var in [
+        "HTTP_PROXY=UNSET",
+        "HTTPS_PROXY=UNSET",
+        "http_proxy=UNSET",
+        "https_proxy=UNSET",
+        "ALL_PROXY=UNSET",
+        "all_proxy=UNSET",
+    ] {
+        assert!(dump.contains(var), "expected {var} in dump:\n{dump}");
+    }
+}
