@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
@@ -19,10 +19,11 @@ use tracing::{debug, warn};
 
 use crate::driver::{
     now_ms, AxNode, BoundingBox, BrowserDriver, ConsoleEntry, ContextOptions, Cookie,
-    DriverCapabilities, DriverSession, EngineKind, EnvProfile, KeyEvent, KeyEventType,
+    DriverCapabilities, DriverSession, EngineKind, EnvProfile, FrameInfo, KeyEvent, KeyEventType,
     LaunchOptions, MouseButton, MouseEvent, MouseEventType, NavInfo, NetworkEvent, OriginStorage,
     PageError, PermissionGrant, PermissionState, RouteMock, ScreenshotFormat,
-    ScreenshotOpts, SessionInfo, StorageState, TabInfo, WheelEvent,
+    ScreenshotOpts, SelectBy, SessionInfo, ShadowMatch, StorageState, TabInfo, WheelEvent,
+    MOD_ALT, MOD_CONTROL, MOD_META,
 };
 use crate::env_profile::{
     build_window_init_script, build_worker_init_script, ProxyRelay,
@@ -35,6 +36,37 @@ use crate::network::{
 use crate::process::{chromium_proxy_bypass_list, ProcessGuard};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
+static NEXT_OBJECT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
+const INSTANT_ANIM_CSS: &str = "*, *::before, *::after { transition-duration: 0s !important; transition-delay: 0s !important; animation-duration: 0s !important; animation-delay: 0s !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }";
+const INSTANT_ANIM_PRELOAD_JS: &str = r#"(() => {
+  const css = "*, *::before, *::after { transition-duration: 0s !important; transition-delay: 0s !important; animation-duration: 0s !important; animation-delay: 0s !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }";
+  const apply = () => {
+    try {
+      if (document.adoptedStyleSheets && typeof CSSStyleSheet === "function") {
+        const already = document.adoptedStyleSheets.some(s => {
+          try { return s.cssRules && s.cssRules.length > 0 && s.cssRules[0].cssText.includes("animation-iteration-count: 1"); } catch { return false; }
+        });
+        if (!already) {
+          const sheet = new CSSStyleSheet();
+          sheet.replaceSync(css);
+          document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+        }
+        return;
+      }
+    } catch {}
+    const host = document.head || document.documentElement;
+    if (host) {
+      const existing = Array.from(host.querySelectorAll("style")).some(el => el.textContent === css);
+      if (!existing) {
+        const st = document.createElement("style");
+        st.textContent = css;
+        host.appendChild(st);
+      }
+    }
+  };
+  if (document.documentElement) apply();
+  else document.addEventListener("DOMContentLoaded", apply, { once: true });
+})();"#;
 
 pub struct CdpDriver;
 
@@ -218,6 +250,7 @@ fn cdp_capabilities() -> DriverCapabilities {
         supports_per_context_proxy: true,
         supports_native_ax_tree: true,
         supports_isolated_world: true,
+        supports_closed_shadow_dom: true,
         supports_pdf: true,
         supports_network_intercept: true,
     }
@@ -228,6 +261,7 @@ struct CdpConnection {
     write_tx: mpsc::UnboundedSender<String>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
     sessions: RwLock<HashMap<String, Arc<CdpSessionState>>>,
+    iframe_owner_sessions: RwLock<HashMap<String, String>>,
     isolated_contexts: RwLock<HashSet<String>>,
     active_targets: RwLock<HashMap<String, String>>,
     process: AsyncMutex<Option<ProcessGuard>>,
@@ -283,6 +317,7 @@ impl CdpConnection {
             write_tx,
             pending: Mutex::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
+            iframe_owner_sessions: RwLock::new(HashMap::new()),
             isolated_contexts: RwLock::new(HashSet::new()),
             active_targets: RwLock::new(HashMap::new()),
             process: AsyncMutex::new(Some(process)),
@@ -373,22 +408,30 @@ impl CdpConnection {
         let session_id = val.get("sessionId").and_then(|v| v.as_str());
 
         if let Some(sid) = session_id {
-            let state = self.sessions.read().get(sid).cloned();
-            if let Some(state) = state {
-                state.handle_event(self, method, params);
-            } else if method == "Target.attachedToTarget"
-                && params.get("waitingForDebugger").and_then(|v| v.as_bool()) == Some(true)
-                && let Some(child_sid) = params
-                    .get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .map(ToString::to_string)
-            {
-                let conn_clone = Arc::clone(self);
-                tokio::spawn(async move {
-                    let _ = conn_clone
-                        .send_raw(Some(&child_sid), "Runtime.runIfWaitingForDebugger", json!({}))
-                        .await;
-                });
+            let direct_state = self.sessions.read().get(sid).cloned();
+            if let Some(state) = direct_state {
+                state.handle_event(self, sid, method, params, false);
+            } else {
+                let owner_state = {
+                    let owner_sid = self.iframe_owner_sessions.read().get(sid).cloned();
+                    owner_sid.and_then(|osid| self.sessions.read().get(&osid).cloned())
+                };
+                if let Some(state) = owner_state {
+                    state.handle_event(self, sid, method, params, true);
+                } else if method == "Target.attachedToTarget"
+                    && params.get("waitingForDebugger").and_then(|v| v.as_bool()) == Some(true)
+                    && let Some(child_sid) = params
+                        .get("sessionId")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string)
+                {
+                    let conn_clone = Arc::clone(self);
+                    tokio::spawn(async move {
+                        let _ = conn_clone
+                            .send_raw(Some(&child_sid), "Runtime.runIfWaitingForDebugger", json!({}))
+                            .await;
+                    });
+                }
             }
         } else if method == "Target.attachedToTarget"
             && params.get("waitingForDebugger").and_then(|v| v.as_bool()) == Some(true)
@@ -495,6 +538,16 @@ impl Drop for CdpConnection {
     }
 }
 
+#[derive(Debug, Clone)]
+struct PendingCdpRequest {
+    session_id: String,
+    frame_id: Option<String>,
+    loader_id: Option<String>,
+    resource_type: String,
+    received_response: bool,
+    committed: bool,
+}
+
 struct CdpSessionState {
     session_id: String,
     target_id: String,
@@ -506,9 +559,17 @@ struct CdpSessionState {
     main_frame_id: Mutex<Option<String>>,
     last_main_origin: Mutex<Option<String>>,
     isolated_worlds: Mutex<HashMap<String, i64>>,
-    telemetry: TelemetryStore,
+    default_contexts: Mutex<HashMap<String, i64>>,
+    iframe_sessions: Mutex<HashMap<String, String>>,
+    iframe_session_targets: Mutex<HashMap<String, String>>,
+    iframe_parent_sessions: Mutex<HashMap<String, String>>,
+    pending_cdp_requests: Mutex<HashMap<String, PendingCdpRequest>>,
+    finalized_doc_loaders: Mutex<VecDeque<String>>,
+    telemetry: Arc<TelemetryStore>,
     interceptor: Mutex<NetworkInterceptor>,
     fetch_enabled: AtomicBool,
+    instant_animations: AtomicBool,
+    anim_script_id: AsyncMutex<Option<String>>,
     env_script_id: AsyncMutex<Option<String>>,
     worker_init_script: Mutex<Option<String>>,
     worker_ua_params: Mutex<Option<Value>>,
@@ -519,14 +580,38 @@ struct CdpSessionState {
 }
 
 impl CdpSessionState {
-    fn handle_event(&self, conn: &Arc<CdpConnection>, method: &str, params: Value) {
+    fn handle_event(
+        &self,
+        conn: &Arc<CdpConnection>,
+        event_sid: &str,
+        method: &str,
+        params: Value,
+        from_child: bool,
+    ) {
         match method {
             "Page.frameNavigated" => {
                 if let Some(frame) = params.get("frame")
                     && let Some(fid) = frame.get("id").and_then(|v| v.as_str())
                 {
                     self.isolated_worlds.lock().remove(fid);
-                    if frame.get("parentId").and_then(|v| v.as_str()).is_none() {
+                    self.default_contexts.lock().remove(fid);
+                    let nav_loader_id = frame.get("loaderId").and_then(|v| v.as_str());
+                    if from_child {
+                        self.iframe_sessions
+                            .lock()
+                            .entry(fid.to_string())
+                            .or_insert_with(|| event_sid.to_string());
+                        if let Some(lid) = nav_loader_id {
+                            self.prune_pending_requests_for_frame_outside_loader(fid, lid);
+                        }
+                        self.mark_document_committed_and_prune_superseded(fid, nav_loader_id);
+                    } else if frame.get("parentId").and_then(|v| v.as_str()).is_some() {
+                        self.iframe_sessions.lock().remove(fid);
+                        if let Some(lid) = nav_loader_id {
+                            self.prune_pending_requests_for_frame_outside_loader(fid, lid);
+                        }
+                        self.mark_document_committed_and_prune_superseded(fid, nav_loader_id);
+                    } else {
                         *self.main_frame_id.lock() = Some(fid.to_string());
                         if let Some(u) = frame.get("url").and_then(|v| v.as_str())
                             && let Ok(parsed) = url::Url::parse(u)
@@ -536,19 +621,92 @@ impl CdpSessionState {
                                 *self.last_main_origin.lock() = Some(origin);
                             }
                         }
+                        if let Some(lid) = nav_loader_id {
+                            self.prune_pending_requests_outside_loader(lid);
+                        }
+                        self.mark_document_committed_and_prune_superseded(fid, nav_loader_id);
+                    }
+                }
+            }
+            "Page.frameDetached" => {
+                let reason = params.get("reason").and_then(|v| v.as_str());
+                if reason != Some("swap")
+                    && let Some(fid) = params.get("frameId").and_then(|v| v.as_str())
+                {
+                    self.prune_pending_requests_for_frame(fid);
+                }
+            }
+            "Runtime.executionContextCreated" => {
+                if let Some(ctx) = params.get("context")
+                    && let Some(ctx_id) = ctx.get("id").and_then(|v| v.as_i64())
+                    && let Some(aux) = ctx.get("auxData")
+                {
+                    let is_default = aux.get("isDefault").and_then(|v| v.as_bool()) == Some(true);
+                    let aux_type = aux.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if let Some(fid) = aux.get("frameId").and_then(|v| v.as_str()) {
+                        if from_child {
+                            self.iframe_sessions
+                                .lock()
+                                .insert(fid.to_string(), event_sid.to_string());
+                        }
+                        if is_default && aux_type == "default" {
+                            self.default_contexts
+                                .lock()
+                                .insert(fid.to_string(), ctx_id);
+                        }
                     }
                 }
             }
             "Runtime.executionContextsCleared" => {
-                self.isolated_worlds.lock().clear();
+                let iframe_fids = self.iframe_sessions.lock().clone();
+                if from_child {
+                    self.isolated_worlds.lock().retain(|fid, _| {
+                        iframe_fids.get(fid).map(String::as_str) != Some(event_sid)
+                    });
+                    self.default_contexts.lock().retain(|fid, _| {
+                        iframe_fids.get(fid).map(String::as_str) != Some(event_sid)
+                    });
+                } else {
+                    self.isolated_worlds
+                        .lock()
+                        .retain(|fid, _| iframe_fids.contains_key(fid));
+                    self.default_contexts
+                        .lock()
+                        .retain(|fid, _| iframe_fids.contains_key(fid));
+                }
             }
             "Runtime.executionContextDestroyed" => {
                 if let Some(ctx_id) = params.get("executionContextId").and_then(|v| v.as_i64()) {
-                    self.isolated_worlds.lock().retain(|_, &mut v| v != ctx_id);
+                    let iframe_fids = self.iframe_sessions.lock().clone();
+                    let matches_owner = |fid: &String| -> bool {
+                        if from_child {
+                            iframe_fids.get(fid).map(String::as_str) == Some(event_sid)
+                        } else {
+                            !iframe_fids.contains_key(fid)
+                        }
+                    };
+                    self.isolated_worlds
+                        .lock()
+                        .retain(|fid, &mut v| !(v == ctx_id && matches_owner(fid)));
+                    self.default_contexts
+                        .lock()
+                        .retain(|fid, &mut v| !(v == ctx_id && matches_owner(fid)));
                 }
             }
             "Page.loadEventFired" | "Page.frameStoppedLoading" => {
-                if method == "Page.loadEventFired"
+                if method == "Page.frameStoppedLoading"
+                    && let Some(fid) = params.get("frameId").and_then(|v| v.as_str())
+                {
+                    let is_oopif = from_child || self.iframe_sessions.lock().contains_key(fid);
+                    self.finalize_document_requests_for_frame(fid, is_oopif);
+                } else if method == "Page.loadEventFired" && from_child {
+                    let tid = self.iframe_session_targets.lock().get(event_sid).cloned();
+                    if let Some(fid) = tid {
+                        self.finalize_document_requests_for_frame(&fid, true);
+                    }
+                }
+                if !from_child
+                    && method == "Page.loadEventFired"
                     && let Some(cur_origin) = self.last_main_origin.lock().clone()
                 {
                     let to_remove: Vec<String> = {
@@ -588,6 +746,11 @@ impl CdpSessionState {
                     .and_then(|t| t.get("type"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                let target_id_opt = params
+                    .get("targetInfo")
+                    .and_then(|t| t.get("targetId"))
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
                 let waiting = params
                     .get("waitingForDebugger")
                     .and_then(|v| v.as_bool())
@@ -597,6 +760,20 @@ impl CdpSessionState {
                     .and_then(|v| v.as_str())
                     .map(ToString::to_string)
                 {
+                    let is_iframe = target_type == "iframe";
+                    let tid_for_spawn = target_id_opt.clone();
+                    if is_iframe && let Some(tid) = target_id_opt {
+                        self.iframe_sessions.lock().insert(tid.clone(), child_sid.clone());
+                        self.iframe_session_targets.lock().insert(child_sid.clone(), tid);
+                        if from_child {
+                            self.iframe_parent_sessions
+                                .lock()
+                                .insert(child_sid.clone(), event_sid.to_string());
+                        }
+                        conn.iframe_owner_sessions
+                            .write()
+                            .insert(child_sid.clone(), self.session_id.clone());
+                    }
                     let is_worker = matches!(
                         target_type,
                         "worker" | "shared_worker" | "service_worker"
@@ -611,9 +788,58 @@ impl CdpSessionState {
                     } else {
                         None
                     };
-                    if is_worker || waiting {
+                    let instant_anim = is_iframe && self.instant_animations.load(Ordering::SeqCst);
+                    if is_worker || is_iframe || waiting {
                         let conn_clone = Arc::clone(conn);
+                        let owner_sid = self.session_id.clone();
                         tokio::spawn(async move {
+                            if is_iframe {
+                                let _ = conn_clone
+                                    .send_raw(Some(&child_sid), "Page.enable", json!({}))
+                                    .await;
+                                let _ = conn_clone
+                                    .send_raw(Some(&child_sid), "Network.enable", json!({}))
+                                    .await;
+                                let _ = conn_clone
+                                    .send_raw(Some(&child_sid), "Runtime.enable", json!({}))
+                                    .await;
+                                let _ = conn_clone
+                                    .send_raw(Some(&child_sid), "DOM.enable", json!({}))
+                                    .await;
+                                let _ = conn_clone
+                                    .send_raw(Some(&child_sid), "Accessibility.enable", json!({}))
+                                    .await;
+                                let _ = conn_clone
+                                    .send_raw(
+                                        Some(&child_sid),
+                                        "Target.setAutoAttach",
+                                        json!({
+                                            "autoAttach": true,
+                                            "waitForDebuggerOnStart": true,
+                                            "flatten": true,
+                                        }),
+                                    )
+                                    .await;
+                                if instant_anim {
+                                    let _ = conn_clone
+                                        .send_raw(Some(&child_sid), "Animation.enable", json!({}))
+                                        .await;
+                                    let _ = conn_clone
+                                        .send_raw(
+                                            Some(&child_sid),
+                                            "Animation.setPlaybackRate",
+                                            json!({ "playbackRate": 10_000.0 }),
+                                        )
+                                        .await;
+                                    let _ = conn_clone
+                                        .send_raw(
+                                            Some(&child_sid),
+                                            "Page.addScriptToEvaluateOnNewDocument",
+                                            json!({ "source": INSTANT_ANIM_PRELOAD_JS }),
+                                        )
+                                        .await;
+                                }
+                            }
                             if let Some(ua) = worker_ua {
                                 let _ = conn_clone
                                     .send_raw(
@@ -643,9 +869,31 @@ impl CdpSessionState {
                                         json!({}),
                                     )
                                     .await;
+                            } else if is_iframe
+                                && let Some(tid) = tid_for_spawn
+                                && let Ok(rs) = conn_clone
+                                    .send_raw(
+                                        Some(&child_sid),
+                                        "Runtime.evaluate",
+                                        json!({
+                                            "expression": "document.readyState",
+                                            "returnByValue": true,
+                                        }),
+                                    )
+                                    .await
+                                && rs["result"]["value"].as_str() == Some("complete")
+                                && let Some(owner_state) =
+                                    conn_clone.sessions.read().get(&owner_sid).cloned()
+                            {
+                                owner_state.finalize_document_requests_for_frame(&tid, true);
                             }
                         });
                     }
+                }
+            }
+            "Target.detachedFromTarget" => {
+                if let Some(child_sid) = params.get("sessionId").and_then(|v| v.as_str()) {
+                    self.prune_detached_iframe_sessions(conn, child_sid);
                 }
             }
             "Runtime.consoleAPICalled" => {
@@ -788,9 +1036,18 @@ impl CdpSessionState {
                     .and_then(|v| v.as_str())
                     .unwrap_or("Other")
                     .to_string();
+                let frame_id = params
+                    .get("frameId")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let loader_id = params
+                    .get("loaderId")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
                 let request_headers = json_map_to_btree(req.get("headers"));
 
-                let redir = params.get("redirectResponse");
+                let redir = params.get("redirectResponse").filter(|v| !v.is_null());
+                let is_redirect = redir.is_some();
                 let redir_status = redir
                     .and_then(|r| r.get("status"))
                     .and_then(|v| v.as_u64())
@@ -800,6 +1057,41 @@ impl CdpSessionState {
                     .and_then(|v| v.as_str())
                     .map(ToString::to_string);
                 let redir_headers = json_map_to_btree(redir.and_then(|r| r.get("headers")));
+
+                {
+                    let mut pending = self.pending_cdp_requests.lock();
+                    if !is_redirect && pending.contains_key(req_id) {
+                        return;
+                    }
+                    if from_child && resource_type == "Document" {
+                        if loader_id
+                            .as_deref()
+                            .is_some_and(|lid| self.is_doc_loader_finalized(lid))
+                        {
+                            return;
+                        }
+                        if loader_id.is_some()
+                            && pending.values().any(|e| {
+                                e.resource_type == "Document"
+                                    && e.frame_id == frame_id
+                                    && e.loader_id == loader_id
+                            })
+                        {
+                            return;
+                        }
+                    }
+                    pending.insert(
+                        req_id.to_string(),
+                        PendingCdpRequest {
+                            session_id: event_sid.to_string(),
+                            frame_id,
+                            loader_id,
+                            resource_type: resource_type.clone(),
+                            received_response: false,
+                            committed: false,
+                        },
+                    );
+                }
 
                 self.telemetry.on_request_started(
                     NetworkEvent {
@@ -824,6 +1116,18 @@ impl CdpSessionState {
                 let Some(req_id) = params.get("requestId").and_then(|v| v.as_str()) else {
                     return;
                 };
+                let is_pending = {
+                    let mut pending = self.pending_cdp_requests.lock();
+                    if let Some(entry) = pending.get_mut(req_id) {
+                        entry.received_response = true;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if from_child && !is_pending {
+                    return;
+                }
                 let resp = &params["response"];
                 let status = resp
                     .get("status")
@@ -841,18 +1145,40 @@ impl CdpSessionState {
                 let Some(req_id) = params.get("requestId").and_then(|v| v.as_str()) else {
                     return;
                 };
-                self.telemetry.on_request_finished(req_id);
+                let removed = self.pending_cdp_requests.lock().remove(req_id);
+                let was_pending = if let Some(entry) = removed {
+                    if entry.resource_type == "Document" {
+                        self.record_finalized_doc_loader(entry.loader_id.as_deref());
+                    }
+                    true
+                } else {
+                    false
+                };
+                if !from_child || was_pending {
+                    self.telemetry.on_request_finished(req_id);
+                }
             }
             "Network.loadingFailed" => {
                 let Some(req_id) = params.get("requestId").and_then(|v| v.as_str()) else {
                     return;
                 };
-                let error_text = params
-                    .get("errorText")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| params.get("blockedReason").and_then(|v| v.as_str()))
-                    .map(ToString::to_string);
-                self.telemetry.on_request_failed(req_id, error_text);
+                let removed = self.pending_cdp_requests.lock().remove(req_id);
+                let was_pending = if let Some(entry) = removed {
+                    if entry.resource_type == "Document" {
+                        self.record_finalized_doc_loader(entry.loader_id.as_deref());
+                    }
+                    true
+                } else {
+                    false
+                };
+                if !from_child || was_pending {
+                    let error_text = params
+                        .get("errorText")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| params.get("blockedReason").and_then(|v| v.as_str()))
+                        .map(ToString::to_string);
+                    self.telemetry.on_request_failed(req_id, error_text);
+                }
             }
             "Fetch.requestPaused" => {
                 let Some(fetch_id) = params
@@ -883,18 +1209,23 @@ impl CdpSessionState {
                 });
 
                 let conn_clone = Arc::clone(conn);
-                let sid = self.session_id.clone();
+                let sid = event_sid.to_string();
+                let network_id = params
+                    .get("networkId")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let telem = Arc::clone(&self.telemetry);
 
                 tokio::spawn(async move {
-                    match decision {
+                    let res = match decision {
                         InterceptDecision::Block { reason } => {
-                            let _ = conn_clone
+                            conn_clone
                                 .send_raw(
                                     Some(&sid),
                                     "Fetch.failRequest",
                                     json!({ "requestId": fetch_id, "errorReason": reason }),
                                 )
-                                .await;
+                                .await
                         }
                         InterceptDecision::Fulfill {
                             status,
@@ -905,7 +1236,7 @@ impl CdpSessionState {
                                 .into_iter()
                                 .map(|(name, value)| json!({ "name": name, "value": value }))
                                 .collect();
-                            let _ = conn_clone
+                            conn_clone
                                 .send_raw(
                                     Some(&sid),
                                     "Fetch.fulfillRequest",
@@ -916,7 +1247,7 @@ impl CdpSessionState {
                                         "body": BASE64.encode(body),
                                     }),
                                 )
-                                .await;
+                                .await
                         }
                         InterceptDecision::ModifyHeaders { headers } => {
                             let hdrs: Vec<Value> = headers
@@ -932,28 +1263,279 @@ impl CdpSessionState {
                                 .await
                             {
                                 warn!(target: "mimikyu::cdp::fetch", "Fetch.continueRequest(ModifyHeaders) failed: {e}");
-                                let _ = conn_clone
+                                conn_clone
                                     .send_raw(
                                         Some(&sid),
                                         "Fetch.continueRequest",
                                         json!({ "requestId": fetch_id }),
                                     )
-                                    .await;
+                                    .await
+                            } else {
+                                Ok(Value::Null)
                             }
                         }
                         InterceptDecision::Continue => {
-                            let _ = conn_clone
+                            conn_clone
                                 .send_raw(
                                     Some(&sid),
                                     "Fetch.continueRequest",
                                     json!({ "requestId": fetch_id }),
                                 )
-                                .await;
+                                .await
                         }
+                    };
+                    if let Err(e) = res
+                        && let Some(nid) = network_id
+                    {
+                        telem.on_intercept_resolved_locally(
+                            &nid,
+                            None,
+                            BTreeMap::new(),
+                            true,
+                            Some(e.to_string()),
+                        );
                     }
                 });
             }
             _ => {}
+        }
+    }
+
+    fn prune_detached_iframe_sessions(&self, conn: &Arc<CdpConnection>, root_sid: &str) {
+        let mut sids_to_clean: HashSet<String> = HashSet::new();
+        sids_to_clean.insert(root_sid.to_string());
+        {
+            let mut parent_map = self.iframe_parent_sessions.lock();
+            loop {
+                let mut added = false;
+                for (csid, psid) in parent_map.iter() {
+                    if sids_to_clean.contains(psid) && sids_to_clean.insert(csid.clone()) {
+                        added = true;
+                    }
+                }
+                if !added {
+                    break;
+                }
+            }
+            parent_map.retain(|csid, psid| {
+                !sids_to_clean.contains(csid) && !sids_to_clean.contains(psid)
+            });
+        }
+        {
+            let mut owners = conn.iframe_owner_sessions.write();
+            for sid in &sids_to_clean {
+                owners.remove(sid);
+            }
+        }
+        let mut removed_tids: HashSet<String> = HashSet::new();
+        {
+            let mut targets = self.iframe_session_targets.lock();
+            for sid in &sids_to_clean {
+                if let Some(tid) = targets.remove(sid) {
+                    removed_tids.insert(tid);
+                }
+            }
+        }
+        let mut fids_to_clean = Vec::new();
+        self.iframe_sessions.lock().retain(|fid, sid| {
+            if sids_to_clean.contains(sid) || removed_tids.contains(fid) {
+                fids_to_clean.push(fid.clone());
+                false
+            } else {
+                true
+            }
+        });
+        let mut all_fids = removed_tids;
+        {
+            let mut iw = self.isolated_worlds.lock();
+            let mut dc = self.default_contexts.lock();
+            for fid in fids_to_clean {
+                iw.remove(&fid);
+                dc.remove(&fid);
+                all_fids.insert(fid);
+            }
+        }
+        self.prune_pending_requests_for_detached(&sids_to_clean, &all_fids);
+    }
+
+    fn record_finalized_doc_loader(&self, loader_id: Option<&str>) {
+        let Some(lid) = loader_id else {
+            return;
+        };
+        let mut guard = self.finalized_doc_loaders.lock();
+        if guard.iter().any(|existing| existing == lid) {
+            return;
+        }
+        if guard.len() >= 256 {
+            guard.pop_front();
+        }
+        guard.push_back(lid.to_string());
+    }
+
+    fn is_doc_loader_finalized(&self, loader_id: &str) -> bool {
+        self.finalized_doc_loaders
+            .lock()
+            .iter()
+            .any(|existing| existing == loader_id)
+    }
+
+    fn mark_document_committed_and_prune_superseded(&self, fid: &str, nav_loader_id: Option<&str>) {
+        let mut to_finish: Vec<(String, bool, Option<String>)> = Vec::new();
+        {
+            let mut pending = self.pending_cdp_requests.lock();
+            pending.retain(|req_id, entry| {
+                if entry.frame_id.as_deref() != Some(fid) {
+                    return true;
+                }
+                if entry.resource_type == "Document" {
+                    if nav_loader_id.is_some() && entry.loader_id.as_deref() == nav_loader_id {
+                        entry.committed = true;
+                        true
+                    } else if nav_loader_id.is_some() {
+                        to_finish.push((
+                            req_id.clone(),
+                            entry.received_response,
+                            entry.loader_id.clone(),
+                        ));
+                        false
+                    } else {
+                        true
+                    }
+                } else {
+                    true
+                }
+            });
+        }
+        for (req_id, ok, lid) in to_finish {
+            self.record_finalized_doc_loader(lid.as_deref());
+            if ok {
+                self.telemetry.on_request_finished(&req_id);
+            } else {
+                self.telemetry
+                    .on_request_failed(&req_id, Some("navigation superseded".to_string()));
+            }
+        }
+    }
+
+    fn finalize_document_requests_for_frame(&self, fid: &str, is_oopif: bool) {
+        let mut to_finish: Vec<(String, Option<String>)> = Vec::new();
+        {
+            let mut pending = self.pending_cdp_requests.lock();
+            pending.retain(|req_id, entry| {
+                if entry.frame_id.as_deref() == Some(fid)
+                    && entry.resource_type == "Document"
+                    && (is_oopif || entry.committed || entry.received_response)
+                {
+                    to_finish.push((req_id.clone(), entry.loader_id.clone()));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        for (req_id, lid) in to_finish {
+            self.record_finalized_doc_loader(lid.as_deref());
+            self.telemetry.on_request_finished(&req_id);
+        }
+    }
+
+    fn prune_pending_requests_for_frame_outside_loader(&self, fid: &str, new_loader_id: &str) {
+        let mut to_fail: Vec<String> = Vec::new();
+        {
+            let mut pending = self.pending_cdp_requests.lock();
+            pending.retain(|req_id, entry| {
+                if entry.frame_id.as_deref() == Some(fid)
+                    && entry.resource_type != "Document"
+                    && entry.loader_id.as_deref() != Some(new_loader_id)
+                {
+                    to_fail.push(req_id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        for req_id in to_fail {
+            self.telemetry
+                .on_request_failed(&req_id, Some("frame navigated".to_string()));
+        }
+    }
+
+    fn prune_pending_requests_for_frame(&self, fid: &str) {
+        let mut to_fail: Vec<(String, Option<String>)> = Vec::new();
+        {
+            let mut pending = self.pending_cdp_requests.lock();
+            pending.retain(|req_id, entry| {
+                if entry.frame_id.as_deref() == Some(fid) {
+                    let lid = (entry.resource_type == "Document")
+                        .then(|| entry.loader_id.clone())
+                        .flatten();
+                    to_fail.push((req_id.clone(), lid));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        for (req_id, lid) in to_fail {
+            self.record_finalized_doc_loader(lid.as_deref());
+            self.telemetry
+                .on_request_failed(&req_id, Some("frame detached".to_string()));
+        }
+    }
+
+    fn prune_pending_requests_for_detached(
+        &self,
+        sids: &HashSet<String>,
+        fids: &HashSet<String>,
+    ) {
+        let mut to_fail: Vec<(String, Option<String>)> = Vec::new();
+        {
+            let mut pending = self.pending_cdp_requests.lock();
+            pending.retain(|req_id, entry| {
+                let sid_match = sids.contains(&entry.session_id);
+                let fid_match = entry
+                    .frame_id
+                    .as_deref()
+                    .is_some_and(|fid| fids.contains(fid));
+                if sid_match || fid_match {
+                    let lid = (entry.resource_type == "Document")
+                        .then(|| entry.loader_id.clone())
+                        .flatten();
+                    to_fail.push((req_id.clone(), lid));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        for (req_id, lid) in to_fail {
+            self.record_finalized_doc_loader(lid.as_deref());
+            self.telemetry
+                .on_request_failed(&req_id, Some("target detached".to_string()));
+        }
+    }
+
+    fn prune_pending_requests_outside_loader(&self, new_loader_id: &str) {
+        let mut to_fail: Vec<(String, Option<String>)> = Vec::new();
+        {
+            let mut pending = self.pending_cdp_requests.lock();
+            pending.retain(|req_id, entry| {
+                if entry.loader_id.as_deref() != Some(new_loader_id) {
+                    let lid = (entry.resource_type == "Document")
+                        .then(|| entry.loader_id.clone())
+                        .flatten();
+                    to_fail.push((req_id.clone(), lid));
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        for (req_id, lid) in to_fail {
+            self.record_finalized_doc_loader(lid.as_deref());
+            self.telemetry
+                .on_request_failed(&req_id, Some("document navigated".to_string()));
         }
     }
 }
@@ -990,9 +1572,17 @@ impl CdpSession {
             main_frame_id: Mutex::new(None),
             last_main_origin: Mutex::new(None),
             isolated_worlds: Mutex::new(HashMap::new()),
-            telemetry: TelemetryStore::new(telem_cfg),
+            default_contexts: Mutex::new(HashMap::new()),
+            iframe_sessions: Mutex::new(HashMap::new()),
+            iframe_session_targets: Mutex::new(HashMap::new()),
+            iframe_parent_sessions: Mutex::new(HashMap::new()),
+            pending_cdp_requests: Mutex::new(HashMap::new()),
+            finalized_doc_loaders: Mutex::new(VecDeque::new()),
+            telemetry: Arc::new(TelemetryStore::new(telem_cfg)),
             interceptor: Mutex::new(NetworkInterceptor::default()),
             fetch_enabled: AtomicBool::new(false),
+            instant_animations: AtomicBool::new(false),
+            anim_script_id: AsyncMutex::new(None),
             env_script_id: AsyncMutex::new(None),
             worker_init_script: Mutex::new(None),
             worker_ua_params: Mutex::new(None),
@@ -1105,6 +1695,18 @@ impl CdpSession {
             .await
     }
 
+    async fn call_for_frame(
+        &self,
+        frame_id: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> Result<Value> {
+        self.ensure_alive()?;
+        let child_sid = frame_id.and_then(|fid| self.state.iframe_sessions.lock().get(fid).cloned());
+        let sid = child_sid.as_deref().unwrap_or(&self.info.session_id);
+        self.conn.send_raw(Some(sid), method, params).await
+    }
+
     async fn main_frame_id(&self) -> Result<String> {
         if let Some(fid) = self.state.main_frame_id.lock().clone() {
             return Ok(fid);
@@ -1121,16 +1723,23 @@ impl CdpSession {
         Ok(fid)
     }
 
-    async fn get_or_create_isolated_context(&self) -> Result<(String, i64)> {
-        let frame_id = self.main_frame_id().await?;
-        if let Some(ctx_id) = self.state.isolated_worlds.lock().get(&frame_id).copied() {
-            return Ok((frame_id, ctx_id));
+    async fn get_or_create_isolated_context_for(
+        &self,
+        frame_id: Option<&str>,
+    ) -> Result<(String, i64)> {
+        let fid = match frame_id {
+            Some(f) => f.to_string(),
+            None => self.main_frame_id().await?,
+        };
+        if let Some(ctx_id) = self.state.isolated_worlds.lock().get(&fid).copied() {
+            return Ok((fid, ctx_id));
         }
         let res = self
-            .call(
+            .call_for_frame(
+                Some(&fid),
                 "Page.createIsolatedWorld",
                 json!({
-                    "frameId": frame_id,
+                    "frameId": fid,
                     "worldName": "mimikyu_isolated",
                     "grantUniveralAccess": true,
                 }),
@@ -1142,11 +1751,429 @@ impl CdpSession {
                 code: -1,
                 message: "Page.createIsolatedWorld missing executionContextId".to_string(),
             })?;
-        self.state
-            .isolated_worlds
-            .lock()
-            .insert(frame_id.clone(), ctx_id);
-        Ok((frame_id, ctx_id))
+        self.state.isolated_worlds.lock().insert(fid.clone(), ctx_id);
+        Ok((fid, ctx_id))
+    }
+
+    async fn extract_array_object_ids(
+        &self,
+        fid: &str,
+        array_object_id: &str,
+    ) -> Result<Vec<String>> {
+        let props = self
+            .call_for_frame(
+                Some(fid),
+                "Runtime.getProperties",
+                json!({
+                    "objectId": array_object_id,
+                    "ownProperties": true,
+                }),
+            )
+            .await?;
+        let mut indexed: Vec<(usize, String)> = Vec::new();
+        if let Some(arr) = props["result"].as_array() {
+            for prop in arr {
+                if let Some(name) = prop["name"].as_str()
+                    && let Ok(idx) = name.parse::<usize>()
+                    && let Some(oid) = prop["value"]["objectId"].as_str()
+                {
+                    indexed.push((idx, oid.to_string()));
+                }
+            }
+        }
+        indexed.sort_by_key(|(i, _)| *i);
+        Ok(indexed.into_iter().map(|(_, o)| o).collect())
+    }
+
+    async fn query_shadow_inner(
+        &self,
+        fid: &str,
+        ctx_id: i64,
+        group: &str,
+        selector_chain: &[String],
+    ) -> Result<Vec<ShadowMatch>> {
+        let sel0_json = serde_json::to_string(&selector_chain[0])?;
+        let eval_res = self
+            .call_for_frame(
+                Some(fid),
+                "Runtime.evaluate",
+                json!({
+                    "expression": format!("Array.from(document.querySelectorAll({sel0_json}))"),
+                    "contextId": ctx_id,
+                    "objectGroup": group,
+                    "returnByValue": false,
+                }),
+            )
+            .await?;
+        if let Some(exc) = eval_res.get("exceptionDetails") {
+            let msg = exc["text"].as_str().unwrap_or("querySelectorAll failed");
+            return Err(MimikyuError::EvalFailed(msg.to_string()));
+        }
+        let Some(arr_oid) = eval_res["result"]["objectId"].as_str() else {
+            return Ok(Vec::new());
+        };
+        let mut current_oids = self.extract_array_object_ids(fid, arr_oid).await?;
+
+        for sel in &selector_chain[1..] {
+            let mut next_oids = Vec::new();
+            for oid in current_oids {
+                let desc = self
+                    .call_for_frame(
+                        Some(fid),
+                        "DOM.describeNode",
+                        json!({ "objectId": oid, "depth": 1, "pierce": true }),
+                    )
+                    .await;
+                let Ok(desc_val) = desc else {
+                    continue;
+                };
+                let Some(srs) = desc_val["node"]["shadowRoots"].as_array() else {
+                    continue;
+                };
+                for sr in srs {
+                    let Some(sr_bid) = sr["backendNodeId"].as_i64() else {
+                        continue;
+                    };
+                    let Ok(sr_resolved) = self
+                        .call_for_frame(
+                            Some(fid),
+                            "DOM.resolveNode",
+                            json!({
+                                "backendNodeId": sr_bid,
+                                "executionContextId": ctx_id,
+                                "objectGroup": group,
+                            }),
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
+                    let Some(sr_oid) = sr_resolved["object"]["objectId"].as_str() else {
+                        continue;
+                    };
+                    let Ok(call_res) = self
+                        .call_for_frame(
+                            Some(fid),
+                            "Runtime.callFunctionOn",
+                            json!({
+                                "objectId": sr_oid,
+                                "functionDeclaration": "function(s) { return Array.from(this.querySelectorAll(s)); }",
+                                "arguments": [{ "value": sel }],
+                                "objectGroup": group,
+                                "returnByValue": false,
+                            }),
+                        )
+                        .await
+                    else {
+                        continue;
+                    };
+                    if let Some(sub_arr_oid) = call_res["result"]["objectId"].as_str()
+                        && let Ok(found) = self.extract_array_object_ids(fid, sub_arr_oid).await
+                    {
+                        next_oids.extend(found);
+                    }
+                }
+            }
+            current_oids = next_oids;
+            if current_oids.is_empty() {
+                break;
+            }
+        }
+
+        let mut matches = Vec::with_capacity(current_oids.len());
+        for oid in current_oids {
+            let bid = self
+                .call_for_frame(Some(fid), "DOM.describeNode", json!({ "objectId": oid }))
+                .await
+                .ok()
+                .and_then(|d| d["node"]["backendNodeId"].as_i64());
+            let info_res = self
+                .call_for_frame(
+                    Some(fid),
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": oid,
+                        "functionDeclaration": r#"function() {
+                            const attrs = {};
+                            if (this.attributes) {
+                                for (const a of this.attributes) attrs[a.name] = a.value;
+                            }
+                            const r = this.getBoundingClientRect ? this.getBoundingClientRect() : null;
+                            return {
+                                tagName: (this.tagName || '').toLowerCase(),
+                                text: (this.innerText || this.textContent || '').trim(),
+                                html: this.outerHTML || null,
+                                attributes: attrs,
+                                bounds: r ? { x: r.x, y: r.y, width: r.width, height: r.height } : null
+                            };
+                        }"#,
+                        "returnByValue": true,
+                    }),
+                )
+                .await?;
+            let val = parse_eval_result(info_res)?;
+            let attributes: BTreeMap<String, String> =
+                serde_json::from_value(val["attributes"].clone()).unwrap_or_default();
+            let bounds: Option<BoundingBox> =
+                serde_json::from_value(val["bounds"].clone()).ok();
+            matches.push(ShadowMatch {
+                backend_node_id: bid,
+                frame_id: Some(fid.to_string()),
+                tag_name: val["tagName"].as_str().unwrap_or_default().to_string(),
+                text: val["text"].as_str().unwrap_or_default().to_string(),
+                html: val["html"].as_str().map(ToString::to_string),
+                attributes,
+                bounds,
+            });
+        }
+        Ok(matches)
+    }
+
+    async fn resolve_frame_transform(
+        &self,
+        frame_id: &str,
+        main_fid: Option<&str>,
+        parent_map: &HashMap<String, String>,
+        cache: &mut HashMap<String, FrameTransform>,
+    ) -> FrameTransform {
+        if Some(frame_id) == main_fid {
+            return FrameTransform::identity();
+        }
+        if let Some(&cached) = cache.get(frame_id) {
+            return cached;
+        }
+        let mut chain = Vec::new();
+        let mut cur = frame_id.to_string();
+        for _ in 0..32 {
+            if Some(cur.as_str()) == main_fid {
+                break;
+            }
+            if let Some(parent) = parent_map.get(&cur) {
+                chain.push((cur.clone(), parent.clone()));
+                cur = parent.clone();
+            } else {
+                break;
+            }
+        }
+        let mut total = FrameTransform::identity();
+        for (child_fid, parent_fid) in chain.into_iter().rev() {
+            if let Some(&cached) = cache.get(&child_fid) {
+                total = cached;
+                continue;
+            }
+            if let Ok(owner) = self
+                .call_for_frame(
+                    Some(&parent_fid),
+                    "DOM.getFrameOwner",
+                    json!({ "frameId": child_fid }),
+                )
+                .await
+                && let Some(obid) = owner["backendNodeId"].as_i64()
+                && let Ok(val) = self
+                    .call_function_on_node(
+                        obid,
+                        Some(&parent_fid),
+                        r#"function() {
+                            const r = this.getBoundingClientRect();
+                            const cs = getComputedStyle(this);
+                            const iw = this.offsetWidth;
+                            const ih = this.offsetHeight;
+                            const sx = iw > 0 && r.width > 0 ? r.width / iw : 1;
+                            const sy = ih > 0 && r.height > 0 ? r.height / ih : 1;
+                            return {
+                                ox: r.x + ((parseFloat(cs.borderLeftWidth) || 0) + (parseFloat(cs.paddingLeft) || 0)) * sx,
+                                oy: r.y + ((parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.paddingTop) || 0)) * sy,
+                                sx,
+                                sy
+                            };
+                        }"#,
+                        vec![],
+                    )
+                    .await
+                && let (Some(ox), Some(oy)) = (
+                    val["ox"].as_f64().filter(|v| v.is_finite()),
+                    val["oy"].as_f64().filter(|v| v.is_finite()),
+                )
+            {
+                let sx = val["sx"]
+                    .as_f64()
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .unwrap_or(1.0);
+                let sy = val["sy"]
+                    .as_f64()
+                    .filter(|v| v.is_finite() && *v > 0.0)
+                    .unwrap_or(1.0);
+                total = total.compose_inner(FrameTransform { ox, oy, sx, sy });
+            }
+            cache.insert(child_fid, total);
+        }
+        total
+    }
+
+    async fn capture_dom_snapshot_bounds(
+        &self,
+        frames: &[FrameInfo],
+    ) -> HashMap<(Option<String>, i64), BoundingBox> {
+        let mut map = HashMap::new();
+        let main_fid = self.main_frame_id().await.ok();
+        let parent_map: HashMap<String, String> = frames
+            .iter()
+            .filter_map(|f| {
+                f.parent_frame_id
+                    .as_ref()
+                    .map(|p| (f.frame_id.clone(), p.clone()))
+            })
+            .collect();
+        let mut frame_transforms: HashMap<String, FrameTransform> = HashMap::new();
+        if let Some(ref mfid) = main_fid {
+            frame_transforms.insert(mfid.clone(), FrameTransform::identity());
+        }
+
+        let mut snapshots_to_collect: Vec<(Option<String>, Option<String>)> =
+            vec![(None, main_fid.clone())];
+        {
+            let targets = self.state.iframe_session_targets.lock();
+            for (sid, tid) in targets.iter() {
+                snapshots_to_collect.push((Some(sid.clone()), Some(tid.clone())));
+            }
+        }
+
+        for (sid_opt, fallback_fid) in snapshots_to_collect {
+            let snap_res = match sid_opt.as_deref() {
+                Some(sid) => {
+                    self.conn
+                        .send_raw(
+                            Some(sid),
+                            "DOMSnapshot.captureSnapshot",
+                            json!({
+                                "computedStyles": ["display", "visibility"],
+                                "includeDOMRects": true,
+                            }),
+                        )
+                        .await
+                }
+                None => {
+                    self.call(
+                        "DOMSnapshot.captureSnapshot",
+                        json!({
+                            "computedStyles": ["display", "visibility"],
+                            "includeDOMRects": true,
+                        }),
+                    )
+                    .await
+                }
+            };
+            let Ok(snap) = snap_res else {
+                continue;
+            };
+            let strings = snap["strings"].as_array();
+            let str_at = |v: &Value| -> Option<&str> {
+                let idx = v.as_u64()? as usize;
+                strings?.get(idx)?.as_str()
+            };
+            let Some(docs) = snap["documents"].as_array() else {
+                continue;
+            };
+
+            for doc in docs {
+                let doc_fid = doc
+                    .get("frameId")
+                    .and_then(&str_at)
+                    .map(ToString::to_string)
+                    .or_else(|| fallback_fid.clone());
+                let tf = if let Some(ref fid) = doc_fid {
+                    self.resolve_frame_transform(
+                        fid,
+                        main_fid.as_deref(),
+                        &parent_map,
+                        &mut frame_transforms,
+                    )
+                    .await
+                } else {
+                    FrameTransform::identity()
+                };
+
+                let Some(backend_ids) = doc["nodes"]["backendNodeId"].as_array() else {
+                    continue;
+                };
+                let node_names = doc["nodes"]["nodeName"].as_array();
+                let node_attrs = doc["nodes"]["attributes"].as_array();
+                let Some(node_indices) = doc["layout"]["nodeIndex"].as_array() else {
+                    continue;
+                };
+                let Some(bounds_arr) = doc["layout"]["bounds"].as_array() else {
+                    continue;
+                };
+                let styles_arr = doc["layout"]["styles"].as_array();
+                let scroll_x = doc["scrollOffsetX"].as_f64().unwrap_or(0.0);
+                let scroll_y = doc["scrollOffsetY"].as_f64().unwrap_or(0.0);
+                for (layout_idx, (ni_val, rect_val)) in
+                    node_indices.iter().zip(bounds_arr.iter()).enumerate()
+                {
+                    let Some(ni) = ni_val.as_u64().map(|u| u as usize) else {
+                        continue;
+                    };
+                    let Some(bid) = backend_ids.get(ni).and_then(|v| v.as_i64()) else {
+                        continue;
+                    };
+                    let Some(rect) = rect_val.as_array() else {
+                        continue;
+                    };
+                    if rect.len() < 4 {
+                        continue;
+                    }
+                    let (Some(x), Some(y), Some(mut w), Some(mut h)) = (
+                        rect[0].as_f64(),
+                        rect[1].as_f64(),
+                        rect[2].as_f64(),
+                        rect[3].as_f64(),
+                    ) else {
+                        continue;
+                    };
+
+                    let is_file_input = node_names
+                        .and_then(|arr| arr.get(ni))
+                        .and_then(&str_at)
+                        .is_some_and(|name| name.eq_ignore_ascii_case("INPUT"))
+                        && node_attrs
+                            .and_then(|arr| arr.get(ni))
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|pairs| {
+                                pairs.chunks_exact(2).any(|kv| {
+                                    str_at(&kv[0]).is_some_and(|k| k.eq_ignore_ascii_case("type"))
+                                        && str_at(&kv[1])
+                                            .is_some_and(|val| val.eq_ignore_ascii_case("file"))
+                                })
+                            });
+                    if is_file_input {
+                        let is_css_hidden = styles_arr
+                            .and_then(|arr| arr.get(layout_idx))
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|st| {
+                                let disp = st.first().and_then(&str_at).unwrap_or("");
+                                let vis = st.get(1).and_then(&str_at).unwrap_or("");
+                                disp.eq_ignore_ascii_case("none")
+                                    || vis.eq_ignore_ascii_case("hidden")
+                                    || vis.eq_ignore_ascii_case("collapse")
+                            });
+                        if !is_css_hidden {
+                            w = w.max(1.0);
+                            h = h.max(1.0);
+                        }
+                    }
+
+                    let mut bbox = BoundingBox {
+                        x: x - scroll_x,
+                        y: y - scroll_y,
+                        width: w,
+                        height: h,
+                    };
+                    tf.apply(&mut bbox);
+                    map.entry((doc_fid.clone(), bid)).or_insert(bbox);
+                }
+            }
+        }
+        map
     }
 
     async fn wait_for_load_complete(&self) -> Result<()> {
@@ -1183,12 +2210,72 @@ impl CdpSession {
     }
 
     async fn query_backend_node_id(&self, selector: &str) -> Result<i64> {
-        let doc = self.call("DOM.getDocument", json!({ "depth": 0 })).await?;
+        self.query_backend_node_id_in_frame(selector, None).await
+    }
+
+    async fn query_backend_node_id_in_frame(
+        &self,
+        selector: &str,
+        frame_id: Option<&str>,
+    ) -> Result<i64> {
+        if let Some(fid_in) = frame_id {
+            let sel_json = serde_json::to_string(selector)?;
+            let expr = format!("document.querySelector({sel_json})");
+            for attempt in 0..2 {
+                let (fid, ctx_id) = self.get_or_create_isolated_context_for(Some(fid_in)).await?;
+                let res = self
+                    .call_for_frame(
+                        Some(&fid),
+                        "Runtime.evaluate",
+                        json!({
+                            "expression": expr,
+                            "contextId": ctx_id,
+                            "returnByValue": false,
+                            "awaitPromise": false,
+                        }),
+                    )
+                    .await;
+                let eval_val = match res {
+                    Ok(v) => v,
+                    Err(MimikyuError::Protocol { ref message, .. })
+                        if attempt == 0 && message.contains("Cannot find context") =>
+                    {
+                        self.state.isolated_worlds.lock().remove(&fid);
+                        continue;
+                    }
+                    Err(e) => return Err(e),
+                };
+                if let Some(obj_id) = eval_val["result"]["objectId"].as_str() {
+                    let desc = self
+                        .call_for_frame(Some(&fid), "DOM.describeNode", json!({ "objectId": obj_id }))
+                        .await;
+                    let _ = self
+                        .call_for_frame(
+                            Some(&fid),
+                            "Runtime.releaseObject",
+                            json!({ "objectId": obj_id }),
+                        )
+                        .await;
+                    let desc = desc?;
+                    return desc["node"]["backendNodeId"]
+                        .as_i64()
+                        .ok_or_else(|| MimikyuError::ElementNotFound(selector.to_string()));
+                }
+                return Err(MimikyuError::ElementNotFound(format!(
+                    "selector '{selector}' matched no element"
+                )));
+            }
+        }
+
+        let doc = self
+            .call_for_frame(frame_id, "DOM.getDocument", json!({ "depth": 0 }))
+            .await?;
         let root_id = doc["root"]["nodeId"]
             .as_i64()
             .ok_or_else(|| MimikyuError::ElementNotFound(selector.to_string()))?;
         let q = self
-            .call(
+            .call_for_frame(
+                frame_id,
                 "DOM.querySelector",
                 json!({ "nodeId": root_id, "selector": selector }),
             )
@@ -1200,7 +2287,7 @@ impl CdpSession {
             )));
         }
         let desc = self
-            .call("DOM.describeNode", json!({ "nodeId": node_id }))
+            .call_for_frame(frame_id, "DOM.describeNode", json!({ "nodeId": node_id }))
             .await?;
         desc["node"]["backendNodeId"]
             .as_i64()
@@ -1529,11 +2616,267 @@ impl DriverSession for CdpSession {
     }
 
     async fn eval_isolated(&self, expr: &str) -> Result<Value> {
+        self.eval_isolated_in_frame(expr, None).await
+    }
+
+    async fn eval_main_world(&self, expr: &str) -> Result<Value> {
+        self.eval_main_world_in_frame(expr, None).await
+    }
+
+    async fn list_frames(&self) -> Result<Vec<FrameInfo>> {
+        self.ensure_alive()?;
+        let tree = self.call("Page.getFrameTree", json!({})).await?;
+        let mut out = Vec::new();
+        collect_cdp_frames(&tree["frameTree"], None, &mut out);
+
+        let mut oopifs: Vec<(String, String)> = self
+            .state
+            .iframe_session_targets
+            .lock()
+            .iter()
+            .map(|(sid, tid)| (tid.clone(), sid.clone()))
+            .collect();
+        oopifs.sort_by(|a, b| a.0.cmp(&b.0));
+
+        if oopifs.is_empty() {
+            return Ok(out);
+        }
+
+        let known_oopif_fids: HashSet<String> = {
+            let guard = self.state.iframe_sessions.lock();
+            guard.keys().cloned().collect()
+        };
+        let main_session_fids: Vec<String> = out
+            .iter()
+            .filter(|f| !known_oopif_fids.contains(&f.frame_id))
+            .map(|f| f.frame_id.clone())
+            .collect();
+
+        struct OopifTree {
+            tid: String,
+            sid: String,
+            frames: Vec<FrameInfo>,
+            raw_parent_id: Option<String>,
+        }
+
+        let mut oopif_trees: Vec<OopifTree> = Vec::with_capacity(oopifs.len());
+        for (tid, child_sid) in oopifs {
+            let sub_tree = match self
+                .conn
+                .send_raw(Some(&child_sid), "Page.getFrameTree", json!({}))
+                .await
+            {
+                Ok(t) => t,
+                Err(MimikyuError::Protocol { ref message, .. })
+                    if message.contains("Session with given id not found")
+                        || message.contains("Target closed") =>
+                {
+                    self.state
+                        .prune_detached_iframe_sessions(&self.conn, &child_sid);
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            let mut sub_frames = Vec::new();
+            collect_cdp_frames(&sub_tree["frameTree"], None, &mut sub_frames);
+            if sub_frames.is_empty() {
+                continue;
+            }
+            for sf in &mut sub_frames {
+                sf.is_main = false;
+            }
+            {
+                let targets_guard = self.state.iframe_session_targets.lock();
+                if !targets_guard.contains_key(&child_sid) {
+                    continue;
+                }
+                let mut sessions_guard = self.state.iframe_sessions.lock();
+                for sf in &sub_frames {
+                    sessions_guard.insert(sf.frame_id.clone(), child_sid.clone());
+                }
+            }
+            let raw_parent_id = sub_tree["frameTree"]["frame"]["parentId"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(ToString::to_string);
+            oopif_trees.push(OopifTree {
+                tid,
+                sid: child_sid,
+                frames: sub_frames,
+                raw_parent_id,
+            });
+        }
+
+        let main_fid_fallback = out.first().map(|f| f.frame_id.clone());
+        let oopif_fids_by_sid: HashMap<String, Vec<String>> = oopif_trees
+            .iter()
+            .map(|ot| {
+                (
+                    ot.sid.clone(),
+                    ot.frames.iter().map(|f| f.frame_id.clone()).collect(),
+                )
+            })
+            .collect();
+        let candidate_sessions: Vec<(Option<String>, Vec<String>)> = {
+            let mut v = Vec::with_capacity(1 + oopif_trees.len());
+            for ot in &oopif_trees {
+                let fids: Vec<String> = ot.frames.iter().map(|f| f.frame_id.clone()).collect();
+                v.push((Some(ot.sid.clone()), fids));
+            }
+            v.push((None, main_session_fids));
+            v
+        };
+
+        let parent_sess_map = self.state.iframe_parent_sessions.lock().clone();
+        for ot in &mut oopif_trees {
+            let root_fid = ot.frames[0].frame_id.clone();
+            let attached_parent_sid = parent_sess_map.get(&ot.sid).cloned();
+            let mut parent_fid = ot.raw_parent_id.clone();
+
+            if parent_fid.is_none() {
+                if let Some(ref psid) = attached_parent_sid {
+                    if let Some(pfids) = oopif_fids_by_sid.get(psid) {
+                        if pfids.len() == 1 {
+                            parent_fid = Some(pfids[0].clone());
+                        } else if pfids.len() > 1 {
+                            if let Ok(owner) = self
+                                .conn
+                                .send_raw(Some(psid), "DOM.getFrameOwner", json!({ "frameId": root_fid }))
+                                .await
+                                && let Some(obid) = owner["backendNodeId"].as_i64()
+                            {
+                                for cfid in pfids {
+                                    if let Ok(Value::Bool(true)) = self
+                                        .call_function_on_node(
+                                            obid,
+                                            Some(cfid),
+                                            "function() { return this.ownerDocument === document; }",
+                                            vec![],
+                                        )
+                                        .await
+                                    {
+                                        parent_fid = Some(cfid.clone());
+                                        break;
+                                    }
+                                }
+                            }
+                            if parent_fid.is_none() {
+                                parent_fid = pfids.first().cloned();
+                            }
+                        }
+                    }
+                } else {
+                    parent_fid = out
+                        .iter()
+                        .find(|f| f.frame_id == root_fid)
+                        .and_then(|f| f.parent_frame_id.clone());
+                }
+            }
+
+            if parent_fid.is_none() {
+                for (cand_sid, cand_fids) in &candidate_sessions {
+                    if cand_sid.as_deref() == Some(ot.sid.as_str()) {
+                        continue;
+                    }
+                    if attached_parent_sid.is_some() && cand_sid.is_none() {
+                        continue;
+                    }
+                    let owner_res = match cand_sid.as_deref() {
+                        Some(sid) => {
+                            self.conn
+                                .send_raw(Some(sid), "DOM.getFrameOwner", json!({ "frameId": root_fid }))
+                                .await
+                        }
+                        None => {
+                            self.call("DOM.getFrameOwner", json!({ "frameId": root_fid }))
+                                .await
+                        }
+                    };
+                    if let Ok(owner) = owner_res
+                        && let Some(obid) = owner["backendNodeId"].as_i64()
+                    {
+                        if cand_fids.len() == 1 {
+                            parent_fid = Some(cand_fids[0].clone());
+                            break;
+                        } else if cand_fids.len() > 1 {
+                            for cfid in cand_fids {
+                                if let Ok(Value::Bool(true)) = self
+                                    .call_function_on_node(
+                                        obid,
+                                        Some(cfid),
+                                        "function() { return this.ownerDocument === document; }",
+                                        vec![],
+                                    )
+                                    .await
+                                {
+                                    parent_fid = Some(cfid.clone());
+                                    break;
+                                }
+                            }
+                            if parent_fid.is_some() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if parent_fid.is_none()
+                && let Ok(tinfo) = self
+                    .conn
+                    .send_browser("Target.getTargetInfo", json!({ "targetId": ot.tid }))
+                    .await
+            {
+                parent_fid = tinfo["targetInfo"]["parentFrameId"]
+                    .as_str()
+                    .or_else(|| tinfo["targetInfo"]["openerFrameId"].as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(ToString::to_string);
+            }
+
+            ot.frames[0].parent_frame_id = if parent_fid.is_some() {
+                parent_fid
+            } else if attached_parent_sid.is_none() {
+                main_fid_fallback.clone()
+            } else {
+                None
+            };
+        }
+
+        let mut idx_by_fid: HashMap<String, usize> = out
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (f.frame_id.clone(), i))
+            .collect();
+        for ot in oopif_trees {
+            for sf in ot.frames {
+                if let Some(&idx) = idx_by_fid.get(&sf.frame_id) {
+                    if sf.parent_frame_id.is_some() {
+                        out[idx].parent_frame_id = sf.parent_frame_id;
+                    }
+                    if out[idx].url.is_empty() && !sf.url.is_empty() {
+                        out[idx].url = sf.url;
+                    }
+                    if out[idx].name.is_none() && sf.name.is_some() {
+                        out[idx].name = sf.name;
+                    }
+                } else {
+                    idx_by_fid.insert(sf.frame_id.clone(), out.len());
+                    out.push(sf);
+                }
+            }
+        }
+
+        Ok(out)
+    }
+
+    async fn eval_isolated_in_frame(&self, expr: &str, frame_id: Option<&str>) -> Result<Value> {
         self.ensure_alive()?;
         for attempt in 0..2 {
-            let (frame_id, ctx_id) = self.get_or_create_isolated_context().await?;
+            let (fid, ctx_id) = self.get_or_create_isolated_context_for(frame_id).await?;
             let res = self
-                .call(
+                .call_for_frame(
+                    Some(&fid),
                     "Runtime.evaluate",
                     json!({
                         "expression": expr,
@@ -1549,7 +2892,7 @@ impl DriverSession for CdpSession {
                 Err(MimikyuError::Protocol { ref message, .. })
                     if attempt == 0 && message.contains("Cannot find context") =>
                 {
-                    self.state.isolated_worlds.lock().remove(&frame_id);
+                    self.state.isolated_worlds.lock().remove(&fid);
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -1560,22 +2903,191 @@ impl DriverSession for CdpSession {
         ))
     }
 
-    async fn eval_main_world(&self, expr: &str) -> Result<Value> {
+    async fn eval_main_world_in_frame(&self, expr: &str, frame_id: Option<&str>) -> Result<Value> {
         self.ensure_alive()?;
         if !self.state.main_world_eval {
             return Err(MimikyuError::MainWorldDisabled);
         }
+        let Some(fid) = frame_id else {
+            let res = self
+                .call(
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": expr,
+                        "returnByValue": true,
+                        "awaitPromise": true,
+                    }),
+                )
+                .await?;
+            return parse_eval_result(res);
+        };
+
+        let main_fid = self.main_frame_id().await.ok();
+        if main_fid.as_deref() == Some(fid) {
+            let res = self
+                .call(
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": expr,
+                        "returnByValue": true,
+                        "awaitPromise": true,
+                    }),
+                )
+                .await?;
+            return parse_eval_result(res);
+        }
+
+        if self.state.iframe_sessions.lock().contains_key(fid) {
+            let ctx_id = self.state.default_contexts.lock().get(fid).copied();
+            let mut params = json!({
+                "expression": expr,
+                "returnByValue": true,
+                "awaitPromise": true,
+            });
+            if let Some(cid) = ctx_id {
+                params["contextId"] = json!(cid);
+            }
+            let res = self
+                .call_for_frame(Some(fid), "Runtime.evaluate", params)
+                .await?;
+            return parse_eval_result(res);
+        }
+
+        let ctx_id = self.state.default_contexts.lock().get(fid).copied();
+        let Some(ctx_id) = ctx_id else {
+            return Err(MimikyuError::NotFound(format!(
+                "frame '{fid}' has no default execution context"
+            )));
+        };
         let res = self
             .call(
                 "Runtime.evaluate",
                 json!({
                     "expression": expr,
+                    "contextId": ctx_id,
                     "returnByValue": true,
                     "awaitPromise": true,
                 }),
             )
             .await?;
         parse_eval_result(res)
+    }
+
+    async fn call_function_on_node(
+        &self,
+        backend_node_id: i64,
+        frame_id: Option<&str>,
+        function_declaration: &str,
+        args: Vec<Value>,
+    ) -> Result<Value> {
+        self.ensure_alive()?;
+        let (fid, ctx_id) = self.get_or_create_isolated_context_for(frame_id).await?;
+        let group = format!(
+            "mimikyu_node_{}",
+            NEXT_OBJECT_GROUP_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let resolved = self
+            .call_for_frame(
+                Some(&fid),
+                "DOM.resolveNode",
+                json!({
+                    "backendNodeId": backend_node_id,
+                    "executionContextId": ctx_id,
+                    "objectGroup": group,
+                }),
+            )
+            .await?;
+        let obj_id = resolved["object"]["objectId"]
+            .as_str()
+            .ok_or_else(|| {
+                MimikyuError::ElementNotFound(format!(
+                    "backendNodeId {backend_node_id} could not be resolved"
+                ))
+            })?
+            .to_string();
+        let call_args: Vec<Value> = args.into_iter().map(|v| json!({ "value": v })).collect();
+        let res = self
+            .call_for_frame(
+                Some(&fid),
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": obj_id,
+                    "functionDeclaration": function_declaration,
+                    "arguments": call_args,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                }),
+            )
+            .await;
+        let _ = self
+            .call_for_frame(
+                Some(&fid),
+                "Runtime.releaseObjectGroup",
+                json!({ "objectGroup": group }),
+            )
+            .await;
+        parse_eval_result(res?)
+    }
+
+    async fn query_shadow(
+        &self,
+        selector_chain: &[String],
+        frame_id: Option<&str>,
+    ) -> Result<Vec<ShadowMatch>> {
+        self.ensure_alive()?;
+        if selector_chain.is_empty() {
+            return Err(MimikyuError::InvalidConfig(
+                "query_shadow requires at least one selector".to_string(),
+            ));
+        }
+        let (fid, ctx_id) = self.get_or_create_isolated_context_for(frame_id).await?;
+        let group = format!(
+            "mimikyu_shadow_{}",
+            NEXT_OBJECT_GROUP_ID.fetch_add(1, Ordering::Relaxed)
+        );
+        let res = self
+            .query_shadow_inner(&fid, ctx_id, &group, selector_chain)
+            .await;
+        let _ = self
+            .call_for_frame(
+                Some(&fid),
+                "Runtime.releaseObjectGroup",
+                json!({ "objectGroup": group }),
+            )
+            .await;
+        res
+    }
+
+    async fn closed_shadow_hosts(&self, frame_id: Option<&str>) -> Result<Vec<i64>> {
+        self.ensure_alive()?;
+        let is_oopif = frame_id
+            .is_some_and(|fid| self.state.iframe_sessions.lock().contains_key(fid));
+        let main_fid = if !is_oopif {
+            self.main_frame_id().await.ok()
+        } else {
+            None
+        };
+        let doc = self
+            .call_for_frame(
+                frame_id,
+                "DOM.getDocument",
+                json!({ "depth": -1, "pierce": true }),
+            )
+            .await?;
+        let root_fid = doc["root"]
+            .get("frameId")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string)
+            .or_else(|| {
+                if is_oopif {
+                    frame_id.map(ToString::to_string)
+                } else {
+                    main_fid
+                }
+            });
+        let mut hosts = Vec::new();
+        collect_closed_shadow_roots(&doc["root"], root_fid.as_deref(), frame_id, &mut hosts);
+        Ok(hosts)
     }
 
     async fn add_init_script(&self, script: &str) -> Result<String> {
@@ -1604,91 +3116,130 @@ impl DriverSession for CdpSession {
     }
 
     async fn accessibility_tree(&self) -> Result<Vec<AxNode>> {
+        self.ensure_alive()?;
+        let main_fid = self.main_frame_id().await.ok();
+        let frames = self.list_frames().await.unwrap_or_default();
+
+        // Capture bulk bounding boxes via DOMSnapshot (best-effort single RPC per renderer).
+        let bounds_map = self.capture_dom_snapshot_bounds(&frames).await;
+
         let res = self.call("Accessibility.getFullAXTree", json!({})).await?;
-        let raw_nodes = res["nodes"].as_array().cloned().unwrap_or_default();
-        let mut nodes = Vec::with_capacity(raw_nodes.len());
+        let main_raw = res["nodes"].as_array().cloned().unwrap_or_default();
+        let mut seen_frames: HashSet<String> = HashSet::new();
+        for n in &main_raw {
+            if let Some(fid) = n["frameId"].as_str() {
+                seen_frames.insert(fid.to_string());
+            }
+        }
+        let mut nodes = parse_cdp_ax_nodes(&main_raw, None, main_fid.as_deref(), &bounds_map);
 
-        for n in raw_nodes {
-            let node_id = n["nodeId"].as_str().unwrap_or_default().to_string();
-            let parent_id = n["parentId"].as_str().map(ToString::to_string);
-            let child_ids = n["childIds"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|v| v.as_str().map(ToString::to_string))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let role = n["role"]["value"]
-                .as_str()
-                .unwrap_or("unknown")
-                .to_string();
-            let name = n["name"]["value"]
-                .as_str()
-                .map(ToString::to_string);
-            let value = n["value"]["value"]
-                .as_str()
-                .map(ToString::to_string)
-                .or_else(|| n["value"]["value"].as_f64().map(|f| f.to_string()));
-            let description = n["description"]["value"].as_str().map(ToString::to_string);
-            let backend_node_id = n["backendDOMNodeId"].as_i64();
-            let frame_id = n["frameId"].as_str().map(ToString::to_string);
-            let ignored = n["ignored"].as_bool().unwrap_or(false);
-
-            let mut focusable = false;
-            let mut focused = false;
-            let mut disabled = false;
-            let mut checked = None;
-            let mut expanded = None;
-            let mut selected = None;
-            let mut required = false;
-            let mut level = None;
-
-            if let Some(props) = n["properties"].as_array() {
-                for prop in props {
-                    let pname = prop["name"].as_str().unwrap_or_default();
-                    let pval = &prop["value"]["value"];
-                    match pname {
-                        "focusable" => focusable = pval.as_bool().unwrap_or(false),
-                        "focused" => focused = pval.as_bool().unwrap_or(false),
-                        "disabled" => disabled = pval.as_bool().unwrap_or(false),
-                        "checked" => {
-                            checked = match pval.as_str() {
-                                Some("true") => Some(true),
-                                Some("false") => Some(false),
-                                _ => pval.as_bool(),
-                            };
-                        }
-                        "expanded" => expanded = pval.as_bool(),
-                        "selected" => selected = pval.as_bool(),
-                        "required" => required = pval.as_bool().unwrap_or(false),
-                        "level" => level = pval.as_u64().map(|l| l as u32),
-                        _ => {}
-                    }
+        // Order non-main frames topologically (parent before child) so nested OOPIFs attach cleanly.
+        let mut remaining: Vec<FrameInfo> = frames
+            .iter()
+            .filter(|f| !f.is_main && !seen_frames.contains(&f.frame_id))
+            .cloned()
+            .collect();
+        let mut ordered_frames: Vec<FrameInfo> = Vec::with_capacity(remaining.len());
+        let mut resolved_fids: HashSet<String> = seen_frames.clone();
+        if let Some(ref mfid) = main_fid {
+            resolved_fids.insert(mfid.clone());
+        }
+        while !remaining.is_empty() {
+            let prev_len = remaining.len();
+            let mut next_remaining = Vec::new();
+            for f in remaining {
+                let parent_ready = f
+                    .parent_frame_id
+                    .as_deref()
+                    .is_none_or(|p| resolved_fids.contains(p));
+                if parent_ready {
+                    resolved_fids.insert(f.frame_id.clone());
+                    ordered_frames.push(f);
+                } else {
+                    next_remaining.push(f);
                 }
             }
+            if next_remaining.len() == prev_len {
+                ordered_frames.extend(next_remaining);
+                break;
+            }
+            remaining = next_remaining;
+        }
 
-            nodes.push(AxNode {
-                node_id,
-                parent_id,
-                child_ids,
-                role,
-                name,
-                value,
-                description,
-                backend_node_id,
-                frame_id,
-                ignored,
-                focusable,
-                focused,
-                disabled,
-                checked,
-                expanded,
-                selected,
-                required,
-                level,
-                bounds: None,
-            });
+        // Fetch child frame AX trees if not already included in main getFullAXTree.
+        for f in &ordered_frames {
+            if f.is_main || seen_frames.contains(&f.frame_id) {
+                continue;
+            }
+            let prefix = format!("{}::", f.frame_id);
+            let sub_res = self
+                .call_for_frame(
+                    Some(&f.frame_id),
+                    "Accessibility.getFullAXTree",
+                    json!({ "frameId": f.frame_id }),
+                )
+                .await;
+            let Ok(sub_val) = sub_res else {
+                continue;
+            };
+            let sub_raw = sub_val["nodes"].as_array().cloned().unwrap_or_default();
+            if sub_raw.is_empty() {
+                continue;
+            }
+            for n in &sub_raw {
+                if let Some(sfid) = n["frameId"].as_str() {
+                    seen_frames.insert(sfid.to_string());
+                }
+            }
+            seen_frames.insert(f.frame_id.clone());
+
+            let mut sub_nodes =
+                parse_cdp_ax_nodes(&sub_raw, Some(&prefix), Some(&f.frame_id), &bounds_map);
+            for sn in &mut sub_nodes {
+                if sn.frame_id.is_none() {
+                    sn.frame_id = Some(f.frame_id.clone());
+                }
+            }
+            // Link subframe root node under the parent Iframe node via DOM.getFrameOwner on the owning parent frame.
+            let owner_bid = self
+                .call_for_frame(
+                    f.parent_frame_id.as_deref(),
+                    "DOM.getFrameOwner",
+                    json!({ "frameId": f.frame_id }),
+                )
+                .await
+                .ok()
+                .and_then(|v| v["backendNodeId"].as_i64());
+            if let Some(obid) = owner_bid
+                && let Some(parent_idx) = nodes
+                    .iter()
+                    .position(|n| {
+                        n.backend_node_id == Some(obid)
+                            && f.parent_frame_id
+                                .as_deref()
+                                .is_none_or(|pfid| n.frame_id.as_deref() == Some(pfid))
+                    })
+                    .or_else(|| {
+                        nodes.iter().position(|n| {
+                            n.backend_node_id == Some(obid)
+                                && (n.role.eq_ignore_ascii_case("Iframe")
+                                    || n.role.eq_ignore_ascii_case("IframePresentational"))
+                        })
+                    })
+            {
+                let parent_node_id = nodes[parent_idx].node_id.clone();
+                let mut root_ids = Vec::new();
+                for sn in &mut sub_nodes {
+                    if sn.parent_id.is_none() {
+                        sn.parent_id = Some(parent_node_id.clone());
+                        root_ids.push(sn.node_id.clone());
+                    }
+                }
+                nodes[parent_idx].child_ids.extend(root_ids);
+            } else if main_fid.is_some() {
+                // Keep subframe nodes with parent_id=None as top-level sibling roots if owner not found
+            }
+            nodes.extend(sub_nodes);
         }
 
         Ok(nodes)
@@ -1697,10 +3248,13 @@ impl DriverSession for CdpSession {
     async fn resolve_node_box(
         &self,
         backend_node_id: i64,
-        _frame_id: Option<&str>,
+        frame_id: Option<&str>,
     ) -> Result<BoundingBox> {
+        let mut bbox_opt = None;
+        let mut from_local_root = false;
         if let Ok(res) = self
-            .call(
+            .call_for_frame(
+                frame_id,
                 "DOM.getContentQuads",
                 json!({ "backendNodeId": backend_node_id }),
             )
@@ -1710,28 +3264,319 @@ impl DriverSession for CdpSession {
                 .and_then(|arr| arr.first())
                 .and_then(quad_to_bbox)
         {
-            return Ok(bbox);
+            bbox_opt = Some(bbox);
+            from_local_root = true;
         }
 
-        if let Ok(res) = self
-            .call(
-                "DOM.getBoxModel",
-                json!({ "backendNodeId": backend_node_id }),
-            )
-            .await
+        if bbox_opt.is_none()
+            && let Ok(res) = self
+                .call_for_frame(
+                    frame_id,
+                    "DOM.getBoxModel",
+                    json!({ "backendNodeId": backend_node_id }),
+                )
+                .await
             && let Some(bbox) = quad_to_bbox(&res["model"]["content"])
         {
-            return Ok(bbox);
+            bbox_opt = Some(bbox);
+            from_local_root = true;
         }
 
-        Err(MimikyuError::ElementNotFound(format!(
-            "cannot resolve bounding box for backendNodeId {backend_node_id}"
-        )))
+        if bbox_opt.is_none()
+            && let Ok(val) = self
+                .call_function_on_node(
+                    backend_node_id,
+                    frame_id,
+                    r#"function() {
+                        const r = this.getBoundingClientRect ? this.getBoundingClientRect() : null;
+                        if (!r) return null;
+                        return { x: r.x, y: r.y, width: r.width, height: r.height };
+                    }"#,
+                    vec![],
+                )
+                .await
+            && !val.is_null()
+            && let Ok(bbox) = serde_json::from_value::<BoundingBox>(val)
+        {
+            bbox_opt = Some(bbox);
+        }
+
+        let mut bbox = bbox_opt.ok_or_else(|| {
+            MimikyuError::ElementNotFound(format!(
+                "cannot resolve bounding box for backendNodeId {backend_node_id}"
+            ))
+        })?;
+
+        // If frame_id is hosted in an OOPIF child session, accumulate host <iframe> offsets up to main frame.
+        // DOM.getContentQuads / DOM.getBoxModel already include same-origin subframe offsets up to the
+        // OOPIF's own local root frame, so when `from_local_root` is true we walk to that local root
+        // before accumulating cross-process offsets (avoiding double-offsetting same-origin subframes
+        // inside an OOPIF).
+        let child_sid_opt =
+            frame_id.and_then(|fid| self.state.iframe_sessions.lock().get(fid).cloned());
+        if let Some(fid) = frame_id
+            && (child_sid_opt.is_some() || !from_local_root)
+        {
+            let main_fid = self.main_frame_id().await.ok();
+            if child_sid_opt.is_some() || main_fid.as_deref() != Some(fid) {
+                let frames = self.list_frames().await.unwrap_or_default();
+                let parent_map: HashMap<String, String> = frames
+                    .iter()
+                    .filter_map(|f| {
+                        f.parent_frame_id
+                            .as_ref()
+                            .map(|p| (f.frame_id.clone(), p.clone()))
+                    })
+                    .collect();
+                let offset_fid = if from_local_root
+                    && let Some(ref child_sid) = child_sid_opt
+                {
+                    let iframe_map = self.state.iframe_sessions.lock().clone();
+                    let mut cur = fid.to_string();
+                    for _ in 0..32 {
+                        let Some(p) = parent_map.get(&cur) else {
+                            break;
+                        };
+                        if iframe_map.get(p).map(String::as_str) == Some(child_sid.as_str()) {
+                            cur = p.clone();
+                        } else {
+                            break;
+                        }
+                    }
+                    cur
+                } else {
+                    fid.to_string()
+                };
+                let mut cache = HashMap::new();
+                let tf = self
+                    .resolve_frame_transform(
+                        &offset_fid,
+                        main_fid.as_deref(),
+                        &parent_map,
+                        &mut cache,
+                    )
+                    .await;
+                tf.apply(&mut bbox);
+            }
+        }
+
+        Ok(bbox)
     }
 
     async fn resolve_selector_box(&self, selector: &str) -> Result<BoundingBox> {
         let backend_id = self.query_backend_node_id(selector).await?;
         self.resolve_node_box(backend_id, None).await
+    }
+
+    async fn viewport_size(&self) -> Result<(f64, f64)> {
+        let val = self
+            .eval_isolated(
+                r#"(() => {
+                    const iw = window.innerWidth || 1280;
+                    const ih = window.innerHeight || 800;
+                    const cw = (document.documentElement && document.documentElement.clientWidth) || iw;
+                    const ch = (document.documentElement && document.documentElement.clientHeight) || ih;
+                    return { w: Math.min(iw, cw), h: Math.min(ih, ch) };
+                })()"#,
+            )
+            .await?;
+        let w = val["w"].as_f64().unwrap_or(1280.0).max(1.0);
+        let h = val["h"].as_f64().unwrap_or(800.0).max(1.0);
+        Ok((w, h))
+    }
+
+    async fn scroll_into_view(
+        &self,
+        backend_node_id: Option<i64>,
+        frame_id: Option<&str>,
+        selector: Option<&str>,
+    ) -> Result<()> {
+        let bid = match (backend_node_id, selector) {
+            (Some(b), _) => b,
+            (None, Some(sel)) => self.query_backend_node_id(sel).await?,
+            (None, None) => {
+                return Err(MimikyuError::InvalidConfig(
+                    "scroll_into_view requires backend_node_id or selector".to_string(),
+                ))
+            }
+        };
+        if self
+            .call_for_frame(
+                frame_id,
+                "DOM.scrollIntoViewIfNeeded",
+                json!({ "backendNodeId": bid }),
+            )
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        let _ = self
+            .call_function_on_node(
+                bid,
+                frame_id,
+                "function() { this.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); return true; }",
+                vec![],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn clear_node_value(
+        &self,
+        backend_node_id: Option<i64>,
+        frame_id: Option<&str>,
+        selector: Option<&str>,
+    ) -> Result<()> {
+        let bid = match (backend_node_id, selector) {
+            (Some(b), _) => b,
+            (None, Some(sel)) => self.query_backend_node_id(sel).await?,
+            (None, None) => {
+                return Err(MimikyuError::InvalidConfig(
+                    "clear_node_value requires backend_node_id or selector".to_string(),
+                ))
+            }
+        };
+        let ok = self
+            .call_function_on_node(
+                bid,
+                frame_id,
+                r#"function() {
+                    if (!this) return false;
+                    if (typeof this.focus === 'function') this.focus();
+                    const tag = this.tagName;
+                    if (tag === 'INPUT' || tag === 'TEXTAREA') {
+                        const proto = tag === 'INPUT' ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+                        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                        if (setter) setter.call(this, '');
+                        else this.value = '';
+                        this.dispatchEvent(new Event('input', { bubbles: true }));
+                        return true;
+                    }
+                    if (this.isContentEditable) {
+                        this.textContent = '';
+                        this.dispatchEvent(new Event('input', { bubbles: true }));
+                        return true;
+                    }
+                    return false;
+                }"#,
+                vec![],
+            )
+            .await?;
+        if ok.as_bool() != Some(true) {
+            return Err(MimikyuError::ElementNotFound(format!(
+                "element {bid} is not a clearable input/textarea/contenteditable"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn select_option(
+        &self,
+        backend_node_id: Option<i64>,
+        frame_id: Option<&str>,
+        selector: Option<&str>,
+        by: SelectBy,
+    ) -> Result<String> {
+        let bid = match (backend_node_id, selector) {
+            (Some(b), _) => b,
+            (None, Some(sel)) => self.query_backend_node_id(sel).await?,
+            (None, None) => {
+                return Err(MimikyuError::InvalidConfig(
+                    "select_option requires backend_node_id or selector".to_string(),
+                ))
+            }
+        };
+        let (mode, val_arg): (&str, Value) = match by {
+            SelectBy::Value(v) => ("value", json!(v)),
+            SelectBy::Label(l) => ("label", json!(l)),
+            SelectBy::Index(i) => ("index", json!(i)),
+            SelectBy::Auto(a) => ("auto", json!(a)),
+        };
+        let res = self
+            .call_function_on_node(
+                bid,
+                frame_id,
+                r#"function(mode, target) {
+                    if (!this || this.tagName !== 'SELECT') {
+                        return { ok: false, error: 'element is not a <select>' };
+                    }
+                    const opts = Array.from(this.options || []);
+                    let idx = -1;
+                    if (mode === 'index') {
+                        const i = Number(target);
+                        if (Number.isInteger(i) && i >= 0 && i < opts.length) idx = i;
+                    } else if (mode === 'value') {
+                        idx = opts.findIndex(o => o.value === String(target));
+                    } else if (mode === 'label') {
+                        idx = opts.findIndex(o => (o.textContent || '').trim() === String(target));
+                    } else {
+                        idx = opts.findIndex(o => o.value === String(target));
+                        if (idx < 0) idx = opts.findIndex(o => (o.textContent || '').trim() === String(target));
+                    }
+                    if (idx < 0 || opts[idx].disabled) {
+                        return { ok: false, error: 'option not found or disabled' };
+                    }
+                    this.selectedIndex = idx;
+                    opts[idx].selected = true;
+                    this.dispatchEvent(new Event('input', { bubbles: true }));
+                    this.dispatchEvent(new Event('change', { bubbles: true }));
+                    return { ok: true, value: opts[idx].value };
+                }"#,
+                vec![json!(mode), val_arg],
+            )
+            .await?;
+        if res["ok"].as_bool() == Some(true) {
+            return Ok(res["value"].as_str().unwrap_or_default().to_string());
+        }
+        Err(MimikyuError::ElementNotFound(
+            res["error"]
+                .as_str()
+                .unwrap_or("select_option failed")
+                .to_string(),
+        ))
+    }
+
+    async fn css_selector_for_node(
+        &self,
+        backend_node_id: i64,
+        frame_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Ok(val) = self
+            .call_function_on_node(
+                backend_node_id,
+                frame_id,
+                r#"function() {
+                    if (!this || this.nodeType !== 1) return null;
+                    if (this.getRootNode && this.getRootNode() instanceof ShadowRoot) return null;
+                    if (this.id) return '#' + CSS.escape(this.id);
+                    const parts = [];
+                    let cur = this;
+                    while (cur && cur.nodeType === 1 && cur !== document.documentElement) {
+                        let sel = cur.tagName.toLowerCase();
+                        if (cur.id) {
+                            parts.unshift('#' + CSS.escape(cur.id));
+                            break;
+                        }
+                        const parent = cur.parentElement;
+                        if (parent) {
+                            const sameTag = Array.from(parent.children).filter(c => c.tagName === cur.tagName);
+                            if (sameTag.length > 1) {
+                                sel += `:nth-of-type(${sameTag.indexOf(cur) + 1})`;
+                            }
+                        }
+                        parts.unshift(sel);
+                        cur = parent;
+                    }
+                    return parts.join(' > ');
+                }"#,
+                vec![],
+            )
+            .await
+        else {
+            return Ok(None);
+        };
+        Ok(val.as_str().map(ToString::to_string))
     }
 
     async fn focus_node(
@@ -1758,6 +3603,7 @@ impl DriverSession for CdpSession {
     async fn set_file_input_files(
         &self,
         backend_node_id: Option<i64>,
+        frame_id: Option<&str>,
         selector: Option<&str>,
         files: Vec<PathBuf>,
     ) -> Result<()> {
@@ -1767,7 +3613,8 @@ impl DriverSession for CdpSession {
             .collect();
 
         if let Some(bid) = backend_node_id {
-            self.call(
+            self.call_for_frame(
+                frame_id,
                 "DOM.setFileInputFiles",
                 json!({ "backendNodeId": bid, "files": file_strs }),
             )
@@ -1775,8 +3622,9 @@ impl DriverSession for CdpSession {
             return Ok(());
         }
         if let Some(sel) = selector {
-            let bid = self.query_backend_node_id(sel).await?;
-            self.call(
+            let bid = self.query_backend_node_id_in_frame(sel, frame_id).await?;
+            self.call_for_frame(
+                frame_id,
                 "DOM.setFileInputFiles",
                 json!({ "backendNodeId": bid, "files": file_strs }),
             )
@@ -1918,6 +3766,9 @@ impl DriverSession for CdpSession {
             }
 
             let (resolved_key, resolved_text) = resolve_cdp_char_key_and_text(&ev);
+            let fallback = ascii_key_code_and_vk(&ev.key);
+            let code_opt = ev.code.as_deref().or_else(|| fallback.map(|f| f.0));
+            let vk_opt = ev.windows_virtual_key_code.or_else(|| fallback.map(|f| f.1));
             let down_type = if resolved_text.is_some() {
                 "keyDown"
             } else {
@@ -1928,10 +3779,10 @@ impl DriverSession for CdpSession {
                 "key": resolved_key,
                 "modifiers": ev.modifiers,
             });
-            if let Some(ref code) = ev.code {
+            if let Some(code) = code_opt {
                 down_params["code"] = json!(code);
             }
-            if let Some(vk) = ev.windows_virtual_key_code {
+            if let Some(vk) = vk_opt {
                 down_params["windowsVirtualKeyCode"] = json!(vk);
             }
             if let Some(ref txt) = resolved_text {
@@ -1945,10 +3796,10 @@ impl DriverSession for CdpSession {
                 "key": resolved_key,
                 "modifiers": ev.modifiers,
             });
-            if let Some(ref code) = ev.code {
+            if let Some(code) = code_opt {
                 up_params["code"] = json!(code);
             }
-            if let Some(vk) = ev.windows_virtual_key_code {
+            if let Some(vk) = vk_opt {
                 up_params["windowsVirtualKeyCode"] = json!(vk);
             }
             self.call("Input.dispatchKeyEvent", up_params).await?;
@@ -2016,6 +3867,7 @@ impl DriverSession for CdpSession {
             ScreenshotFormat::Jpeg { quality } => json!({ "format": "jpeg", "quality": quality }),
         };
 
+        let scale = opts.scale.unwrap_or(1.0).max(0.05);
         if opts.full_page {
             params["captureBeyondViewport"] = json!(true);
             if let Ok(metrics) = self.call("Page.getLayoutMetrics", json!({})).await
@@ -2031,16 +3883,31 @@ impl DriverSession for CdpSession {
                     "y": 0.0,
                     "width": w,
                     "height": h,
-                    "scale": 1.0,
+                    "scale": scale,
                 });
             }
         } else if let Some(clip) = opts.clip {
+            params["captureBeyondViewport"] = json!(true);
+            let (page_x, page_y) = match self.call("Page.getLayoutMetrics", json!({})).await {
+                Ok(metrics) => {
+                    let px = metrics["cssVisualViewport"]["pageX"]
+                        .as_f64()
+                        .or_else(|| metrics["cssLayoutViewport"]["pageX"].as_f64())
+                        .unwrap_or(0.0);
+                    let py = metrics["cssVisualViewport"]["pageY"]
+                        .as_f64()
+                        .or_else(|| metrics["cssLayoutViewport"]["pageY"].as_f64())
+                        .unwrap_or(0.0);
+                    (px, py)
+                }
+                Err(_) => (0.0, 0.0),
+            };
             params["clip"] = json!({
-                "x": clip.x,
-                "y": clip.y,
+                "x": clip.x + page_x,
+                "y": clip.y + page_y,
                 "width": clip.width,
                 "height": clip.height,
-                "scale": 1.0,
+                "scale": scale,
             });
         }
 
@@ -2086,10 +3953,116 @@ impl DriverSession for CdpSession {
     }
 
     async fn set_instant_animations(&self, enabled: bool) -> Result<()> {
+        self.ensure_alive()?;
+        self.state
+            .instant_animations
+            .store(enabled, Ordering::SeqCst);
+
         let _ = self.call("Animation.enable", json!({})).await;
-        let rate = if enabled { 1000.0 } else { 1.0 };
+        let rate = if enabled { 10_000.0 } else { 1.0 };
         self.call("Animation.setPlaybackRate", json!({ "playbackRate": rate }))
             .await?;
+
+        {
+            let mut guard = self.state.anim_script_id.lock().await;
+            if let Some(old_id) = guard.take() {
+                let _ = self.remove_init_script(&old_id).await;
+            }
+            if enabled {
+                let res = self
+                    .call(
+                        "Page.addScriptToEvaluateOnNewDocument",
+                        json!({
+                            "source": INSTANT_ANIM_PRELOAD_JS,
+                            "worldName": "mimikyu_isolated",
+                        }),
+                    )
+                    .await;
+                if let Ok(v) = res
+                    && let Some(id) = v["identifier"].as_str()
+                {
+                    *guard = Some(id.to_string());
+                } else if let Ok(id) = self.add_init_script(INSTANT_ANIM_PRELOAD_JS).await {
+                    *guard = Some(id);
+                }
+            }
+        }
+
+        let frames = self.list_frames().await.unwrap_or_default();
+        let target_frames: Vec<Option<String>> = if frames.is_empty() {
+            vec![None]
+        } else {
+            frames.into_iter().map(|f| Some(f.frame_id)).collect()
+        };
+
+        for fid in target_frames {
+            if let Some(ref f) = fid
+                && self.state.iframe_sessions.lock().contains_key(f)
+            {
+                let _ = self
+                    .call_for_frame(Some(f), "Animation.enable", json!({}))
+                    .await;
+                let _ = self
+                    .call_for_frame(
+                        Some(f),
+                        "Animation.setPlaybackRate",
+                        json!({ "playbackRate": rate }),
+                    )
+                    .await;
+            }
+            let css_json = serde_json::to_string(INSTANT_ANIM_CSS)?;
+            let js = if enabled {
+                format!(
+                    r#"(() => {{
+                        const css = {css_json};
+                        try {{
+                            if (document.adoptedStyleSheets && typeof CSSStyleSheet === "function") {{
+                                const already = document.adoptedStyleSheets.some(s => {{
+                                    try {{ return s.cssRules && s.cssRules.length > 0 && s.cssRules[0].cssText.includes("animation-iteration-count: 1"); }} catch {{ return false; }}
+                                }});
+                                if (!already) {{
+                                    const sheet = new CSSStyleSheet();
+                                    sheet.replaceSync(css);
+                                    document.adoptedStyleSheets = [...document.adoptedStyleSheets, sheet];
+                                }}
+                            }} else {{
+                                const host = document.head || document.documentElement;
+                                if (host && !Array.from(host.querySelectorAll("style")).some(el => el.textContent === css)) {{
+                                    const st = document.createElement("style");
+                                    st.textContent = css;
+                                    host.appendChild(st);
+                                }}
+                            }}
+                        }} catch {{}}
+                        try {{
+                            for (const anim of document.getAnimations()) {{
+                                const t = anim.effect && anim.effect.getComputedTiming ? anim.effect.getComputedTiming() : null;
+                                if (!t || Number.isFinite(t.iterations)) {{
+                                    try {{ anim.finish(); }} catch {{}}
+                                }}
+                            }}
+                        }} catch {{}}
+                    }})()"#
+                )
+            } else {
+                format!(
+                    r#"(() => {{
+                        const css = {css_json};
+                        try {{
+                            if (document.adoptedStyleSheets) {{
+                                document.adoptedStyleSheets = document.adoptedStyleSheets.filter(s => {{
+                                    try {{ return !(s.cssRules && s.cssRules.length > 0 && s.cssRules[0].cssText.includes("animation-iteration-count: 1")); }} catch {{ return true; }}
+                                }});
+                            }}
+                            for (const st of Array.from(document.querySelectorAll("style"))) {{
+                                if (st.textContent === css) st.remove();
+                            }}
+                        }} catch {{}}
+                    }})()"#
+                )
+            };
+            let _ = self.eval_isolated_in_frame(&js, fid.as_deref()).await;
+        }
         Ok(())
     }
 
@@ -2524,6 +4497,11 @@ impl DriverSession for CdpSession {
         Ok(self.state.telemetry.inflight_count())
     }
 
+    async fn inflight_activity(&self, ignore_long_lived: bool) -> Result<(usize, u64)> {
+        self.ensure_alive()?;
+        Ok(self.state.telemetry.inflight_stats(ignore_long_lived))
+    }
+
     async fn document_ready_state(&self) -> Result<String> {
         let val = self.eval_isolated("document.readyState").await?;
         Ok(val.as_str().unwrap_or("loading").to_string())
@@ -2534,6 +4512,10 @@ impl DriverSession for CdpSession {
             return Ok(());
         }
         self.conn.sessions.write().remove(&self.info.session_id);
+        self.conn
+            .iframe_owner_sessions
+            .write()
+            .retain(|_, owner| owner != &self.info.session_id);
 
         if self.state.is_root {
             self.conn.shutdown_all().await;
@@ -2659,6 +4641,41 @@ fn json_map_to_btree(val: Option<&Value>) -> BTreeMap<String, String> {
     map
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FrameTransform {
+    ox: f64,
+    oy: f64,
+    sx: f64,
+    sy: f64,
+}
+
+impl FrameTransform {
+    fn identity() -> Self {
+        Self {
+            ox: 0.0,
+            oy: 0.0,
+            sx: 1.0,
+            sy: 1.0,
+        }
+    }
+
+    fn compose_inner(self, inner: Self) -> Self {
+        Self {
+            ox: self.ox + inner.ox * self.sx,
+            oy: self.oy + inner.oy * self.sy,
+            sx: self.sx * inner.sx,
+            sy: self.sy * inner.sy,
+        }
+    }
+
+    fn apply(self, bbox: &mut BoundingBox) {
+        bbox.x = self.ox + bbox.x * self.sx;
+        bbox.y = self.oy + bbox.y * self.sy;
+        bbox.width *= self.sx;
+        bbox.height *= self.sy;
+    }
+}
+
 fn quad_to_bbox(quad: &Value) -> Option<BoundingBox> {
     let arr = quad.as_array()?;
     if arr.len() < 8 {
@@ -2690,6 +4707,7 @@ fn quad_to_bbox(quad: &Value) -> Option<BoundingBox> {
 
 fn resolve_cdp_char_key_and_text(ev: &KeyEvent) -> (String, Option<String>) {
     let shift_active = ev.modifiers & 8 != 0;
+    let non_text_mod_active = ev.modifiers & (MOD_ALT | MOD_CONTROL | MOD_META) != 0;
     let mut chars = ev.key.chars();
     let single_char = match (chars.next(), chars.next()) {
         (Some(ch), None) => Some(ch),
@@ -2705,12 +4723,224 @@ fn resolve_cdp_char_key_and_text(ev: &KeyEvent) -> (String, Option<String>) {
         ev.key.clone()
     };
 
-    let resolved_text = ev
-        .text
-        .clone()
-        .or_else(|| single_char.map(|_| resolved_key.clone()));
+    let resolved_text = ev.text.clone().or_else(|| {
+        if non_text_mod_active {
+            None
+        } else {
+            single_char.map(|_| resolved_key.clone())
+        }
+    });
 
     (resolved_key, resolved_text)
+}
+
+fn ascii_key_code_and_vk(key: &str) -> Option<(&'static str, u32)> {
+    let mut chars = key.chars();
+    let (Some(ch), None) = (chars.next(), chars.next()) else {
+        return None;
+    };
+    match ch.to_ascii_uppercase() {
+        'A' => Some(("KeyA", 65)),
+        'B' => Some(("KeyB", 66)),
+        'C' => Some(("KeyC", 67)),
+        'D' => Some(("KeyD", 68)),
+        'E' => Some(("KeyE", 69)),
+        'F' => Some(("KeyF", 70)),
+        'G' => Some(("KeyG", 71)),
+        'H' => Some(("KeyH", 72)),
+        'I' => Some(("KeyI", 73)),
+        'J' => Some(("KeyJ", 74)),
+        'K' => Some(("KeyK", 75)),
+        'L' => Some(("KeyL", 76)),
+        'M' => Some(("KeyM", 77)),
+        'N' => Some(("KeyN", 78)),
+        'O' => Some(("KeyO", 79)),
+        'P' => Some(("KeyP", 80)),
+        'Q' => Some(("KeyQ", 81)),
+        'R' => Some(("KeyR", 82)),
+        'S' => Some(("KeyS", 83)),
+        'T' => Some(("KeyT", 84)),
+        'U' => Some(("KeyU", 85)),
+        'V' => Some(("KeyV", 86)),
+        'W' => Some(("KeyW", 87)),
+        'X' => Some(("KeyX", 88)),
+        'Y' => Some(("KeyY", 89)),
+        'Z' => Some(("KeyZ", 90)),
+        '0' => Some(("Digit0", 48)),
+        '1' => Some(("Digit1", 49)),
+        '2' => Some(("Digit2", 50)),
+        '3' => Some(("Digit3", 51)),
+        '4' => Some(("Digit4", 52)),
+        '5' => Some(("Digit5", 53)),
+        '6' => Some(("Digit6", 54)),
+        '7' => Some(("Digit7", 55)),
+        '8' => Some(("Digit8", 56)),
+        '9' => Some(("Digit9", 57)),
+        _ => None,
+    }
+}
+
+fn collect_cdp_frames(tree: &Value, parent_id: Option<&str>, out: &mut Vec<FrameInfo>) {
+    let frame = &tree["frame"];
+    let Some(fid) = frame["id"].as_str() else {
+        return;
+    };
+    let name = frame["name"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+    let url = frame["url"].as_str().unwrap_or_default().to_string();
+    out.push(FrameInfo {
+        frame_id: fid.to_string(),
+        parent_frame_id: parent_id.map(ToString::to_string),
+        name,
+        url,
+        is_main: parent_id.is_none(),
+    });
+    if let Some(children) = tree["childFrames"].as_array() {
+        for child in children {
+            collect_cdp_frames(child, Some(fid), out);
+        }
+    }
+}
+
+fn collect_closed_shadow_roots(
+    node: &Value,
+    current_frame_id: Option<&str>,
+    filter_frame_id: Option<&str>,
+    out: &mut Vec<i64>,
+) {
+    let node_fid = node.get("frameId").and_then(|v| v.as_str());
+    let is_document = node.get("nodeType").and_then(|v| v.as_i64()) == Some(9);
+    let effective_frame_id = if is_document {
+        node_fid.or(current_frame_id)
+    } else {
+        current_frame_id
+    };
+    let frame_matches = filter_frame_id.is_none_or(|target| effective_frame_id == Some(target));
+    if let Some(srs) = node.get("shadowRoots").and_then(|v| v.as_array()) {
+        for sr in srs {
+            if frame_matches
+                && sr.get("shadowRootType").and_then(|v| v.as_str()) == Some("closed")
+                && let Some(bid) = sr.get("backendNodeId").and_then(|v| v.as_i64())
+            {
+                out.push(bid);
+            }
+            collect_closed_shadow_roots(sr, effective_frame_id, filter_frame_id, out);
+        }
+    }
+    if let Some(children) = node.get("children").and_then(|v| v.as_array()) {
+        for ch in children {
+            collect_closed_shadow_roots(ch, effective_frame_id, filter_frame_id, out);
+        }
+    }
+    if let Some(cd) = node.get("contentDocument") {
+        let cd_frame_id = node_fid.or(effective_frame_id);
+        collect_closed_shadow_roots(cd, cd_frame_id, filter_frame_id, out);
+    }
+}
+
+fn parse_cdp_ax_nodes(
+    raw_nodes: &[Value],
+    id_prefix: Option<&str>,
+    default_frame_id: Option<&str>,
+    bounds_map: &HashMap<(Option<String>, i64), BoundingBox>,
+) -> Vec<AxNode> {
+    let scope_id = |id: &str| -> String {
+        match id_prefix {
+            Some(p) => format!("{p}{id}"),
+            None => id.to_string(),
+        }
+    };
+    let mut nodes = Vec::with_capacity(raw_nodes.len());
+    for n in raw_nodes {
+        let raw_nid = n["nodeId"].as_str().unwrap_or_default();
+        let node_id = scope_id(raw_nid);
+        let parent_id = n["parentId"].as_str().map(&scope_id);
+        let child_ids = n["childIds"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(&scope_id))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let role = n["role"]["value"]
+            .as_str()
+            .unwrap_or("unknown")
+            .to_string();
+        let name = n["name"]["value"].as_str().map(ToString::to_string);
+        let value = n["value"]["value"]
+            .as_str()
+            .map(ToString::to_string)
+            .or_else(|| n["value"]["value"].as_f64().map(|f| f.to_string()));
+        let description = n["description"]["value"].as_str().map(ToString::to_string);
+        let backend_node_id = n["backendDOMNodeId"].as_i64();
+        let frame_id = n["frameId"]
+            .as_str()
+            .map(ToString::to_string)
+            .or_else(|| default_frame_id.map(ToString::to_string));
+        let ignored = n["ignored"].as_bool().unwrap_or(false);
+
+        let mut focusable = false;
+        let mut focused = false;
+        let mut disabled = false;
+        let mut checked = None;
+        let mut expanded = None;
+        let mut selected = None;
+        let mut required = false;
+        let mut level = None;
+
+        if let Some(props) = n["properties"].as_array() {
+            for prop in props {
+                let pname = prop["name"].as_str().unwrap_or_default();
+                let pval = &prop["value"]["value"];
+                match pname {
+                    "focusable" => focusable = pval.as_bool().unwrap_or(false),
+                    "focused" => focused = pval.as_bool().unwrap_or(false),
+                    "disabled" => disabled = pval.as_bool().unwrap_or(false),
+                    "checked" => {
+                        checked = match pval.as_str() {
+                            Some("true") => Some(true),
+                            Some("false") => Some(false),
+                            _ => pval.as_bool(),
+                        };
+                    }
+                    "expanded" => expanded = pval.as_bool(),
+                    "selected" => selected = pval.as_bool(),
+                    "required" => required = pval.as_bool().unwrap_or(false),
+                    "level" => level = pval.as_u64().map(|l| l as u32),
+                    _ => {}
+                }
+            }
+        }
+
+        let bounds = backend_node_id
+            .and_then(|bid| bounds_map.get(&(frame_id.clone(), bid)).copied());
+
+        nodes.push(AxNode {
+            node_id,
+            parent_id,
+            child_ids,
+            role,
+            name,
+            value,
+            description,
+            backend_node_id,
+            frame_id,
+            ignored,
+            focusable,
+            focused,
+            disabled,
+            checked,
+            expanded,
+            selected,
+            required,
+            level,
+            bounds,
+        });
+    }
+    nodes
 }
 
 fn named_key_cdp_spec(key: &str) -> Option<(&'static str, &'static str, u32, Option<&'static str>)> {
@@ -2827,5 +5057,214 @@ mod tests {
             resolve_cdp_char_key_and_text(&explicit_text),
             ("A".to_string(), Some("custom".to_string()))
         );
+
+        let ctrl_chord = KeyEvent {
+            event_type: KeyEventType::Char,
+            key: "a".to_string(),
+            code: None,
+            text: None,
+            windows_virtual_key_code: None,
+            modifiers: MOD_CONTROL,
+        };
+        assert_eq!(
+            resolve_cdp_char_key_and_text(&ctrl_chord),
+            ("a".to_string(), None)
+        );
+        assert_eq!(ascii_key_code_and_vk("a"), Some(("KeyA", 65)));
+    }
+
+    fn dummy_session_state() -> CdpSessionState {
+        CdpSessionState {
+            session_id: "main-sid".to_string(),
+            target_id: "main-tid".to_string(),
+            context_id: None,
+            owns_context: false,
+            is_root: true,
+            main_world_eval: false,
+            telemetry_capacity: None,
+            main_frame_id: Mutex::new(Some("main-fid".to_string())),
+            last_main_origin: Mutex::new(None),
+            isolated_worlds: Mutex::new(HashMap::new()),
+            default_contexts: Mutex::new(HashMap::new()),
+            iframe_sessions: Mutex::new(HashMap::new()),
+            iframe_session_targets: Mutex::new(HashMap::new()),
+            iframe_parent_sessions: Mutex::new(HashMap::new()),
+            pending_cdp_requests: Mutex::new(HashMap::new()),
+            finalized_doc_loaders: Mutex::new(VecDeque::new()),
+            telemetry: Arc::new(TelemetryStore::default()),
+            interceptor: Mutex::new(NetworkInterceptor::default()),
+            fetch_enabled: AtomicBool::new(false),
+            instant_animations: AtomicBool::new(false),
+            anim_script_id: AsyncMutex::new(None),
+            env_script_id: AsyncMutex::new(None),
+            worker_init_script: Mutex::new(None),
+            worker_ua_params: Mutex::new(None),
+            pending_storage_scripts: Mutex::new(Vec::new()),
+            _proxy_relay: Mutex::new(None),
+            load_notify: Notify::new(),
+            disposed: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn cdp_pending_oopif_document_finalizes_and_prunes_cleanly() {
+        let state = dummy_session_state();
+        let insert_req = |req_id: &str, fid: &str, lid: &str, rt: &str| {
+            state.pending_cdp_requests.lock().insert(
+                req_id.to_string(),
+                PendingCdpRequest {
+                    session_id: "main-sid".to_string(),
+                    frame_id: Some(fid.to_string()),
+                    loader_id: Some(lid.to_string()),
+                    resource_type: rt.to_string(),
+                    received_response: true,
+                    committed: false,
+                },
+            );
+            state.telemetry.on_request_started(
+                NetworkEvent {
+                    timestamp_ms: 1,
+                    request_id: req_id.to_string(),
+                    url: "http://localhost/child".to_string(),
+                    method: "GET".to_string(),
+                    resource_type: rt.to_string(),
+                    status: Some(200),
+                    mime_type: Some("text/html".to_string()),
+                    failed: false,
+                    error_text: None,
+                    request_headers: BTreeMap::new(),
+                    response_headers: BTreeMap::new(),
+                },
+                None,
+                None,
+                BTreeMap::new(),
+            );
+        };
+
+        // 1. Committed OOPIF Document finalizes on frameStoppedLoading
+        insert_req("req-oopif-1", "child-fid-1", "req-oopif-1", "Document");
+        assert_eq!(state.telemetry.inflight_count(), 1);
+        state.mark_document_committed_and_prune_superseded("child-fid-1", Some("req-oopif-1"));
+        assert_eq!(state.telemetry.inflight_count(), 1);
+        state.finalize_document_requests_for_frame("child-fid-1", true);
+        assert_eq!(state.telemetry.inflight_count(), 0);
+
+        // 2. Frame detached prunes pending requests on that frame
+        insert_req("req-oopif-2", "child-fid-2", "req-oopif-2", "Document");
+        assert_eq!(state.telemetry.inflight_count(), 1);
+        state.prune_pending_requests_for_frame("child-fid-2");
+        assert_eq!(state.telemetry.inflight_count(), 0);
+
+        // 3. Top-level navigation prunes requests outside new loaderId
+        insert_req("req-old-fetch", "main-fid", "loader-old", "Fetch");
+        insert_req("req-new-doc", "main-fid", "loader-new", "Document");
+        assert_eq!(state.telemetry.inflight_count(), 2);
+        state.prune_pending_requests_outside_loader("loader-new");
+        assert_eq!(state.telemetry.inflight_count(), 1);
+        assert!(state.pending_cdp_requests.lock().contains_key("req-new-doc"));
+
+        // 4. Child-session Fetch + Document deduplication + SSE ignore_long_lived + detach pruning
+        state.finalize_document_requests_for_frame("main-fid", false);
+        assert_eq!(state.telemetry.inflight_count(), 0);
+        // Simulate finalized loaderId for child Document: re-sent from child must be ignored
+        state.record_finalized_doc_loader(Some("loader-oopif-done"));
+        assert!(state.is_doc_loader_finalized("loader-oopif-done"));
+        state.pending_cdp_requests.lock().insert(
+            "child-fetch-1".to_string(),
+            PendingCdpRequest {
+                session_id: "child-sid-1".to_string(),
+                frame_id: Some("child-fid-1".to_string()),
+                loader_id: Some("loader-child-1".to_string()),
+                resource_type: "Fetch".to_string(),
+                received_response: false,
+                committed: false,
+            },
+        );
+        state.telemetry.on_request_started(
+            NetworkEvent {
+                timestamp_ms: 2,
+                request_id: "child-fetch-1".to_string(),
+                url: "http://localhost/api/delayed".to_string(),
+                method: "GET".to_string(),
+                resource_type: "Fetch".to_string(),
+                status: None,
+                mime_type: None,
+                failed: false,
+                error_text: None,
+                request_headers: BTreeMap::new(),
+                response_headers: BTreeMap::new(),
+            },
+            None,
+            None,
+            BTreeMap::new(),
+        );
+        state.pending_cdp_requests.lock().insert(
+            "child-sse-1".to_string(),
+            PendingCdpRequest {
+                session_id: "child-sid-1".to_string(),
+                frame_id: Some("child-fid-1".to_string()),
+                loader_id: Some("loader-child-1".to_string()),
+                resource_type: "EventSource".to_string(),
+                received_response: true,
+                committed: false,
+            },
+        );
+        state.telemetry.on_request_started(
+            NetworkEvent {
+                timestamp_ms: 3,
+                request_id: "child-sse-1".to_string(),
+                url: "http://localhost/sse".to_string(),
+                method: "GET".to_string(),
+                resource_type: "EventSource".to_string(),
+                status: Some(200),
+                mime_type: Some("text/event-stream".to_string()),
+                failed: false,
+                error_text: None,
+                request_headers: BTreeMap::new(),
+                response_headers: BTreeMap::new(),
+            },
+            None,
+            None,
+            BTreeMap::new(),
+        );
+        assert_eq!(state.telemetry.inflight_stats(false).0, 2);
+        assert_eq!(state.telemetry.inflight_stats(true).0, 1);
+        let mut det_sids = HashSet::new();
+        det_sids.insert("child-sid-1".to_string());
+        state.prune_pending_requests_for_detached(&det_sids, &HashSet::new());
+        assert_eq!(state.telemetry.inflight_count(), 0);
+    }
+
+    #[test]
+    fn cdp_frame_transform_composes_nested_nonuniform_scale_and_offset() {
+        let outer = FrameTransform {
+            ox: 24.0 + 10.0 * 1.5,
+            oy: 16.0 + 8.0 * 0.8,
+            sx: 1.5,
+            sy: 0.8,
+        };
+        let inner = FrameTransform {
+            ox: 10.0 + 5.0 * 0.8,
+            oy: 20.0 + 4.0 * 1.25,
+            sx: 0.8,
+            sy: 1.25,
+        };
+        let composed = outer.compose_inner(inner);
+        assert!((composed.sx - 1.2).abs() < 1e-9);
+        assert!((composed.sy - 1.0).abs() < 1e-9);
+        assert!((composed.ox - (39.0 + 14.0 * 1.5)).abs() < 1e-9);
+        assert!((composed.oy - (22.4 + 25.0 * 0.8)).abs() < 1e-9);
+
+        let mut bbox = BoundingBox {
+            x: 100.0,
+            y: 40.0,
+            width: 80.0,
+            height: 30.0,
+        };
+        composed.apply(&mut bbox);
+        assert!((bbox.x - (60.0 + 100.0 * 1.2)).abs() < 1e-9);
+        assert!((bbox.y - (42.4 + 40.0 * 1.0)).abs() < 1e-9);
+        assert!((bbox.width - 96.0).abs() < 1e-9);
+        assert!((bbox.height - 30.0).abs() < 1e-9);
     }
 }

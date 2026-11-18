@@ -1,1 +1,98 @@
-//! M3 module stub: deterministic composite wait_idle and wait condition polling.
+pub mod conditions;
+pub mod idle;
+
+use serde::{Deserialize, Serialize};
+
+use crate::driver::DriverSession;
+use crate::error::Result;
+use crate::snapshot::RefMap;
+
+pub const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_POLL_INTERVAL_MS: u64 = 25;
+pub const DEFAULT_NETWORK_QUIET_MS: u64 = 250;
+pub const DEFAULT_BBOX_STABLE_FRAMES: u32 = 2;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaitOptions {
+    pub timeout_ms: u64,
+    pub poll_interval_ms: u64,
+}
+
+impl Default for WaitOptions {
+    fn default() -> Self {
+        Self {
+            timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+            poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaitIdleOptions {
+    pub timeout_ms: u64,
+    pub poll_interval_ms: u64,
+    pub network_quiet_ms: u64,
+    pub ignore_long_lived_sockets: bool,
+    pub stable_target: Option<String>,
+    pub bbox_stable_frames: u32,
+}
+
+impl Default for WaitIdleOptions {
+    fn default() -> Self {
+        Self {
+            timeout_ms: DEFAULT_WAIT_TIMEOUT_MS,
+            poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
+            network_quiet_ms: DEFAULT_NETWORK_QUIET_MS,
+            ignore_long_lived_sockets: true,
+            stable_target: None,
+            bbox_stable_frames: DEFAULT_BBOX_STABLE_FRAMES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitSelectorState {
+    Attached,
+    #[default]
+    Visible,
+    Hidden,
+    Detached,
+}
+
+pub struct WaitEngine;
+
+impl WaitEngine {
+    pub async fn wait_idle(
+        session: &dyn DriverSession,
+        ref_map: Option<&RefMap>,
+        opts: WaitIdleOptions,
+    ) -> Result<()> {
+        idle::wait_idle(session, ref_map, opts).await
+    }
+
+    pub async fn wait_text(
+        session: &dyn DriverSession,
+        text: &str,
+        opts: WaitOptions,
+    ) -> Result<()> {
+        conditions::wait_text(session, text, opts).await
+    }
+
+    pub async fn wait_url(
+        session: &dyn DriverSession,
+        substr: &str,
+        opts: WaitOptions,
+    ) -> Result<()> {
+        conditions::wait_url(session, substr, opts).await
+    }
+
+    pub async fn wait_selector(
+        session: &dyn DriverSession,
+        selector: &str,
+        state: WaitSelectorState,
+        opts: WaitOptions,
+    ) -> Result<()> {
+        conditions::wait_selector(session, selector, state, opts).await
+    }
+}

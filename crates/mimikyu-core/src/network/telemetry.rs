@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -123,6 +124,7 @@ pub struct TelemetryStore {
     network: Mutex<RingBuffer<NetworkEvent>>,
     pending_requests: Mutex<HashMap<String, NetworkEvent>>,
     inflight: Mutex<HashSet<String>>,
+    activity_seq: AtomicU64,
 }
 
 impl Default for TelemetryStore {
@@ -139,6 +141,7 @@ impl TelemetryStore {
             network: Mutex::new(RingBuffer::new(config.max_network_events)),
             pending_requests: Mutex::new(HashMap::new()),
             inflight: Mutex::new(HashSet::new()),
+            activity_seq: AtomicU64::new(0),
         }
     }
 
@@ -159,6 +162,7 @@ impl TelemetryStore {
         redirect_mime: Option<String>,
         redirect_headers: BTreeMap<String, String>,
     ) {
+        self.activity_seq.fetch_add(1, Ordering::SeqCst);
         self.inflight.lock().insert(ev.request_id.clone());
         let mut pending = self.pending_requests.lock();
         if let Some(mut prev) = pending.insert(ev.request_id.clone(), ev) {
@@ -172,6 +176,12 @@ impl TelemetryStore {
                 prev.response_headers = redirect_headers;
             }
             self.network.lock().push(prev);
+        }
+    }
+
+    pub fn set_pending_resource_type(&self, req_id: &str, resource_type: &str) {
+        if let Some(ev) = self.pending_requests.lock().get_mut(req_id) {
+            ev.resource_type = resource_type.to_string();
         }
     }
 
@@ -190,6 +200,7 @@ impl TelemetryStore {
     }
 
     pub fn on_request_finished(&self, req_id: &str) {
+        self.activity_seq.fetch_add(1, Ordering::SeqCst);
         self.inflight.lock().remove(req_id);
         if let Some(ev) = self.pending_requests.lock().remove(req_id) {
             self.network.lock().push(ev);
@@ -197,6 +208,7 @@ impl TelemetryStore {
     }
 
     pub fn on_request_failed(&self, req_id: &str, error_text: Option<String>) {
+        self.activity_seq.fetch_add(1, Ordering::SeqCst);
         self.inflight.lock().remove(req_id);
         if let Some(mut ev) = self.pending_requests.lock().remove(req_id) {
             ev.failed = true;
@@ -215,6 +227,7 @@ impl TelemetryStore {
         failed: bool,
         error_text: Option<String>,
     ) {
+        self.activity_seq.fetch_add(1, Ordering::SeqCst);
         self.inflight.lock().remove(req_id);
         if let Some(mut ev) = self.pending_requests.lock().remove(req_id) {
             if let Some(s) = status {
@@ -263,6 +276,35 @@ impl TelemetryStore {
 
     pub fn inflight_count(&self) -> usize {
         self.inflight.lock().len()
+    }
+
+    pub fn activity_seq(&self) -> u64 {
+        self.activity_seq.load(Ordering::SeqCst)
+    }
+
+    /// Returns `(inflight_count, activity_seq)` preserving canonical lock order
+    /// (`inflight` -> `pending_requests`). When `ignore_long_lived` is true,
+    /// `WebSocket` and `EventSource` connections are excluded from the inflight count.
+    pub fn inflight_stats(&self, ignore_long_lived: bool) -> (usize, u64) {
+        let inflight = self.inflight.lock();
+        let seq = self.activity_seq.load(Ordering::SeqCst);
+        if !ignore_long_lived {
+            return (inflight.len(), seq);
+        }
+        let pending = self.pending_requests.lock();
+        let count = inflight
+            .iter()
+            .filter(|req_id| {
+                pending
+                    .get(*req_id)
+                    .map(|ev| {
+                        let rt = ev.resource_type.to_ascii_lowercase();
+                        rt != "websocket" && rt != "eventsource"
+                    })
+                    .unwrap_or(true)
+            })
+            .count();
+        (count, seq)
     }
 
     pub fn find_latest_status_for_url(&self, url: &str) -> Option<u16> {
@@ -512,5 +554,73 @@ mod tests {
         assert_eq!(final_snap.page_errors.len(), 64);
         assert_eq!(final_snap.network_events.len(), 64);
         assert!(final_snap.dropped_network > 0);
+    }
+
+    #[test]
+    fn telemetry_store_activity_seq_and_inflight_stats_ignore_long_lived() {
+        let store = TelemetryStore::new(TelemetryConfig::with_capacity(16));
+        assert_eq!(store.inflight_stats(true), (0, 0));
+
+        store.on_request_started(
+            NetworkEvent {
+                timestamp_ms: 1,
+                request_id: "ws1".to_string(),
+                url: "ws://127.0.0.1/live".to_string(),
+                method: "GET".to_string(),
+                resource_type: "WebSocket".to_string(),
+                status: None,
+                mime_type: None,
+                failed: false,
+                error_text: None,
+                request_headers: BTreeMap::new(),
+                response_headers: BTreeMap::new(),
+            },
+            None,
+            None,
+            BTreeMap::new(),
+        );
+        store.on_request_started(
+            NetworkEvent {
+                timestamp_ms: 2,
+                request_id: "sse1".to_string(),
+                url: "http://127.0.0.1/events".to_string(),
+                method: "GET".to_string(),
+                resource_type: "EventSource".to_string(),
+                status: None,
+                mime_type: None,
+                failed: false,
+                error_text: None,
+                request_headers: BTreeMap::new(),
+                response_headers: BTreeMap::new(),
+            },
+            None,
+            None,
+            BTreeMap::new(),
+        );
+        assert_eq!(store.inflight_stats(false), (2, 2));
+        assert_eq!(store.inflight_stats(true), (0, 2));
+
+        store.on_request_started(
+            NetworkEvent {
+                timestamp_ms: 3,
+                request_id: "xhr1".to_string(),
+                url: "http://127.0.0.1/api".to_string(),
+                method: "GET".to_string(),
+                resource_type: "Fetch".to_string(),
+                status: None,
+                mime_type: None,
+                failed: false,
+                error_text: None,
+                request_headers: BTreeMap::new(),
+                response_headers: BTreeMap::new(),
+            },
+            None,
+            None,
+            BTreeMap::new(),
+        );
+        assert_eq!(store.inflight_stats(true), (1, 3));
+        store.on_request_finished("xhr1");
+        assert_eq!(store.inflight_stats(true), (0, 4));
+        assert_eq!(store.activity_seq(), 4);
     }
 }

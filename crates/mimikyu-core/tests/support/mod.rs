@@ -74,6 +74,17 @@ impl TestServer {
 
                     hits_req.lock().push(format!("{method} {raw_target}"));
 
+                    if (method, path) == ("GET", "/sse-stream") {
+                        let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\n\r\ndata: hello\n\n";
+                        if stream.write_all(hdr.as_bytes()).await.is_ok() {
+                            let _ = stream.flush().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+                            let _ = stream.write_all(b"data: done\n\n").await;
+                        }
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+
                     let (status, content_type, extra_headers, body): (
                         &str,
                         &str,
@@ -758,6 +769,1467 @@ self.onconnect = (e) => {
 </html>"#
                                 .to_vec(),
                         ),
+                        ("GET", "/humanize-tracker") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Humanize Tracker</title></head>
+<body style="margin:0; height:900px;">
+  <input id="type-target" type="text" style="position:absolute; left:100px; top:120px; width:220px; height:32px;" />
+  <button id="target-btn" style="position:absolute; left:520px; top:380px; width:120px; height:44px;">Track Click</button>
+  <script>
+    const mouseTrack = [];
+    let clickCount = 0;
+    const keyTrack = [];
+    const sync = () => {
+      document.documentElement.dataset.mouseTrack = JSON.stringify(mouseTrack);
+      document.documentElement.dataset.clickCount = String(clickCount);
+      document.documentElement.dataset.keyTrack = JSON.stringify(keyTrack);
+    };
+    sync();
+    document.addEventListener('mousemove', (e) => {
+      mouseTrack.push({ x: e.clientX, y: e.clientY, t: performance.now() });
+      sync();
+    });
+    document.getElementById('target-btn').addEventListener('click', () => {
+      clickCount += 1;
+      sync();
+    });
+    document.getElementById('type-target').addEventListener('keydown', (e) => {
+      keyTrack.push({ key: e.key, t: performance.now() });
+      sync();
+    });
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/edge-and-scroll") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Edge and Scroll</title></head>
+<body style="margin:0;">
+  <button id="top-edge-btn" style="position:fixed; top:-6px; left:50px; width:100px; height:12px;">TopEdge</button>
+  <button id="above-edge-btn" style="position:fixed; top:-10px; left:200px; width:80px; height:8px;">AboveEdge</button>
+  <button id="bottom-right-btn" style="position:fixed; right:-8px; bottom:-8px; width:60px; height:36px;">Corner</button>
+  <div style="height:2200px;">spacer</div>
+  <button id="offscreen-btn" style="width:140px; height:40px;">Offscreen</button>
+  <script>
+    const edgeHits = [];
+    const scrollEvents = [];
+    const sync = () => {
+      document.documentElement.dataset.edgeHits = JSON.stringify(edgeHits);
+      document.documentElement.dataset.scrollEvents = JSON.stringify(scrollEvents);
+    };
+    sync();
+    for (const id of ['top-edge-btn', 'above-edge-btn', 'bottom-right-btn', 'offscreen-btn']) {
+      document.getElementById(id).addEventListener('click', () => {
+        edgeHits.push(id);
+        sync();
+      });
+    }
+    window.addEventListener('wheel', (e) => {
+      scrollEvents.push({ dx: e.deltaX, dy: e.deltaY });
+      sync();
+    });
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/forms-rich") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Forms Rich</title></head>
+<body>
+  <h1>Rich Form</h1>
+  <div style="display:none"><button id="hidden-css-btn">HiddenCss</button></div>
+  <nav aria-hidden="true"><button id="aria-hidden-btn">AriaHidden</button></nav>
+  <button id="zero-rect-btn" style="width:0; height:0; padding:0; border:0; overflow:hidden;">ZeroRect</button>
+  <div style="display:contents"><button id="contents-btn">ContentsBtn</button></div>
+
+  <label for="prefilled">Username</label>
+  <input id="prefilled" type="text" value="old-secret-text" />
+  <textarea id="notes"></textarea>
+  <div id="ce" contenteditable="true" style="border:1px solid #888; min-height:24px;">initial</div>
+
+  <label for="country">Country</label>
+  <select id="country">
+    <option value="us">United States</option>
+    <option value="de">Germany</option>
+    <option value="jp">Japan</option>
+    <option value="dis" disabled>Disabled Country</option>
+  </select>
+
+  <label><input id="agree" type="checkbox" /> Accept Terms</label>
+  <input id="upload" type="file" aria-label="Upload Files" multiple />
+  <details><summary id="sum-btn">More Info</summary><p id="det-body">Extra info</p></details>
+
+  <div id="banner-slot"></div>
+  <div style="height:1400px;">spacer</div>
+  <button id="submit-bottom">Submit Form</button>
+  <div id="form-result">waiting</div>
+
+  <script>
+    const events = [];
+    const chords = [];
+    const sync = () => {
+      document.documentElement.dataset.events = JSON.stringify(events);
+      document.documentElement.dataset.chords = JSON.stringify(chords);
+    };
+    sync();
+    for (const id of ['prefilled', 'notes', 'ce', 'country', 'agree']) {
+      const el = document.getElementById(id);
+      el.addEventListener('input', () => { events.push(id + ':input'); sync(); });
+      el.addEventListener('change', () => { events.push(id + ':change'); sync(); });
+    }
+    document.getElementById('submit-bottom').addEventListener('click', () => {
+      document.getElementById('form-result').textContent = 'submitted:' + document.getElementById('prefilled').value + ':' + document.getElementById('country').value;
+    });
+    document.addEventListener('keydown', (e) => {
+      chords.push({
+        key: e.key,
+        code: e.code,
+        ctrlKey: e.ctrlKey,
+        altKey: e.altKey,
+        shiftKey: e.shiftKey,
+        metaKey: e.metaKey,
+      });
+      sync();
+    });
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/api/delayed-items") => {
+                            let delay_ms = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("delay="))
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .unwrap_or(200)
+                                .min(2000);
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            (
+                                "200 OK",
+                                "application/json",
+                                vec![],
+                                br#"{"items":["alpha","beta"]}"#.to_vec(),
+                            )
+                        }
+                        ("GET", "/spa-delayed") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>SPA Delayed</title></head>
+<body>
+  <h1>SPA Dashboard</h1>
+  <div id="moving-box" style="position:relative; left:0px; width:120px; height:40px; background:#369;">Loading</div>
+  <ul id="items"></ul>
+  <script>
+    setTimeout(async () => {
+      const res = await fetch('/api/delayed-items?delay=200');
+      const data = await res.json();
+      let step = 0;
+      const box = document.getElementById('moving-box');
+      const timer = setInterval(() => {
+        step += 1;
+        box.style.left = (step * 25) + 'px';
+        if (step >= 4) {
+          clearInterval(timer);
+          box.textContent = 'Settled';
+          const ul = document.getElementById('items');
+          for (const item of data.items) {
+            const li = document.createElement('li');
+            li.textContent = item;
+            ul.appendChild(li);
+          }
+          const badge = document.createElement('div');
+          badge.id = 'hydrated-badge';
+          badge.textContent = 'HYDRATED_OK';
+          document.body.appendChild(badge);
+        }
+      }, 35);
+    }, 80);
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/spa-short-polls") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Short Polls</title></head>
+<body>
+  <div id="poll-status">running</div>
+  <script>
+    (async () => {
+      for (let i = 0; i < 3; i++) {
+        await fetch('/api/delayed-items?delay=15');
+        await new Promise(r => setTimeout(r, 40));
+      }
+      const d = document.createElement('div');
+      d.id = 'polls-done';
+      d.textContent = 'POLLS_FINISHED';
+      document.body.appendChild(d);
+    })();
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/slow-iframe") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Slow Iframe</title></head>
+<body>
+  <p>slow</p>
+  <script>
+    fetch('/api/delayed-items?delay=500').catch(() => {});
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/destroyed-iframe-fetch") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Destroyed Iframe</title></head>
+<body>
+  <iframe id="ephemeral-frame" src="/slow-iframe"></iframe>
+  <div id="status">pending</div>
+  <script>
+    setTimeout(() => {
+      const fr = document.getElementById('ephemeral-frame');
+      if (fr) fr.remove();
+      document.getElementById('status').textContent = 'removed';
+    }, 80);
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/nested-frames-shadow") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Nested Frames and Shadow</title></head>
+<body>
+  <h1>Shadow and Frame Host</h1>
+  <div id="open-host"></div>
+  <div id="closed-host-1"></div>
+  <iframe id="outer-frame" src="/outer-frame" style="width:420px; height:260px; border:2px solid #333;"></iframe>
+  <div id="shadow-status">idle</div>
+  <script>
+    window.__mainSecret = 'top-secret';
+    const openRoot = document.getElementById('open-host').attachShadow({ mode: 'open' });
+    openRoot.innerHTML = '<button id="open-btn">OpenShadowBtn</button><span id="open-out">open-idle</span>';
+    openRoot.getElementById('open-btn').addEventListener('click', () => {
+      openRoot.getElementById('open-out').textContent = 'open-clicked';
+    });
+
+    const c1 = document.getElementById('closed-host-1').attachShadow({ mode: 'closed' });
+    const c2Host = document.createElement('div');
+    c2Host.id = 'closed-host-2';
+    c1.appendChild(c2Host);
+    const c2 = c2Host.attachShadow({ mode: 'closed' });
+    c2.innerHTML = '<p>ClosedHeading</p><button id="closed-btn">ClosedShadowBtn</button><input id="closed-inp" aria-label="ClosedInput" type="text" /><a href="/target">ClosedLink</a><table><thead><tr><th>C1</th></tr></thead><tbody><tr><td>ClosedCell</td></tr></tbody></table>';
+    c2.getElementById('closed-btn').addEventListener('click', () => {
+      document.getElementById('shadow-status').textContent = 'closed-clicked:' + c2.getElementById('closed-inp').value;
+    });
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/outer-frame") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Outer Frame</title></head>
+<body>
+  <button id="outer-btn">OuterBtn</button>
+  <iframe id="inner-frame" src="/inner-frame" style="width:360px; height:180px; border:2px solid #666;"></iframe>
+  <script>
+    window.__outerSecret = 'outer-secret';
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/inner-frame") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Inner Frame</title></head>
+<body>
+  <button id="deep-btn" onclick="document.getElementById('deep-status').textContent='deep-clicked:' + document.getElementById('deep-inp').value;">DeepBtn</button>
+  <input id="deep-inp" type="text" placeholder="DeepInput" />
+  <div id="deep-status">idle</div>
+  <script>
+    window.__innerSecret = 'inner-secret';
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/extract-article") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head>
+  <title>Extract Article</title>
+  <style>
+    @keyframes slide {
+      from { transform: translateX(0px); }
+      to { transform: translateX(120px); }
+    }
+    .anim-active {
+      animation: slide 2s linear 1 forwards;
+    }
+  </style>
+</head>
+<body>
+  <nav aria-hidden="true"><a href="/hidden-noise">HiddenNav</a></nav>
+  <div style="display:none"><p>HiddenDisplayNone</p><a href="/hidden-none">HiddenLink</a></div>
+  <main>
+    <h1>Main Title</h1>
+    <h2>Section One</h2>
+    <p>Paragraph with <a href="/rel">Relative Link</a> and <a href="https://example.org/ext">External Link</a> and <a href="/icon"><img alt="Icon Alt" src="/blocked.png" /></a>.</p>
+    <ul>
+      <li>Item 1
+        <ul><li>Sub 1</li></ul>
+      </li>
+      <li>Item 2</li>
+    </ul>
+    <pre><code class="language-rust">fn hello() { println!("hi"); }</code></pre>
+    <blockquote>Quoted wisdom</blockquote>
+    <table id="t1">
+      <caption>Plan Matrix</caption>
+      <thead><tr><th>Tier</th><th colspan="2">Specs</th></tr></thead>
+      <tbody>
+        <tr><td rowspan="2">Pro</td><td>CPU</td><td>8</td></tr>
+        <tr><td>RAM</td><td>32G</td></tr>
+      </tbody>
+    </table>
+    <table id="outer-tbl">
+      <tbody><tr><td>OuterCell<table><tbody><tr><td>InnerCell</td></tr></tbody></table></td></tr></tbody>
+    </table>
+    <div id="art-open-shadow"></div>
+    <div id="anim-box" style="width:80px; height:30px; background:#493;">Anim</div>
+  </main>
+  <div style="height:2000px;">spacer</div>
+  <div id="offscreen-card" style="width:240px; height:80px; background:#225588; color:#fff;">Offscreen Card</div>
+  <button id="offscreen-ref-btn" style="width:220px; height:70px; background:rgb(18, 52, 86); color:#fff;">Offscreen Ref Target</button>
+  <script>
+    const host = document.getElementById('art-open-shadow');
+    const sr = host.attachShadow({ mode: 'open' });
+    sr.innerHTML = '<p>OpenShadowParagraph</p><a href="/open-shadow-link">OpenShadowLink</a>';
+    const ab = document.getElementById('anim-box');
+    ab.dataset.animEnded = 'false';
+    ab.addEventListener('animationend', () => { ab.dataset.animEnded = 'true'; });
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/spa-sse") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>SPA SSE</title></head>
+<body>
+  <div id="sse-status">init</div>
+  <script>
+    const es = new EventSource('/sse-stream');
+    es.onmessage = () => {};
+    fetch('/api/delayed-items?delay=100')
+      .then(r => r.json())
+      .then(() => {
+        document.getElementById('sse-status').textContent = 'SSE_FETCH_OK';
+      });
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/slow-iframe-900") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Slow Iframe 900</title></head>
+<body>
+  <p>slow900</p>
+  <script>
+    fetch('/api/delayed-items?delay=900').catch(() => {});
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/destroyed-iframe-fetch-900") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Destroyed Iframe 900</title></head>
+<body>
+  <iframe id="ephemeral-frame-900" src="/slow-iframe-900"></iframe>
+  <div id="status">pending</div>
+  <script>
+    setTimeout(() => {
+      const fr = document.getElementById('ephemeral-frame-900');
+      if (fr) fr.remove();
+      document.getElementById('status').textContent = 'removed';
+    }, 80);
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/forms-zero-file") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Zero File Input</title></head>
+<body>
+  <input id="file-zero" type="file" aria-label="Zero File" style="width:0; height:0; opacity:0; padding:0; border:0;" />
+  <input id="file-hidden-display" type="file" aria-label="Hidden Display File" style="display:none;" />
+  <input id="file-hidden-vis" type="file" aria-label="Hidden Vis File" style="visibility:hidden;" />
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/offset-iframe-host") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Offset Iframe Host</title></head>
+<body>
+  <h1>Offset Host</h1>
+  <iframe id="offset-frame" src="/offset-iframe-child" style="display:block; margin:40px; border:4px solid #333; padding:12px; width:360px; height:200px;"></iframe>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/offset-iframe-child") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Offset Iframe Child</title></head>
+<body>
+  <button id="offset-btn" onclick="document.getElementById('offset-status').textContent='offset-clicked'">OffsetAction</button>
+  <div id="offset-status">idle</div>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/xo-child") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>XO Child</title></head>
+<body>
+  <button id="xo-btn" onclick="document.getElementById('xo-status').textContent='xo-clicked:' + document.getElementById('xo-inp').value + ':' + document.getElementById('xo-sel').value">XOClick</button>
+  <input id="xo-inp" type="text" aria-label="XOInput" />
+  <select id="xo-sel" aria-label="XOSelect">
+    <option value="a">Alpha</option>
+    <option value="b">Beta</option>
+  </select>
+  <input id="xo-file" type="file" aria-label="XOFile" />
+  <div id="xo-status">xo-idle</div>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/mixed-xo-host") => {
+                            let xo_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("xo="))
+                                .unwrap_or("/xo-child");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>Mixed XO Host</title></head>
+<body>
+  <h1>Mixed Host</h1>
+  <iframe id="so-frame" src="/offset-iframe-child" style="display:block; margin:20px; border:2px solid #222; padding:8px; width:320px; height:120px;"></iframe>
+  <iframe id="xo-frame" src="{xo_url}" style="display:block; margin:30px; border:5px solid #444; padding:10px; width:380px; height:220px;"></iframe>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/iframe-closed-shadow-host") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Iframe Closed Shadow Host</title></head>
+<body>
+  <h1>Main Host Heading</h1>
+  <iframe id="cs-frame" src="/iframe-closed-shadow-child" style="width:320px; height:180px;"></iframe>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/iframe-closed-shadow-child") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Iframe Closed Shadow Child</title></head>
+<body>
+  <div id="sub-cs-host"></div>
+  <script>
+    const sr = document.getElementById('sub-cs-host').attachShadow({ mode: 'closed' });
+    sr.innerHTML = '<p>SubClosedHeading</p><button id="sub-cs-btn">SubClosedBtn</button>';
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/xo-closed-shadow-host") => {
+                            let xo_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("xo="))
+                                .unwrap_or("/xo-closed-shadow-child");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>XO Closed Shadow Host</title></head>
+<body>
+  <h1>XOMainHeading</h1>
+  <iframe id="xo-cs-frame" src="{xo_url}" style="display:block; margin:24px; border:3px solid #333; padding:8px; width:420px; height:260px;"></iframe>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/xo-closed-shadow-child") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>XO Closed Shadow Child</title></head>
+<body>
+  <h2>XOPlainHeading</h2>
+  <div id="xo-cs-host"></div>
+  <script>
+    const sr = document.getElementById('xo-cs-host').attachShadow({ mode: 'closed' });
+    sr.innerHTML = '<p>XOClosedHeading</p><button id="xo-cs-btn">XOClosedBtn</button><a href="/xo-cs-link">XOClosedLink</a><table><thead><tr><th>XHdr</th></tr></thead><tbody><tr><td>XOClosedCell</td></tr></tbody></table>';
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/nested-so-xo-host") => {
+                            let xo_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("xo="))
+                                .unwrap_or("/xo-child");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>Nested SO XO Host</title></head>
+<body>
+  <h1>Nested SO XO Host</h1>
+  <iframe id="mid-so-frame" src="/nested-so-xo-middle?xo={xo_url}" style="display:block; margin:20px; border:4px solid #222; padding:10px; width:460px; height:320px;"></iframe>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/nested-so-xo-middle") => {
+                            let xo_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("xo="))
+                                .unwrap_or("/xo-child");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>Nested SO XO Middle</title></head>
+<body>
+  <button id="mid-btn">MidAction</button>
+  <iframe id="inner-xo-frame" src="{xo_url}" style="display:block; margin:16px; border:3px solid #555; padding:8px; width:380px; height:220px;"></iframe>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/iframe-chord-host") => {
+                            let xo_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("xo="))
+                                .unwrap_or("/xo-chord-child");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>Iframe Chord Host</title></head>
+<body>
+  <h1>Chord Host</h1>
+  <iframe id="so-chord-frame" src="/so-chord-child" style="display:block; margin:12px; width:360px; height:120px;"></iframe>
+  <iframe id="xo-chord-frame" src="{xo_url}" style="display:block; margin:12px; width:360px; height:120px;"></iframe>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/so-chord-child") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>SO Chord Child</title></head>
+<body>
+  <input id="so-chord-inp" type="text" aria-label="SOChordInput" value="so-sentinel" />
+  <script>
+    const chords = [];
+    const sync = () => { document.documentElement.dataset.chords = JSON.stringify(chords); };
+    sync();
+    for (const evType of ['keydown', 'keyup']) {
+      document.addEventListener(evType, (e) => {
+        chords.push({ type: evType, key: e.key, code: e.code, altKey: e.altKey });
+        sync();
+      });
+    }
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/xo-chord-child") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>XO Chord Child</title></head>
+<body>
+  <input id="xo-chord-inp" type="text" aria-label="XOChordInput" value="xo-sentinel" />
+  <script>
+    const chords = [];
+    const sync = () => { document.documentElement.dataset.chords = JSON.stringify(chords); };
+    sync();
+    for (const evType of ['keydown', 'keyup']) {
+      document.addEventListener(evType, (e) => {
+        chords.push({ type: evType, key: e.key, code: e.code, altKey: e.altKey });
+        sync();
+      });
+    }
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/nested-oopif-root") => {
+                            let mid_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("mid="))
+                                .unwrap_or("/nested-oopif-mid");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>Nested OOPIF Root</title></head>
+<body>
+  <h1>NestedOOPIFRoot</h1>
+  <button id="nroot-btn">NRootBtn</button>
+  <iframe id="nmid-frame" name="nested-mid" src="{mid_url}" style="display:block; margin:24px; border:4px solid #222; padding:10px; width:480px; height:320px;"></iframe>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/nested-oopif-mid") => {
+                            let leaf_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("leaf="))
+                                .unwrap_or("/nested-oopif-leaf");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>Nested OOPIF Mid</title></head>
+<body>
+  <p>NestedOOPIFMid</p>
+  <iframe id="nleaf-frame" name="nested-leaf" src="{leaf_url}" style="display:block; margin:18px; border:3px solid #555; padding:8px; width:400px; height:220px;"></iframe>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/nested-oopif-leaf") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Nested OOPIF Leaf</title></head>
+<body>
+  <button id="nleaf-btn" onclick="document.getElementById('nleaf-status').textContent='nleaf-clicked'">NLeafBtn</button>
+  <div id="nleaf-status">idle</div>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/oopif-same-sub-host") => {
+                            let outer_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("outer="))
+                                .unwrap_or("/oopif-outer");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>OOPIF Same Sub Host</title></head>
+<body>
+  <button id="sshost-btn">MainBtn</button>
+  <iframe id="oopif-outer-frame" name="oopif-outer" src="{outer_url}" style="display:block; margin:30px; border:4px solid #222; padding:10px; width:460px; height:300px;"></iframe>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/oopif-outer") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>OOPIF Outer</title></head>
+<body>
+  <p>OuterOOPIFPara</p>
+  <iframe id="oopif-inner-frame" name="oopif-inner" src="/oopif-inner" style="display:block; margin:26px; border:3px solid #444; padding:12px; width:360px; height:180px;"></iframe>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/oopif-inner") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>OOPIF Inner</title></head>
+<body>
+  <button id="inner-sub-btn" onclick="document.getElementById('inner-sub-status').textContent='inner-sub-clicked'">OOPIFSameSubBtn</button>
+  <div id="inner-sub-status">idle</div>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/iframe-exec-ctx-host") => {
+                            let xo_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("xo="))
+                                .unwrap_or("/xo-ctx-child");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>Iframe Exec Ctx Host</title></head>
+<body>
+  <iframe id="so-ctx-frame" src="/so-ctx-child" style="width:240px; height:90px;"></iframe>
+  <iframe id="xo-ctx-frame" src="{xo_url}" style="width:240px; height:90px;"></iframe>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/so-ctx-child") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>SO Ctx Child</title></head>
+<body>
+  <p>SOChild</p>
+  <script>window.__soMarker = 'so-alive-42';</script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/xo-ctx-child") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>XO Ctx Child</title></head>
+<body>
+  <p>XOChild1</p>
+  <script>window.__xoMarker = 'xo-1';</script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/xo-ctx-child-2") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>XO Ctx Child 2</title></head>
+<body>
+  <p>XOChild2</p>
+  <script>window.__xoMarker = 'xo-2';</script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/iframe-focus-host") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Iframe Focus Host</title></head>
+<body>
+  <input id="main-inp" type="text" aria-label="MainFocusInput" value="main-init" />
+  <iframe id="focus-so-frame" src="/so-chord-child" style="display:block; margin:12px; width:360px; height:120px;"></iframe>
+  <script>
+    const mchords = [];
+    const msync = () => { document.documentElement.dataset.chords = JSON.stringify(mchords); };
+    msync();
+    for (const evType of ['keydown', 'keyup']) {
+      document.addEventListener(evType, (e) => {
+        mchords.push({ type: evType, key: e.key, code: e.code, altKey: e.altKey });
+        msync();
+      });
+    }
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/nested-iframe-focus-host") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Nested Iframe Focus Host</title></head>
+<body>
+  <h1>Nested Focus Host</h1>
+  <iframe id="outer-ifr" src="/nested-iframe-focus-outer" style="display:block; margin:10px; width:440px; height:320px;"></iframe>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/nested-iframe-focus-outer") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Nested Iframe Focus Outer</title></head>
+<body>
+  <button id="outer-focus-btn" onclick="document.getElementById('outer-status').textContent='outer-clicked'">OuterFocusBtn</button>
+  <div id="outer-status">idle</div>
+  <iframe id="inner-1" src="/nested-iframe-focus-inner1" style="display:block; margin:8px; width:380px; height:110px;"></iframe>
+  <iframe id="inner-2" src="/nested-iframe-focus-inner2" style="display:block; margin:8px; width:380px; height:110px;"></iframe>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/nested-iframe-focus-inner1") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Nested Focus Inner 1</title></head>
+<body>
+  <input id="in1-inp" type="text" aria-label="Inner1Input" value="in1-sentinel" />
+  <script>
+    const chords = [];
+    const sync = () => { document.documentElement.dataset.chords = JSON.stringify(chords); };
+    sync();
+    for (const evType of ['keydown', 'keyup']) {
+      document.addEventListener(evType, (e) => {
+        chords.push({ type: evType, key: e.key, code: e.code, altKey: e.altKey });
+        sync();
+      });
+    }
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/nested-iframe-focus-inner2") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Nested Focus Inner 2</title></head>
+<body>
+  <input id="in2-inp" type="text" aria-label="Inner2Input" value="in2-sentinel" />
+  <script>
+    const chords = [];
+    const fevs = [];
+    const sync = () => {
+      document.documentElement.dataset.chords = JSON.stringify(chords);
+      document.documentElement.dataset.fevs = JSON.stringify(fevs);
+    };
+    sync();
+    for (const evType of ['keydown', 'keyup']) {
+      document.addEventListener(evType, (e) => {
+        chords.push({ type: evType, key: e.key, code: e.code, altKey: e.altKey });
+        sync();
+      });
+    }
+    for (const evType of ['mousedown', 'focus', 'click']) {
+      document.addEventListener(evType, (e) => {
+        fevs.push(evType + ':' + (e.target && e.target.id ? e.target.id : ''));
+        sync();
+      }, true);
+    }
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/xo-iframe-wait-host") => {
+                            let xo_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("xo="))
+                                .unwrap_or("/xo-chord-child");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>XO Iframe Wait Host</title></head>
+<body>
+  <div id="xo-host-ok">HOST_OK</div>
+  <iframe id="xo-wait-frame" src="{xo_url}" style="width:320px; height:120px;"></iframe>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/xo-destroyed-iframe-host") => {
+                            let xo_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("xo="))
+                                .unwrap_or("/slow-iframe-doc?delay=900");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>XO Destroyed Iframe Host</title></head>
+<body>
+  <iframe id="xo-ephemeral-frame" src="{xo_url}"></iframe>
+  <div id="status">pending</div>
+  <script>
+    setTimeout(() => {{
+      const fr = document.getElementById('xo-ephemeral-frame');
+      if (fr) fr.remove();
+      document.getElementById('status').textContent = 'removed';
+    }}, 80);
+  </script>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/slow-iframe-doc") => {
+                            let delay_ms = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("delay="))
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .unwrap_or(900)
+                                .min(2000);
+                            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                br#"<!doctype html><html><head><title>Slow Doc</title></head><body><p>slow-doc-ok</p></body></html>"#
+                                    .to_vec(),
+                            )
+                        }
+                        ("GET", "/so-chord-child-2") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>SO Chord Child 2</title></head>
+<body>
+  <input id="so2-chord-inp" type="text" aria-label="SO2ChordInput" value="so2-sentinel" />
+  <script>
+    const chords = [];
+    const fevs = [];
+    const sync = () => {
+      document.documentElement.dataset.chords = JSON.stringify(chords);
+      document.documentElement.dataset.fevs = JSON.stringify(fevs);
+    };
+    sync();
+    for (const evType of ['keydown', 'keyup']) {
+      document.addEventListener(evType, (e) => {
+        chords.push({ type: evType, key: e.key, code: e.code, altKey: e.altKey });
+        sync();
+      });
+    }
+    for (const evType of ['mousedown', 'focus', 'click']) {
+      document.addEventListener(evType, (e) => {
+        fevs.push(evType + ':' + (e.target && e.target.id ? e.target.id : ''));
+        sync();
+      }, true);
+    }
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/shadow-iframe-focus-host") => {
+                            let xo_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("xo="))
+                                .unwrap_or("/xo-chord-child");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>Shadow Iframe Focus Host</title></head>
+<body>
+  <div id="open-sh-host"></div>
+  <input id="main-after-sh" type="text" aria-label="MainAfterShadowInput" value="main-sh-init" style="display:block; margin:12px;" />
+  <div id="closed-sh-host"></div>
+  <div id="xo-closed-sh-host"></div>
+  <script>
+    const mchords = [];
+    const msync = () => {{ document.documentElement.dataset.chords = JSON.stringify(mchords); }};
+    msync();
+    for (const evType of ['keydown', 'keyup']) {{
+      document.addEventListener(evType, (e) => {{
+        mchords.push({{ type: evType, key: e.key, code: e.code, altKey: e.altKey }});
+        msync();
+      }});
+    }}
+    const openSr = document.getElementById('open-sh-host').attachShadow({{ mode: 'open' }});
+    openSr.innerHTML = '<iframe id="open-sh-ifr" src="/so-chord-child" style="display:block; margin:10px; width:360px; height:90px;"></iframe>';
+    const closedSr = document.getElementById('closed-sh-host').attachShadow({{ mode: 'closed' }});
+    closedSr.innerHTML = '<iframe id="closed-sh-ifr" src="/so-chord-child-2" style="display:block; margin:14px; border:3px solid #333; padding:6px; width:360px; height:90px;"></iframe>';
+    const xoClosedSr = document.getElementById('xo-closed-sh-host').attachShadow({{ mode: 'closed' }});
+    xoClosedSr.innerHTML = '<iframe id="xo-closed-sh-ifr" src="{xo_url}" style="display:block; margin:14px; border:3px solid #555; padding:6px; width:360px; height:90px;"></iframe>';
+  </script>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/xo-oopif-fetch-child") => {
+                            let delay_ms = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("ms="))
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .unwrap_or(600)
+                                .min(2000);
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>XO OOPIF Fetch Child</title></head>
+<body>
+  <div id="oopif-fetch-status">OOPIF_PENDING</div>
+  <script>
+    fetch('/api/delayed-items?delay={delay_ms}')
+      .then(r => r.json())
+      .then(() => {{
+        document.getElementById('oopif-fetch-status').textContent = 'OOPIF_FETCH_DONE';
+      }});
+  </script>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/xo-oopif-sse-child") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>XO OOPIF SSE Child</title></head>
+<body>
+  <div id="oopif-sse-status">OOPIF_SSE_PENDING</div>
+  <script>
+    const es = new EventSource('/sse-stream');
+    window.__oopifEs = es;
+    fetch('/api/delayed-items?delay=250')
+      .then(r => r.json())
+      .then(() => {
+        document.getElementById('oopif-sse-status').textContent = 'OOPIF_SSE_OK';
+      });
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/regular-so-iframe-host") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Regular SO Iframe Host</title></head>
+<body>
+  <input id="main-inp" type="text" aria-label="MainFocusInput" value="main-init" style="display:block; margin:8px;" />
+  <iframe id="reg-so-ifr" src="/so-chord-child" style="display:block; margin:10px; width:360px; height:90px;"></iframe>
+  <iframe src="/so-chord-child-2" style="display:block; margin:10px; width:360px; height:90px;"></iframe>
+  <script>
+    const mchords = [];
+    const msync = () => { document.documentElement.dataset.chords = JSON.stringify(mchords); };
+    msync();
+    for (const evType of ['keydown', 'keyup']) {
+      document.addEventListener(evType, (e) => {
+        mchords.push({ type: evType, key: e.key, code: e.code, altKey: e.altKey });
+        msync();
+      });
+    }
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/so-upload-host") => {
+                            let xo_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("xo="))
+                                .unwrap_or("/xo-upload-outer");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>SO Upload Host</title></head>
+<body>
+  <iframe id="so-up-with-id" src="/so-upload-child?tag=withid" style="display:block; margin:8px; width:320px; height:70px;"></iframe>
+  <iframe src="/so-upload-child?tag=noid" style="display:block; margin:8px; width:320px; height:70px;"></iframe>
+  <iframe id="so-up-outer" src="/so-upload-outer" style="display:block; margin:8px; width:360px; height:110px;"></iframe>
+  <iframe id="xo-up-outer" src="{xo_url}" style="display:block; margin:8px; width:360px; height:110px;"></iframe>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/so-upload-outer") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>SO Upload Outer</title></head>
+<body>
+  <iframe src="/so-upload-child?tag=nested2" style="display:block; margin:6px; width:320px; height:80px;"></iframe>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/xo-upload-outer") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>XO Upload Outer</title></head>
+<body>
+  <iframe src="/so-upload-child?tag=xoso" style="display:block; margin:6px; width:320px; height:80px;"></iframe>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/so-upload-child") => {
+                            let tag = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("tag="))
+                                .unwrap_or("default");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>SO Upload Child {tag}</title></head>
+<body>
+  <input id="file-inp-{tag}" type="file" aria-label="Upload-{tag}" />
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/shadow-scale-host") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Shadow Scale Host</title></head>
+<body>
+  <div id="sc-closed-host" style="transform: scale(1.6); transform-origin: top left; width: 320px;"></div>
+  <div id="sc-reg-wrap" style="margin-top: 100px; transform: scale(1.5); transform-origin: top left; width: 320px;">
+    <iframe id="sc-reg-ifr" src="/scaled-child-reg" style="display:block; margin:10px; border:2px solid #555; padding:4px; width:400px; height:100px;"></iframe>
+  </div>
+  <script>
+    const closedSr = document.getElementById('sc-closed-host').attachShadow({ mode: 'closed' });
+    closedSr.innerHTML = '<iframe id="sc-ifr" src="/scaled-child" style="display:block; margin:10px; border:3px solid #333; padding:6px; width:400px; height:100px;"></iframe>';
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/scaled-child") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Scaled Child</title></head>
+<body>
+  <input id="scaled-inp" type="text" aria-label="ScaledInput" style="margin-left:180px; margin-top:40px; width:80px; height:24px;" />
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/scaled-child-reg") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Scaled Child Reg</title></head>
+<body>
+  <input id="scaled-reg-inp" type="text" aria-label="ScaledRegInput" style="margin-left:180px; margin-top:40px; width:80px; height:24px;" />
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/scaled-complex-host") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Scaled Complex Host</title></head>
+<body>
+  <div style="transform: scale(1.4, 0.8); transform-origin: top left; width: 420px;">
+    <iframe id="sc-nonuniform-ifr" src="/scaled-child-nonuniform" style="display:block; margin:10px; border:4px solid #333; padding:6px; width:400px; height:100px;"></iframe>
+  </div>
+  <div style="margin-top: 140px; transform: scale(1.5); transform-origin: top left; width: 460px;">
+    <iframe id="sc-nested-outer-ifr" src="/scaled-nested-outer" style="display:block; margin:10px; border:2px solid #444; padding:4px; width:440px; height:180px;"></iframe>
+  </div>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/scaled-child-nonuniform") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Scaled Child NonUniform</title></head>
+<body>
+  <input id="scaled-nonuniform-inp" type="text" aria-label="NonUniformScaledInput" style="margin-left:180px; margin-top:40px; width:80px; height:24px; box-sizing:border-box;" />
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/scaled-nested-outer") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Scaled Nested Outer</title></head>
+<body>
+  <div style="transform: scale(0.8); transform-origin: top left; width: 420px;">
+    <iframe id="sc-nested-inner-ifr" src="/scaled-nested-inner" style="display:block; margin:8px; border:3px solid #666; padding:5px; width:380px; height:140px;"></iframe>
+  </div>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/scaled-nested-inner") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Scaled Nested Inner</title></head>
+<body>
+  <input id="scaled-nested-inp" type="text" aria-label="NestedScaledInput" style="margin-left:180px; margin-top:40px; width:100px; height:30px; box-sizing:border-box;" />
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/scaled-xo-host") => {
+                            let xo_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("xo="))
+                                .unwrap_or("/xo-scaled-child");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>Scaled XO Host</title></head>
+<body>
+  <div style="transform: scale(1.6); transform-origin: top left; width: 440px;">
+    <iframe id="xo-sc-ifr" src="{xo_url}" style="display:block; margin:10px; border:4px solid #333; padding:6px; width:400px; height:120px;"></iframe>
+  </div>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/xo-scaled-child") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>XO Scaled Child</title></head>
+<body>
+  <input id="xo-scaled-inp" type="text" aria-label="XOScaledInput" style="margin-left:200px; margin-top:40px; width:60px; height:24px; box-sizing:border-box;" />
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/scroll-click-batch") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Scroll Click Batch</title></head>
+<body>
+  <h1>Top</h1>
+  <button id="scroll-target-btn" style="display:block; margin-top:900px; width:160px; height:40px;">Scroll Target</button>
+  <div id="scroll-click-result">pending</div>
+  <div style="height:1200px;">bottom spacer</div>
+  <script>
+    document.getElementById('scroll-target-btn').addEventListener('click', () => {
+      document.getElementById('scroll-click-result').textContent = 'CLICKED_AT_SY:' + Math.round(window.scrollY);
+    });
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
                         _ => (
                             "404 Not Found",
                             "text/plain",
@@ -795,6 +2267,11 @@ self.onconnect = (e) => {
     #[allow(dead_code)]
     pub fn url(&self, path: &str) -> String {
         format!("http://{}{}", self.addr, path)
+    }
+
+    #[allow(dead_code)]
+    pub fn localhost_url(&self, path: &str) -> String {
+        format!("http://localhost:{}{}", self.addr.port(), path)
     }
 
     #[allow(dead_code)]
@@ -1362,6 +2839,11 @@ impl KeepAliveTestServer {
     #[allow(dead_code)]
     pub fn url(&self, path: &str) -> String {
         format!("http://{}{}", self.addr, path)
+    }
+
+    #[allow(dead_code)]
+    pub fn localhost_url(&self, path: &str) -> String {
+        format!("http://localhost:{}{}", self.addr.port(), path)
     }
 
     #[allow(dead_code)]

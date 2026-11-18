@@ -384,7 +384,7 @@ async fn exercise_engine_full(engine: EngineKind) {
     let tmp_file = tempfile::NamedTempFile::new().expect("temp file");
     std::fs::write(tmp_file.path(), b"hello-upload").expect("write temp file");
     session
-        .set_file_input_files(None, Some("#file-inp"), vec![tmp_file.path().to_path_buf()])
+        .set_file_input_files(None, None, Some("#file-inp"), vec![tmp_file.path().to_path_buf()])
         .await
         .expect("set_file_input_files");
     let file_count = session

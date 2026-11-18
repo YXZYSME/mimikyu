@@ -19,10 +19,11 @@ use tracing::{debug, warn};
 
 use crate::driver::{
     now_ms, AxNode, BoundingBox, BrowserDriver, ConsoleEntry, ContextOptions, Cookie,
-    DriverCapabilities, DriverSession, EngineKind, EnvProfile, KeyEvent, KeyEventType,
+    DriverCapabilities, DriverSession, EngineKind, EnvProfile, FrameInfo, KeyEvent, KeyEventType,
     LaunchOptions, MouseButton, MouseEvent, MouseEventType, NavInfo, NetworkEvent, OriginStorage,
     PageError, PermissionGrant, PermissionState, ProfileMode, ProxyConfig, RouteMock,
-    ScreenshotFormat, ScreenshotOpts, SessionInfo, StorageState, TabInfo, WheelEvent,
+    ScreenshotFormat, ScreenshotOpts, SelectBy, SessionInfo, ShadowMatch, StorageState, TabInfo,
+    WheelEvent, MOD_ALT, MOD_CONTROL, MOD_META, MOD_SHIFT,
 };
 use crate::env_profile::{build_window_init_script, ProxyRelay};
 use crate::error::{MimikyuError, Result};
@@ -121,7 +122,7 @@ impl BrowserDriver for BidiDriver {
         let _ = conn
             .send(
                 "session.subscribe",
-                json!({ "events": ["network.fetchError"] }),
+                json!({ "events": ["network.fetchError", "network.responseStarted"] }),
             )
             .await;
 
@@ -220,6 +221,7 @@ fn bidi_capabilities() -> DriverCapabilities {
         supports_per_context_proxy: true,
         supports_native_ax_tree: false,
         supports_isolated_world: true,
+        supports_closed_shadow_dom: false,
         supports_pdf: true,
         supports_network_intercept: true,
     }
@@ -289,6 +291,8 @@ struct BidiConnection {
     pending: Mutex<HashMap<u64, oneshot::Sender<Result<Value>>>>,
     contexts: RwLock<HashMap<String, Arc<BidiContextState>>>,
     context_parents: RwLock<HashMap<String, String>>,
+    context_requests: RwLock<HashMap<String, HashSet<String>>>,
+    request_stores: RwLock<HashMap<String, Weak<TelemetryStore>>>,
     isolated_contexts: RwLock<HashSet<String>>,
     active_targets: RwLock<HashMap<String, String>>,
     process: AsyncMutex<Option<ProcessGuard>>,
@@ -364,6 +368,8 @@ impl BidiConnection {
             pending: Mutex::new(HashMap::new()),
             contexts: RwLock::new(HashMap::new()),
             context_parents: RwLock::new(HashMap::new()),
+            context_requests: RwLock::new(HashMap::new()),
+            request_stores: RwLock::new(HashMap::new()),
             isolated_contexts: RwLock::new(HashSet::new()),
             active_targets: RwLock::new(HashMap::new()),
             process: AsyncMutex::new(Some(process)),
@@ -421,6 +427,101 @@ impl BidiConnection {
         Ok(conn)
     }
 
+    fn track_request(&self, ctx_id: Option<&str>, req_id: &str, telem: &Arc<TelemetryStore>) {
+        if let Some(cid) = ctx_id {
+            self.context_requests
+                .write()
+                .entry(cid.to_string())
+                .or_default()
+                .insert(req_id.to_string());
+        }
+        let mut stores = self.request_stores.write();
+        if stores.len() > 8192 {
+            stores.retain(|_, w| w.strong_count() > 0);
+        }
+        stores.insert(req_id.to_string(), Arc::downgrade(telem));
+    }
+
+    fn untrack_request(&self, ctx_id: Option<&str>, req_id: &str) -> Option<Arc<TelemetryStore>> {
+        if let Some(cid) = ctx_id {
+            let mut ctx_reqs = self.context_requests.write();
+            if let Some(set) = ctx_reqs.get_mut(cid) {
+                set.remove(req_id);
+                if set.is_empty() {
+                    ctx_reqs.remove(cid);
+                }
+            }
+        } else {
+            let mut ctx_reqs = self.context_requests.write();
+            ctx_reqs.retain(|_, set| {
+                set.remove(req_id);
+                !set.is_empty()
+            });
+        }
+        self.request_stores
+            .write()
+            .remove(req_id)
+            .and_then(|w| w.upgrade())
+    }
+
+    fn cleanup_destroyed_context(&self, root_cid: &str) {
+        let owner_state = self.resolve_context_state(root_cid);
+        let mut destroyed: HashSet<String> = HashSet::new();
+        destroyed.insert(root_cid.to_string());
+        {
+            let mut parents = self.context_parents.write();
+            loop {
+                let mut added = false;
+                for (child, parent) in parents.iter() {
+                    if destroyed.contains(parent) && !destroyed.contains(child) {
+                        destroyed.insert(child.clone());
+                        added = true;
+                    }
+                }
+                if !added {
+                    break;
+                }
+            }
+            parents.retain(|child, parent| {
+                !destroyed.contains(child) && !destroyed.contains(parent)
+            });
+        }
+
+        if let Some(state) = owner_state {
+            state.inline_frame_owners.lock().retain(|child, owner| {
+                !destroyed.contains(child) && !destroyed.contains(owner)
+            });
+        }
+
+        let mut orphaned_reqs: Vec<String> = Vec::new();
+        {
+            let mut ctx_reqs = self.context_requests.write();
+            for cid in &destroyed {
+                if let Some(reqs) = ctx_reqs.remove(cid) {
+                    orphaned_reqs.extend(reqs);
+                }
+            }
+        }
+
+        if orphaned_reqs.is_empty() {
+            return;
+        }
+
+        let mut to_fail: Vec<(String, Arc<TelemetryStore>)> = Vec::new();
+        {
+            let mut stores = self.request_stores.write();
+            for req_id in orphaned_reqs {
+                if let Some(telem) = stores.remove(&req_id).and_then(|w| w.upgrade()) {
+                    to_fail.push((req_id, telem));
+                }
+            }
+        }
+
+        for (req_id, telem) in to_fail {
+            telem.on_request_failed(&req_id, Some("browsingContext destroyed".to_string()));
+        }
+    }
+
     fn handle_incoming(self: &Arc<Self>, raw: &str) {
         let Ok(val) = serde_json::from_str::<Value>(raw) else {
             warn!("failed to parse BiDi JSON frame");
@@ -474,7 +575,7 @@ impl BidiConnection {
                 }
                 if method == "browsingContext.contextDestroyed" {
                     if let Some(cid) = params.get("context").and_then(|v| v.as_str()) {
-                        self.context_parents.write().remove(cid);
+                        self.cleanup_destroyed_context(cid);
                     }
                     return;
                 }
@@ -490,7 +591,61 @@ impl BidiConnection {
                     });
 
                 if let Some(state) = ctx_id.and_then(|cid| self.resolve_context_state(cid)) {
+                    if method == "network.beforeRequestSent"
+                        && let Some(req_id) = params["request"]["request"].as_str()
+                    {
+                        self.track_request(ctx_id, req_id, &state.telemetry);
+                    } else if matches!(method, "network.responseCompleted" | "network.fetchError")
+                        && let Some(req_id) = params["request"]["request"].as_str()
+                    {
+                        let _ = self.untrack_request(ctx_id, req_id);
+                    }
                     state.handle_event(self, method, params);
+                } else if method == "network.responseStarted"
+                    && let Some(req_id) = params["request"]["request"].as_str()
+                {
+                    let telem_opt = self
+                        .request_stores
+                        .read()
+                        .get(req_id)
+                        .and_then(|w| w.upgrade());
+                    if let Some(telem) = telem_opt {
+                        let resp = &params["response"];
+                        let status = resp.get("status").and_then(|v| v.as_u64()).map(|s| s as u16);
+                        let mime_type = resp
+                            .get("mimeType")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string);
+                        let response_headers = bidi_headers_to_btree(resp.get("headers"));
+                        if is_bidi_sse_response(mime_type.as_deref(), &response_headers) {
+                            telem.set_pending_resource_type(req_id, "EventSource");
+                        }
+                        telem.on_response_received(req_id, status, mime_type, response_headers);
+                    }
+                } else if method == "network.responseCompleted"
+                    && let Some(req_id) = params["request"]["request"].as_str()
+                {
+                    if let Some(telem) = self.untrack_request(ctx_id, req_id) {
+                        let resp = &params["response"];
+                        let status = resp.get("status").and_then(|v| v.as_u64()).map(|s| s as u16);
+                        let mime_type = resp
+                            .get("mimeType")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string);
+                        let response_headers = bidi_headers_to_btree(resp.get("headers"));
+                        telem.on_response_received(req_id, status, mime_type, response_headers);
+                        telem.on_request_finished(req_id);
+                    }
+                } else if method == "network.fetchError"
+                    && let Some(req_id) = params["request"]["request"].as_str()
+                {
+                    if let Some(telem) = self.untrack_request(ctx_id, req_id) {
+                        let error_text = params
+                            .get("errorText")
+                            .and_then(|v| v.as_str())
+                            .map(ToString::to_string);
+                        telem.on_request_failed(req_id, error_text);
+                    }
                 } else if method == "network.beforeRequestSent"
                     && params.get("isBlocked").and_then(|v| v.as_bool()) == Some(true)
                     && let Some(req_id) = params
@@ -601,8 +756,12 @@ struct BidiContextState {
     pending_permissions: Mutex<Vec<PermissionGrant>>,
     applied_permissions: Mutex<Vec<(String, String)>>,
     pending_storage_scripts: Mutex<Vec<(String, String)>>,
+    inline_frame_owners: Mutex<HashMap<String, String>>,
     _proxy_relay: Mutex<Option<ProxyRelay>>,
     intercept_id: AsyncMutex<Option<String>>,
+    pressed_modifiers: Mutex<u32>,
+    instant_animations: AtomicBool,
+    anim_script_id: AsyncMutex<Option<String>>,
     load_notify: Notify,
     disposed: AtomicBool,
 }
@@ -784,9 +943,21 @@ impl BidiContextState {
                     .get("navigation")
                     .and_then(|v| v.as_str())
                     .is_some();
+                let is_sse_accept = request_headers.iter().any(|(k, v)| {
+                    k.eq_ignore_ascii_case("accept")
+                        && v.to_ascii_lowercase().contains("text/event-stream")
+                });
+                let is_ws_upgrade = request_headers.iter().any(|(k, v)| {
+                    k.eq_ignore_ascii_case("upgrade") && v.eq_ignore_ascii_case("websocket")
+                }) || url.starts_with("ws://")
+                    || url.starts_with("wss://");
                 let resource_type_enum =
                     ResourceType::from_bidi_event(destination, initiator_type, is_navigation);
-                let resource_type_str = if !destination.is_empty() {
+                let resource_type_str = if is_sse_accept {
+                    "EventSource".to_string()
+                } else if is_ws_upgrade {
+                    "WebSocket".to_string()
+                } else if !destination.is_empty() {
                     destination.to_string()
                 } else {
                     format!("{resource_type_enum:?}")
@@ -830,10 +1001,15 @@ impl BidiContextState {
                     let has_env_hdrs = !env_hdrs.is_empty();
                     let conn_clone = Arc::clone(conn);
                     let telem = Arc::clone(&self.telemetry);
+                    let req_ctx_id = params
+                        .get("context")
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string);
 
                     tokio::spawn(async move {
                         match decision {
                             InterceptDecision::Block { reason } => {
+                                let _ = conn_clone.untrack_request(req_ctx_id.as_deref(), &req_id);
                                 telem.on_intercept_resolved_locally(
                                     &req_id,
                                     None,
@@ -850,6 +1026,7 @@ impl BidiContextState {
                                 headers,
                                 body,
                             } => {
+                                let _ = conn_clone.untrack_request(req_ctx_id.as_deref(), &req_id);
                                 telem.on_intercept_resolved_locally(
                                     &req_id,
                                     Some(status),
@@ -931,6 +1108,27 @@ impl BidiContextState {
                     });
                 }
             }
+            "network.responseStarted" => {
+                let Some(req_id) = params["request"]["request"].as_str() else {
+                    return;
+                };
+                let resp = &params["response"];
+                let status = resp
+                    .get("status")
+                    .and_then(|v| v.as_u64())
+                    .map(|s| s as u16);
+                let mime_type = resp
+                    .get("mimeType")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string);
+                let response_headers = bidi_headers_to_btree(resp.get("headers"));
+                if is_bidi_sse_response(mime_type.as_deref(), &response_headers) {
+                    self.telemetry
+                        .set_pending_resource_type(req_id, "EventSource");
+                }
+                self.telemetry
+                    .on_response_received(req_id, status, mime_type, response_headers);
+            }
             "network.responseCompleted" => {
                 let Some(req_id) = params["request"]["request"].as_str() else {
                     return;
@@ -961,6 +1159,41 @@ impl BidiContextState {
             }
             _ => {}
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FrameTransform {
+    ox: f64,
+    oy: f64,
+    sx: f64,
+    sy: f64,
+}
+
+impl FrameTransform {
+    fn identity() -> Self {
+        Self {
+            ox: 0.0,
+            oy: 0.0,
+            sx: 1.0,
+            sy: 1.0,
+        }
+    }
+
+    fn compose_inner(self, inner: Self) -> Self {
+        Self {
+            ox: self.ox + inner.ox * self.sx,
+            oy: self.oy + inner.oy * self.sy,
+            sx: self.sx * inner.sx,
+            sy: self.sy * inner.sy,
+        }
+    }
+
+    fn apply(self, bbox: &mut BoundingBox) {
+        bbox.x = self.ox + bbox.x * self.sx;
+        bbox.y = self.oy + bbox.y * self.sy;
+        bbox.width *= self.sx;
+        bbox.height *= self.sy;
     }
 }
 
@@ -998,8 +1231,12 @@ impl BidiSession {
             pending_permissions: Mutex::new(Vec::new()),
             applied_permissions: Mutex::new(Vec::new()),
             pending_storage_scripts: Mutex::new(Vec::new()),
+            inline_frame_owners: Mutex::new(HashMap::new()),
             _proxy_relay: Mutex::new(proxy_relay),
             intercept_id: AsyncMutex::new(None),
+            pressed_modifiers: Mutex::new(0),
+            instant_animations: AtomicBool::new(false),
+            anim_script_id: AsyncMutex::new(None),
             load_notify: Notify::new(),
             disposed: AtomicBool::new(false),
         });
@@ -1101,14 +1338,26 @@ impl BidiSession {
     }
 
     async fn call_sandbox_fn(&self, fn_decl: &str, args: Vec<Value>) -> Result<Value> {
+        self.call_sandbox_fn_in_frame(fn_decl, args, None).await
+    }
+
+    async fn call_sandbox_fn_in_frame(
+        &self,
+        fn_decl: &str,
+        args: Vec<Value>,
+        frame_id: Option<&str>,
+    ) -> Result<Value> {
         self.ensure_alive()?;
+        let target_ctx = frame_id
+            .filter(|f| !f.starts_with("iframe:"))
+            .unwrap_or_else(|| self.ctx());
         let res = self
             .conn
             .send(
                 "script.callFunction",
                 json!({
                     "functionDeclaration": fn_decl,
-                    "target": { "context": self.ctx(), "sandbox": ISOLATED_SANDBOX },
+                    "target": { "context": target_ctx, "sandbox": ISOLATED_SANDBOX },
                     "arguments": args,
                     "awaitPromise": true,
                     "resultOwnership": "none",
@@ -1118,18 +1367,161 @@ impl BidiSession {
         parse_bidi_script_result(&res)
     }
 
-    async fn resolve_shared_element(
+    async fn send_modifier_key_actions(&self, mask: u32, down: bool) -> Result<()> {
+        let actions = build_modifier_key_actions(mask, down);
+        if actions.is_empty() {
+            return Ok(());
+        }
+        self.conn
+            .send(
+                "input.performActions",
+                json!({
+                    "context": self.ctx(),
+                    "actions": [{
+                        "type": "key",
+                        "id": "mimikyu_keyboard",
+                        "actions": actions,
+                    }],
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    fn ax_sandbox_candidates(&self, frame_id: Option<&str>) -> Vec<String> {
+        let mut out = Vec::with_capacity(3);
+        let push_unique = |vec: &mut Vec<String>, ctx: &str| {
+            if !vec.iter().any(|existing| existing == ctx) {
+                vec.push(ctx.to_string());
+            }
+        };
+        if let Some(fid) = frame_id.filter(|f| !f.starts_with("iframe:")) {
+            if let Some(owner) = self.state.inline_frame_owners.lock().get(fid).cloned() {
+                push_unique(&mut out, &owner);
+            }
+            push_unique(&mut out, fid);
+        }
+        push_unique(&mut out, self.ctx());
+        out
+    }
+
+    async fn resolve_shared_element_with_ctx(
         &self,
         backend_node_id: Option<i64>,
+        frame_id: Option<&str>,
         selector: Option<&str>,
-    ) -> Result<Value> {
+    ) -> Result<(String, Value)> {
+        let target_ctx = frame_id
+            .filter(|f| !f.starts_with("iframe:"))
+            .unwrap_or_else(|| self.ctx());
+
+        if let Some(bid) = backend_node_id {
+            for cand_ctx in self.ax_sandbox_candidates(frame_id) {
+                let res = self
+                    .conn
+                    .send(
+                        "script.callFunction",
+                        json!({
+                            "functionDeclaration": r#"(bid) => {
+                                const st = globalThis.__mimikyuAxState;
+                                let el = null;
+                                if (st && st.idToEntry) {
+                                    const entry = st.idToEntry.get(bid);
+                                    el = entry && entry.ref ? entry.ref.deref() : null;
+                                }
+                                if (!el && globalThis.__mimikyuAxMap) {
+                                    el = globalThis.__mimikyuAxMap.get(bid) || null;
+                                }
+                                if (!el) return null;
+                                const doc = el.ownerDocument;
+                                if (!doc) return null;
+                                if (doc === document) return el;
+                                const win = doc.defaultView;
+                                if (!win) return null;
+                                const path = [];
+                                let cur = el;
+                                while (cur && cur !== doc) {
+                                    const parent = cur.parentNode;
+                                    if (!parent || !parent.children) return null;
+                                    const idx = Array.prototype.indexOf.call(parent.children, cur);
+                                    if (idx < 0) return null;
+                                    const isShadow = parent.nodeType === 11;
+                                    path.push({ s: isShadow ? 1 : 0, i: idx });
+                                    cur = isShadow ? parent.host : parent;
+                                }
+                                if (cur !== doc) return null;
+                                path.reverse();
+                                return [win, JSON.stringify(path)];
+                            }"#,
+                            "target": { "context": cand_ctx, "sandbox": ISOLATED_SANDBOX },
+                            "arguments": [{ "type": "number", "value": bid }],
+                            "awaitPromise": false,
+                            "resultOwnership": "root",
+                        }),
+                    )
+                    .await?;
+                if res.get("type").and_then(|v| v.as_str()) == Some("exception") {
+                    continue;
+                }
+                let val = &res["result"];
+                if val.get("type").and_then(|v| v.as_str()) == Some("node") {
+                    return Ok((cand_ctx, val.clone()));
+                }
+                if val.get("type").and_then(|v| v.as_str()) == Some("array")
+                    && let Some(items) = val.get("value").and_then(|v| v.as_array())
+                    && items.len() == 2
+                {
+                    let el_ctx = items[0]["value"]["context"]
+                        .as_str()
+                        .or_else(|| items[0]["context"].as_str())
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| target_ctx.to_string());
+                    let Some(path_json) = items[1]["value"].as_str() else {
+                        continue;
+                    };
+                    let child_res = self
+                        .conn
+                        .send(
+                            "script.callFunction",
+                            json!({
+                                "functionDeclaration": r#"(pathJson) => {
+                                    const path = JSON.parse(pathJson);
+                                    let cur = document;
+                                    for (const step of path) {
+                                        const container = step.s ? cur.shadowRoot : cur;
+                                        if (!container || !container.children) return null;
+                                        cur = container.children[step.i];
+                                        if (!cur) return null;
+                                    }
+                                    return cur;
+                                }"#,
+                                "target": { "context": el_ctx, "sandbox": ISOLATED_SANDBOX },
+                                "arguments": [{ "type": "string", "value": path_json }],
+                                "awaitPromise": false,
+                                "resultOwnership": "root",
+                            }),
+                        )
+                        .await?;
+                    if child_res.get("type").and_then(|v| v.as_str()) != Some("exception") {
+                        let child_val = &child_res["result"];
+                        if child_val.get("type").and_then(|v| v.as_str()) == Some("node") {
+                            return Ok((el_ctx, child_val.clone()));
+                        }
+                    }
+                }
+            }
+            return Err(MimikyuError::ElementNotFound(format!(
+                "backend_node_id {bid} not found in current document"
+            )));
+        }
+
         if let Some(sel) = selector {
             let res = self
                 .conn
                 .send(
                     "browsingContext.locateNodes",
                     json!({
-                        "context": self.ctx(),
+                        "context": target_ctx,
                         "locator": { "type": "css", "value": sel },
                         "maxNodeCount": 1,
                     }),
@@ -1144,43 +1536,182 @@ impl BidiSession {
                         "selector '{sel}' matched no element"
                     ))
                 })?;
-            return Ok(node);
-        }
-
-        if let Some(bid) = backend_node_id {
-            let res = self
-                .conn
-                .send(
-                    "script.callFunction",
-                    json!({
-                        "functionDeclaration": r#"(bid) => {
-                            const m = globalThis.__mimikyuAxMap;
-                            return m ? (m.get(bid) || null) : null;
-                        }"#,
-                        "target": { "context": self.ctx(), "sandbox": ISOLATED_SANDBOX },
-                        "arguments": [{ "type": "number", "value": bid }],
-                        "awaitPromise": false,
-                        "resultOwnership": "root",
-                    }),
-                )
-                .await?;
-            if res.get("type").and_then(|v| v.as_str()) == Some("exception") {
-                return Err(MimikyuError::ElementNotFound(format!(
-                    "backend_node_id {bid} lookup failed"
-                )));
-            }
-            let val = &res["result"];
-            if val.get("type").and_then(|v| v.as_str()) == Some("node") {
-                return Ok(val.clone());
-            }
-            return Err(MimikyuError::ElementNotFound(format!(
-                "backend_node_id {bid} not found in current document"
-            )));
+            return Ok((target_ctx.to_string(), node));
         }
 
         Err(MimikyuError::InvalidConfig(
             "requires either backend_node_id or selector".to_string(),
         ))
+    }
+
+    async fn collect_child_iframe_rects(
+        &self,
+        parent_ctx: &str,
+    ) -> HashMap<String, (bool, FrameTransform)> {
+        let mut out = HashMap::new();
+        let Ok(val) = self
+            .call_sandbox_fn_in_frame(
+                r#"() => {
+                    const items = [];
+                    const visitRoot = (root) => {
+                        if (!root || !root.querySelectorAll) return;
+                        for (const ifr of root.querySelectorAll('iframe')) {
+                            let sameOriginWalked = false;
+                            try {
+                                const cdoc = ifr.contentDocument;
+                                if (cdoc && cdoc.body) sameOriginWalked = true;
+                            } catch {}
+                            const r = ifr.getBoundingClientRect();
+                            const cs = getComputedStyle(ifr);
+                            const iw = ifr.offsetWidth;
+                            const ih = ifr.offsetHeight;
+                            const sx = iw > 0 && r.width > 0 ? r.width / iw : 1;
+                            const sy = ih > 0 && r.height > 0 ? r.height / ih : 1;
+                            items.push({
+                                win: ifr.contentWindow,
+                                sameOriginWalked,
+                                x: r.x + ((parseFloat(cs.borderLeftWidth) || 0) + (parseFloat(cs.paddingLeft) || 0)) * sx,
+                                y: r.y + ((parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.paddingTop) || 0)) * sy,
+                                sx,
+                                sy,
+                            });
+                        }
+                        for (const el of root.querySelectorAll('*')) {
+                            if (el.shadowRoot) visitRoot(el.shadowRoot);
+                        }
+                    };
+                    visitRoot(document);
+                    return items;
+                }"#,
+                vec![],
+                Some(parent_ctx),
+            )
+            .await
+        else {
+            return out;
+        };
+        if let Some(arr) = val.as_array() {
+            for item in arr {
+                if let Some(child_ctx) = item["win"]["context"].as_str() {
+                    let walked = item["sameOriginWalked"].as_bool().unwrap_or(false);
+                    let tf = FrameTransform {
+                        ox: item["x"].as_f64().unwrap_or(0.0),
+                        oy: item["y"].as_f64().unwrap_or(0.0),
+                        sx: item["sx"].as_f64().unwrap_or(1.0),
+                        sy: item["sy"].as_f64().unwrap_or(1.0),
+                    };
+                    out.insert(child_ctx.to_string(), (walked, tf));
+                }
+            }
+        }
+        out
+    }
+
+    async fn resolve_single_child_iframe_offset(
+        &self,
+        child_ctx: &str,
+        parent_ctx: &str,
+    ) -> Option<FrameTransform> {
+        // Closed shadow roots hide <iframe> elements from parent querySelectorAll;
+        // same-origin child contexts still expose their host element via window.frameElement.
+        if let Ok(val) = self
+            .call_sandbox_fn_in_frame(
+                r#"() => {
+                    try {
+                        const fe = window.frameElement;
+                        if (!fe) return null;
+                        const r = fe.getBoundingClientRect();
+                        const pw = (fe.ownerDocument && fe.ownerDocument.defaultView) || window.parent;
+                        const cs = pw.getComputedStyle(fe);
+                        const iw = fe.offsetWidth;
+                        const ih = fe.offsetHeight;
+                        const sx = iw > 0 && r.width > 0 ? r.width / iw : 1;
+                        const sy = ih > 0 && r.height > 0 ? r.height / ih : 1;
+                        return {
+                            x: r.x + ((parseFloat(cs.borderLeftWidth) || 0) + (parseFloat(cs.paddingLeft) || 0)) * sx,
+                            y: r.y + ((parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.paddingTop) || 0)) * sy,
+                            sx,
+                            sy,
+                        };
+                    } catch {
+                        return null;
+                    }
+                }"#,
+                vec![],
+                Some(child_ctx),
+            )
+            .await
+            && let (Some(ox), Some(oy)) = (val["x"].as_f64(), val["y"].as_f64())
+        {
+            return Some(FrameTransform {
+                ox,
+                oy,
+                sx: val["sx"].as_f64().unwrap_or(1.0),
+                sy: val["sy"].as_f64().unwrap_or(1.0),
+            });
+        }
+
+        // Cross-origin closed-shadow-DOM iframe fallback via Firefox viewport screen coordinates.
+        let screen_fn = r#"() => ({
+            sx: typeof window.mozInnerScreenX === 'number' && Number.isFinite(window.mozInnerScreenX) ? window.mozInnerScreenX : null,
+            sy: typeof window.mozInnerScreenY === 'number' && Number.isFinite(window.mozInnerScreenY) ? window.mozInnerScreenY : null
+        })"#;
+        if let (Ok(cv), Ok(pv)) = (
+            self.call_sandbox_fn_in_frame(screen_fn, vec![], Some(child_ctx))
+                .await,
+            self.call_sandbox_fn_in_frame(screen_fn, vec![], Some(parent_ctx))
+                .await,
+        ) && let (Some(cx), Some(cy), Some(px), Some(py)) = (
+            cv["sx"].as_f64(),
+            cv["sy"].as_f64(),
+            pv["sx"].as_f64(),
+            pv["sy"].as_f64(),
+        ) {
+            return Some(FrameTransform {
+                ox: cx - px,
+                oy: cy - py,
+                sx: 1.0,
+                sy: 1.0,
+            });
+        }
+        None
+    }
+
+    async fn resolve_frame_cumulative_offset(
+        &self,
+        frame_id: &str,
+        parent_map: &HashMap<String, String>,
+        cache: &mut HashMap<String, HashMap<String, (bool, FrameTransform)>>,
+    ) -> (bool, FrameTransform) {
+        let mut total = FrameTransform::identity();
+        let mut immediate_walked = false;
+        let mut cur = frame_id.to_string();
+        for hop in 0..32 {
+            if cur == self.ctx() {
+                break;
+            }
+            let Some(parent) = parent_map.get(&cur) else {
+                break;
+            };
+            if !cache.contains_key(parent) {
+                let rects = self.collect_child_iframe_rects(parent).await;
+                cache.insert(parent.clone(), rects);
+            }
+            if let Some(&(walked, tf)) = cache.get(parent).and_then(|m| m.get(&cur)) {
+                if hop == 0 {
+                    immediate_walked = walked;
+                }
+                total = tf.compose_inner(total);
+            } else if let Some(tf) = self.resolve_single_child_iframe_offset(&cur, parent).await {
+                cache
+                    .entry(parent.clone())
+                    .or_default()
+                    .insert(cur.clone(), (false, tf));
+                total = tf.compose_inner(total);
+            }
+            cur = parent.clone();
+        }
+        (immediate_walked, total)
     }
 }
 
@@ -1397,6 +1928,7 @@ impl DriverSession for BidiSession {
                 }
             }
         }
+        self.state.inline_frame_owners.lock().clear();
         self.conn
             .send(
                 "browsingContext.navigate",
@@ -1413,6 +1945,7 @@ impl DriverSession for BidiSession {
 
     async fn reload(&self) -> Result<NavInfo> {
         self.ensure_alive()?;
+        self.state.inline_frame_owners.lock().clear();
         self.conn
             .send(
                 "browsingContext.reload",
@@ -1428,6 +1961,7 @@ impl DriverSession for BidiSession {
 
     async fn go_back(&self) -> Result<NavInfo> {
         self.ensure_alive()?;
+        self.state.inline_frame_owners.lock().clear();
         let notified = self.state.load_notify.notified();
         self.conn
             .send(
@@ -1442,6 +1976,7 @@ impl DriverSession for BidiSession {
 
     async fn go_forward(&self) -> Result<NavInfo> {
         self.ensure_alive()?;
+        self.state.inline_frame_owners.lock().clear();
         let notified = self.state.load_notify.notified();
         self.conn
             .send(
@@ -1465,14 +2000,38 @@ impl DriverSession for BidiSession {
     }
 
     async fn eval_isolated(&self, expr: &str) -> Result<Value> {
+        self.eval_isolated_in_frame(expr, None).await
+    }
+
+    async fn eval_main_world(&self, expr: &str) -> Result<Value> {
+        self.eval_main_world_in_frame(expr, None).await
+    }
+
+    async fn list_frames(&self) -> Result<Vec<FrameInfo>> {
         self.ensure_alive()?;
+        let tree = self
+            .conn
+            .send("browsingContext.getTree", json!({ "root": self.ctx() }))
+            .await?;
+        let mut out = Vec::new();
+        if let Some(contexts) = tree["contexts"].as_array() {
+            for c in contexts {
+                collect_bidi_frames(c, None, &mut out);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn eval_isolated_in_frame(&self, expr: &str, frame_id: Option<&str>) -> Result<Value> {
+        self.ensure_alive()?;
+        let target_ctx = frame_id.unwrap_or_else(|| self.ctx());
         let res = self
             .conn
             .send(
                 "script.evaluate",
                 json!({
                     "expression": expr,
-                    "target": { "context": self.ctx(), "sandbox": ISOLATED_SANDBOX },
+                    "target": { "context": target_ctx, "sandbox": ISOLATED_SANDBOX },
                     "awaitPromise": true,
                     "resultOwnership": "none",
                 }),
@@ -1481,24 +2040,171 @@ impl DriverSession for BidiSession {
         parse_bidi_script_result(&res)
     }
 
-    async fn eval_main_world(&self, expr: &str) -> Result<Value> {
+    async fn eval_main_world_in_frame(&self, expr: &str, frame_id: Option<&str>) -> Result<Value> {
         self.ensure_alive()?;
         if !self.state.main_world_eval {
             return Err(MimikyuError::MainWorldDisabled);
         }
+        let target_ctx = frame_id.unwrap_or_else(|| self.ctx());
         let res = self
             .conn
             .send(
                 "script.evaluate",
                 json!({
                     "expression": expr,
-                    "target": { "context": self.ctx() },
+                    "target": { "context": target_ctx },
                     "awaitPromise": true,
                     "resultOwnership": "none",
                 }),
             )
             .await?;
         parse_bidi_script_result(&res)
+    }
+
+    async fn call_function_on_node(
+        &self,
+        backend_node_id: i64,
+        frame_id: Option<&str>,
+        function_declaration: &str,
+        args: Vec<Value>,
+    ) -> Result<Value> {
+        self.ensure_alive()?;
+        let bidi_args_json = serde_json::to_string(&args)?;
+        let wrapper = format!(
+            r#"(bid, argsJson) => {{
+                const st = globalThis.__mimikyuAxState;
+                const entry = st && st.idToEntry ? st.idToEntry.get(bid) : null;
+                let el = entry && entry.ref ? entry.ref.deref() : null;
+                if (!el && globalThis.__mimikyuAxMap) el = globalThis.__mimikyuAxMap.get(bid) || null;
+                if (!el) return {{ __notFound: true }};
+                const fn = ({function_declaration});
+                const parsedArgs = JSON.parse(argsJson);
+                return {{ __ok: true, value: fn.apply(el, parsedArgs) }};
+            }}"#
+        );
+        let call_args = vec![
+            json!({ "type": "number", "value": backend_node_id }),
+            json!({ "type": "string", "value": bidi_args_json }),
+        ];
+        let mut last_err: Option<MimikyuError> = None;
+        for cand_ctx in self.ax_sandbox_candidates(frame_id) {
+            match self
+                .call_sandbox_fn_in_frame(&wrapper, call_args.clone(), Some(&cand_ctx))
+                .await
+            {
+                Ok(res) => {
+                    if res.get("__notFound").and_then(|v| v.as_bool()) == Some(true) {
+                        continue;
+                    }
+                    return Ok(res.get("value").cloned().unwrap_or(Value::Null));
+                }
+                Err(e) => last_err = Some(e),
+            }
+        }
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+        Err(MimikyuError::ElementNotFound(format!(
+            "backend_node_id {backend_node_id} not found"
+        )))
+    }
+
+    async fn query_shadow(
+        &self,
+        selector_chain: &[String],
+        frame_id: Option<&str>,
+    ) -> Result<Vec<ShadowMatch>> {
+        self.ensure_alive()?;
+        if selector_chain.is_empty() {
+            return Err(MimikyuError::InvalidConfig(
+                "query_shadow requires at least one selector".to_string(),
+            ));
+        }
+        let chain_json = serde_json::to_string(selector_chain)?;
+        let res = self
+            .call_sandbox_fn_in_frame(
+                r#"(chainJson) => {
+                    const chain = JSON.parse(chainJson);
+                    let current = Array.from(document.querySelectorAll(chain[0]));
+                    if (chain.length === 1) {
+                        return { status: 'ok', matches: current.map(el => {
+                            const attrs = {};
+                            for (const a of el.attributes) attrs[a.name] = a.value;
+                            const r = el.getBoundingClientRect();
+                            return {
+                                tag_name: el.tagName.toLowerCase(),
+                                text: (el.innerText || el.textContent || '').trim(),
+                                html: el.outerHTML || null,
+                                attributes: attrs,
+                                bounds: { x: r.x, y: r.y, width: r.width, height: r.height }
+                            };
+                        }) };
+                    }
+                    for (let i = 1; i < chain.length; i++) {
+                        if (current.length === 0) return { status: 'ok', matches: [] };
+                        const roots = current.map(el => el.shadowRoot).filter(Boolean);
+                        if (roots.length === 0) {
+                            return { status: 'closed_or_missing_shadow' };
+                        }
+                        const next = [];
+                        for (const sr of roots) {
+                            for (const found of sr.querySelectorAll(chain[i])) {
+                                next.push(found);
+                            }
+                        }
+                        current = next;
+                    }
+                    return {
+                        status: 'ok',
+                        matches: current.map(el => {
+                            const attrs = {};
+                            for (const a of el.attributes) attrs[a.name] = a.value;
+                            const r = el.getBoundingClientRect();
+                            return {
+                                tag_name: el.tagName.toLowerCase(),
+                                text: (el.innerText || el.textContent || '').trim(),
+                                html: el.outerHTML || null,
+                                attributes: attrs,
+                                bounds: { x: r.x, y: r.y, width: r.width, height: r.height }
+                            };
+                        })
+                    };
+                }"#,
+                vec![json!({ "type": "string", "value": chain_json })],
+                frame_id,
+            )
+            .await?;
+
+        if res["status"].as_str() == Some("closed_or_missing_shadow") {
+            return Err(MimikyuError::Unsupported {
+                engine: "firefox".to_string(),
+                feature: "closed shadow DOM traversal".to_string(),
+            });
+        }
+
+        let target_fid = frame_id.unwrap_or_else(|| self.ctx()).to_string();
+        let arr = res["matches"].as_array().cloned().unwrap_or_default();
+        let mut out = Vec::with_capacity(arr.len());
+        for m in arr {
+            let attributes: BTreeMap<String, String> =
+                serde_json::from_value(m["attributes"].clone()).unwrap_or_default();
+            let bounds: Option<BoundingBox> = serde_json::from_value(m["bounds"].clone()).ok();
+            out.push(ShadowMatch {
+                backend_node_id: None,
+                frame_id: Some(target_fid.clone()),
+                tag_name: m["tag_name"].as_str().unwrap_or_default().to_string(),
+                text: m["text"].as_str().unwrap_or_default().to_string(),
+                html: m["html"].as_str().map(ToString::to_string),
+                attributes,
+                bounds,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn closed_shadow_hosts(&self, _frame_id: Option<&str>) -> Result<Vec<i64>> {
+        self.ensure_alive()?;
+        Ok(Vec::new())
     }
 
     async fn add_init_script(&self, script: &str) -> Result<String> {
@@ -1532,29 +2238,51 @@ impl DriverSession for BidiSession {
     }
 
     async fn accessibility_tree(&self) -> Result<Vec<AxNode>> {
+        let frames = self.list_frames().await.unwrap_or_default();
         let walker_js = r#"(() => {
             const nodes = [];
-            const map = new Map();
-            let nextId = 1;
-            globalThis.__mimikyuAxMap = map;
+            const iframeWins = [];
+            if (!globalThis.__mimikyuAxState) {
+                globalThis.__mimikyuAxState = {
+                    nextId: 1,
+                    elToId: new WeakMap(),
+                    idToEntry: new Map(),
+                };
+            }
+            const state = globalThis.__mimikyuAxState;
+            const getOrAssignId = (el, frameId) => {
+                let bid = state.elToId.get(el);
+                if (!bid) {
+                    bid = state.nextId++;
+                    state.elToId.set(el, bid);
+                }
+                state.idToEntry.set(bid, { ref: new WeakRef(el), frameId });
+                return bid;
+            };
 
             const tagRole = (el) => {
                 const explicit = el.getAttribute('role');
                 if (explicit) return explicit.trim().split(/\s+/)[0];
                 const tag = el.tagName;
                 if (tag === 'A' && el.hasAttribute('href')) return 'link';
-                if (tag === 'BUTTON') return 'button';
+                if (tag === 'BUTTON' || tag === 'SUMMARY') return 'button';
                 if (/^H[1-6]$/.test(tag)) return 'heading';
                 if (tag === 'INPUT') {
                     const t = (el.getAttribute('type') || 'text').toLowerCase();
                     if (t === 'checkbox') return 'checkbox';
                     if (t === 'radio') return 'radio';
-                    if (t === 'submit' || t === 'button' || t === 'reset') return 'button';
+                    if (t === 'submit' || t === 'button' || t === 'reset' || t === 'image' || t === 'file') return 'button';
+                    if (t === 'search') return 'searchbox';
+                    if (t === 'number') return 'spinbutton';
+                    if (t === 'range') return 'slider';
                     if (t === 'hidden') return 'none';
                     return 'textbox';
                 }
                 if (tag === 'TEXTAREA') return 'textbox';
                 if (tag === 'SELECT') return 'combobox';
+                if (tag === 'OPTION') return 'option';
+                if (tag === 'DIALOG') return 'dialog';
+                if (tag === 'IFRAME') return 'Iframe';
                 if (tag === 'IMG') return 'img';
                 if (tag === 'NAV') return 'navigation';
                 if (tag === 'MAIN') return 'main';
@@ -1568,79 +2296,138 @@ impl DriverSession for BidiSession {
                 if (tag === 'TH') return 'columnheader';
                 if (tag === 'TD') return 'cell';
                 if (tag === 'BODY') return 'RootWebArea';
+                if (el.isContentEditable) return 'textbox';
                 return 'generic';
             };
 
-            const computeName = (el) => {
+            const LEAF_NAME_ROLES = new Set([
+                'button', 'link', 'heading', 'menuitem', 'menuitemcheckbox',
+                'menuitemradio', 'tab', 'option', 'checkbox', 'radio', 'switch',
+                'cell', 'columnheader', 'rowheader', 'listitem', 'label',
+                'alert', 'status',
+            ]);
+
+            const computeName = (el, role) => {
                 const al = el.getAttribute('aria-label');
                 if (al && al.trim()) return al.trim();
+                const root = el.getRootNode ? el.getRootNode() : document;
+                const lookupById = (id) => {
+                    if (root && typeof root.getElementById === 'function') {
+                        const found = root.getElementById(id);
+                        if (found) return found;
+                    }
+                    return el.ownerDocument ? el.ownerDocument.getElementById(id) : null;
+                };
                 const labelledBy = el.getAttribute('aria-labelledby');
                 if (labelledBy) {
                     const parts = labelledBy.split(/\s+/).map(id => {
-                        const ref = document.getElementById(id);
+                        const ref = lookupById(id);
                         return ref ? (ref.textContent || '').trim() : '';
                     }).filter(Boolean);
                     if (parts.length) return parts.join(' ');
                 }
                 if (el.id) {
-                    const lbl = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+                    const sel = `label[for="${CSS.escape(el.id)}"]`;
+                    const lbl = (root && root.querySelector ? root.querySelector(sel) : null)
+                        || (el.ownerDocument ? el.ownerDocument.querySelector(sel) : null);
                     if (lbl && lbl.textContent) return lbl.textContent.trim();
                 }
+                if (['INPUT', 'TEXTAREA', 'SELECT'].includes(el.tagName) && el.closest) {
+                    const wrapLbl = el.closest('label');
+                    if (wrapLbl) {
+                        const clone = wrapLbl.cloneNode(true);
+                        for (const ctrl of clone.querySelectorAll('input,select,textarea')) ctrl.remove();
+                        const txt = (clone.textContent || '').replace(/\s+/g, ' ').trim();
+                        if (txt) return txt;
+                    }
+                }
                 if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
-                    if (el.placeholder) return el.placeholder.trim();
                     const t = (el.getAttribute('type') || '').toLowerCase();
-                    if ((t === 'submit' || t === 'button') && el.value) return el.value.trim();
+                    if ((t === 'submit' || t === 'button' || t === 'reset') && el.value) return el.value.trim();
+                    if (t === 'file') return 'Choose File';
+                    if (el.placeholder) return el.placeholder.trim();
                 }
                 if (el.tagName === 'IMG' && el.alt) return el.alt.trim();
+                if (role === 'button' || role === 'link') {
+                    const img = el.querySelector('img[alt]');
+                    if (img && img.alt && img.alt.trim()) return img.alt.trim();
+                    const svgTitle = el.querySelector('svg title');
+                    if (svgTitle && svgTitle.textContent && svgTitle.textContent.trim()) {
+                        return svgTitle.textContent.trim();
+                    }
+                }
                 if (el.title) return el.title.trim();
-                if (el.tagName !== 'BODY' && el.tagName !== 'MAIN' && el.tagName !== 'FORM') {
+                if (LEAF_NAME_ROLES.has(role)) {
                     const txt = (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
                     if (txt && txt.length <= 200) return txt;
                 }
                 return null;
             };
 
-            const visit = (el, parentId) => {
-                if (!el || el.nodeType !== 1) return null;
+            const visit = (el, parentId, frameId, offX, offY, scaleX, scaleY, depth) => {
+                if (!el || el.nodeType !== 1 || depth > 64) return null;
                 const tag = el.tagName;
-                if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT') return null;
-                const style = getComputedStyle(el);
+                if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'NOSCRIPT' || tag === 'TEMPLATE') return null;
+                const win = el.ownerDocument && el.ownerDocument.defaultView ? el.ownerDocument.defaultView : window;
+                const style = win.getComputedStyle(el);
                 if (style.display === 'none' || style.visibility === 'hidden') return null;
                 if (el.getAttribute('aria-hidden') === 'true') return null;
 
                 const role = tagRole(el);
                 if (role === 'none' || role === 'presentation') return null;
 
-                const bid = nextId++;
-                const nodeId = String(bid);
-                map.set(bid, el);
-
+                const isContents = style.display === 'contents';
+                const isFileInput = tag === 'INPUT' && (el.getAttribute('type') || '').toLowerCase() === 'file';
                 const rect = el.getBoundingClientRect();
-                const focusable = el.tabIndex >= 0 || ['A','BUTTON','INPUT','SELECT','TEXTAREA'].includes(tag);
-                const focused = document.activeElement === el;
+                const bounds = isContents
+                    ? { x: 0, y: 0, width: 0, height: 0 }
+                    : isFileInput
+                        ? { x: offX + rect.x * scaleX, y: offY + rect.y * scaleY, width: Math.max(rect.width * scaleX, 1), height: Math.max(rect.height * scaleY, 1) }
+                        : { x: offX + rect.x * scaleX, y: offY + rect.y * scaleY, width: rect.width * scaleX, height: rect.height * scaleY };
+
+                const bid = getOrAssignId(el, frameId);
+                const nodeId = String(bid);
+                const focusable = el.tabIndex >= 0 || ['A','BUTTON','INPUT','SELECT','TEXTAREA','SUMMARY'].includes(tag) || el.isContentEditable;
+                const doc = el.ownerDocument || document;
+                const focused = doc.activeElement === el;
                 const disabled = !!el.disabled || el.getAttribute('aria-disabled') === 'true';
                 const checkedAttr = el.getAttribute('aria-checked');
-                const checked = typeof el.checked === 'boolean' ? el.checked : (checkedAttr === 'true' ? true : checkedAttr === 'false' ? false : null);
+                const checked = (tag === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio'))
+                    ? !!el.checked
+                    : (checkedAttr === 'true' ? true : checkedAttr === 'false' ? false : null);
                 const expAttr = el.getAttribute('aria-expanded');
                 const expanded = expAttr === 'true' ? true : expAttr === 'false' ? false : null;
                 const selAttr = el.getAttribute('aria-selected');
                 const selected = typeof el.selected === 'boolean' ? el.selected : (selAttr === 'true' ? true : selAttr === 'false' ? false : null);
                 const required = !!el.required || el.getAttribute('aria-required') === 'true';
                 const level = /^H([1-6])$/.test(tag) ? Number(tag.slice(1)) : (el.getAttribute('aria-level') ? Number(el.getAttribute('aria-level')) : null);
-                const value = ('value' in el && el.value !== undefined && el.value !== null && tag !== 'BUTTON' && tag !== 'LI') ? String(el.value) : null;
 
-                const idx = nodes.length;
+                let value = null;
+                if (tag === 'INPUT') {
+                    const t = (el.getAttribute('type') || 'text').toLowerCase();
+                    if (t !== 'checkbox' && t !== 'radio' && t !== 'submit' && t !== 'button' && t !== 'reset' && t !== 'file') {
+                        value = el.value !== undefined && el.value !== null ? String(el.value) : null;
+                    }
+                } else if (tag === 'TEXTAREA') {
+                    value = el.value !== undefined && el.value !== null ? String(el.value) : null;
+                } else if (tag === 'SELECT') {
+                    const opt = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
+                    value = opt ? (opt.textContent || opt.value || '').trim() : (el.value || null);
+                } else if (el.isContentEditable && tag !== 'BODY') {
+                    value = (el.innerText || '').trim();
+                }
+
                 const entry = {
                     node_id: nodeId,
                     parent_id: parentId,
                     child_ids: [],
                     role,
-                    name: computeName(el),
+                    name: computeName(el, role),
                     value,
                     description: el.getAttribute('aria-description') || null,
                     backend_node_id: bid,
-                    frame_id: null,
-                    ignored: false,
+                    frame_id: frameId,
+                    ignored: isContents,
                     focusable,
                     focused,
                     disabled,
@@ -1649,13 +2436,13 @@ impl DriverSession for BidiSession {
                     selected,
                     required,
                     level,
-                    bounds: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+                    bounds,
                 };
                 nodes.push(entry);
 
                 const pushChildren = (root) => {
                     for (const child of root.children) {
-                        const cid = visit(child, nodeId);
+                        const cid = visit(child, nodeId, frameId, offX, offY, scaleX, scaleY, depth + 1);
                         if (cid) entry.child_ids.push(cid);
                     }
                 };
@@ -1663,51 +2450,196 @@ impl DriverSession for BidiSession {
                 if (el.shadowRoot) {
                     pushChildren(el.shadowRoot);
                 }
+                if (tag === 'IFRAME') {
+                    try {
+                        const cdoc = el.contentDocument;
+                        if (cdoc && cdoc.body) {
+                            const bl = parseFloat(style.borderLeftWidth) || 0;
+                            const pl = parseFloat(style.paddingLeft) || 0;
+                            const bt = parseFloat(style.borderTopWidth) || 0;
+                            const pt = parseFloat(style.paddingTop) || 0;
+                            const iw = el.offsetWidth;
+                            const ih = el.offsetHeight;
+                            const localSx = iw > 0 && rect.width > 0 ? rect.width / iw : 1;
+                            const localSy = ih > 0 && rect.height > 0 ? rect.height / ih : 1;
+                            const nextSx = scaleX * localSx;
+                            const nextSy = scaleY * localSy;
+                            const nextOffX = offX + (rect.x + (bl + pl) * localSx) * scaleX;
+                            const nextOffY = offY + (rect.y + (bt + pt) * localSy) * scaleY;
+                            const subFid = 'iframe:' + bid;
+                            if (el.contentWindow) {
+                                iframeWins.push([subFid, el.contentWindow]);
+                            }
+                            const cid = visit(cdoc.body, nodeId, subFid, nextOffX, nextOffY, nextSx, nextSy, depth + 1);
+                            if (cid) entry.child_ids.push(cid);
+                        }
+                    } catch {}
+                }
                 return nodeId;
             };
 
             if (document.body) {
-                visit(document.body, null);
+                visit(document.body, null, null, 0, 0, 1, 1, 0);
             }
-            return nodes;
+            return { nodes, iframeWins };
         })()"#;
 
+        let mut new_inline_owners: HashMap<String, String> = HashMap::new();
         let val = self.eval_isolated(walker_js).await?;
-        let arr = val.as_array().cloned().unwrap_or_default();
-        let mut nodes = Vec::with_capacity(arr.len());
-        for item in arr {
-            if let Ok(node) = serde_json::from_value::<AxNode>(item) {
-                nodes.push(node);
+        let mut nodes = parse_bidi_walker_result(val, self.ctx(), &mut new_inline_owners);
+
+        // Cross-origin child contexts (if any whose contentDocument wasn't accessible)
+        let parent_map: HashMap<String, String> = frames
+            .iter()
+            .filter_map(|f| {
+                f.parent_frame_id
+                    .as_ref()
+                    .map(|p| (f.frame_id.clone(), p.clone()))
+            })
+            .collect();
+        let mut rect_cache: HashMap<String, HashMap<String, (bool, FrameTransform)>> = HashMap::new();
+
+        for f in frames {
+            if f.is_main {
+                continue;
+            }
+            let already_has_frame = nodes.iter().any(|n| n.frame_id.as_deref() == Some(&f.frame_id));
+            if already_has_frame {
+                continue;
+            }
+            let (same_origin_walked, tf) = self
+                .resolve_frame_cumulative_offset(&f.frame_id, &parent_map, &mut rect_cache)
+                .await;
+            if same_origin_walked {
+                continue;
+            }
+            if let Ok(sub_val) = self.eval_isolated_in_frame(walker_js, Some(&f.frame_id)).await {
+                let sub_nodes =
+                    parse_bidi_walker_result(sub_val, &f.frame_id, &mut new_inline_owners);
+                let prefix = format!("{}::", f.frame_id);
+                for mut sn in sub_nodes {
+                    sn.node_id = format!("{prefix}{}", sn.node_id);
+                    sn.parent_id = sn.parent_id.map(|p| format!("{prefix}{p}"));
+                    sn.child_ids = sn
+                        .child_ids
+                        .into_iter()
+                        .map(|c| format!("{prefix}{c}"))
+                        .collect();
+                    if let Some(ref mut b) = sn.bounds {
+                        tf.apply(b);
+                    }
+                    nodes.push(sn);
+                }
             }
         }
+
+        *self.state.inline_frame_owners.lock() = new_inline_owners;
         Ok(nodes)
     }
 
     async fn resolve_node_box(
         &self,
         backend_node_id: i64,
-        _frame_id: Option<&str>,
+        frame_id: Option<&str>,
     ) -> Result<BoundingBox> {
-        let val = self
-            .call_sandbox_fn(
-                r#"(bid) => {
-                    const m = globalThis.__mimikyuAxMap;
-                    const el = m ? m.get(bid) : null;
-                    if (!el) return null;
-                    const r = el.getBoundingClientRect();
-                    return { x: r.x, y: r.y, width: r.width, height: r.height };
-                }"#,
-                vec![json!({ "type": "number", "value": backend_node_id })],
-            )
-            .await?;
+        let lookup_js = r#"(bid) => {
+            const st = globalThis.__mimikyuAxState;
+            const entry = st && st.idToEntry ? st.idToEntry.get(bid) : null;
+            let el = entry && entry.ref ? entry.ref.deref() : null;
+            if (!el && globalThis.__mimikyuAxMap) el = globalThis.__mimikyuAxMap.get(bid) || null;
+            if (!el) return null;
+            const r = el.getBoundingClientRect();
+            let bx = r.x;
+            let by = r.y;
+            let bw = r.width;
+            let bh = r.height;
+            try {
+                let curWin = el.ownerDocument && el.ownerDocument.defaultView ? el.ownerDocument.defaultView : null;
+                while (curWin && curWin !== window) {
+                    const fe = curWin.frameElement;
+                    if (!fe) break;
+                    const fr = fe.getBoundingClientRect();
+                    const cs = curWin.parent.getComputedStyle(fe);
+                    const iw = fe.offsetWidth;
+                    const ih = fe.offsetHeight;
+                    const sx = iw > 0 && fr.width > 0 ? fr.width / iw : 1;
+                    const sy = ih > 0 && fr.height > 0 ? fr.height / ih : 1;
+                    const ox = fr.x + ((parseFloat(cs.borderLeftWidth) || 0) + (parseFloat(cs.paddingLeft) || 0)) * sx;
+                    const oy = fr.y + ((parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.paddingTop) || 0)) * sy;
+                    bx = ox + bx * sx;
+                    by = oy + by * sy;
+                    bw *= sx;
+                    bh *= sy;
+                    curWin = curWin.parent;
+                }
+            } catch {}
+            return { x: bx, y: by, width: bw, height: bh };
+        }"#;
+        let args = vec![json!({ "type": "number", "value": backend_node_id })];
+        let mut val = Value::Null;
+        let mut found_in_ctx: Option<String> = None;
+        let mut last_err: Option<MimikyuError> = None;
+        for cand_ctx in self.ax_sandbox_candidates(frame_id) {
+            match self
+                .call_sandbox_fn_in_frame(lookup_js, args.clone(), Some(&cand_ctx))
+                .await
+            {
+                Ok(v) if !v.is_null() => {
+                    val = v;
+                    found_in_ctx = Some(cand_ctx);
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => last_err = Some(e),
+            }
+        }
         if val.is_null() {
+            if let Some(err) = last_err {
+                return Err(err);
+            }
             return Err(MimikyuError::ElementNotFound(format!(
                 "backend_node_id {backend_node_id} not found"
             )));
         }
-        serde_json::from_value::<BoundingBox>(val).map_err(|e| {
+        let mut bbox = serde_json::from_value::<BoundingBox>(val).map_err(|e| {
             MimikyuError::ElementNotFound(format!("invalid bounding box for {backend_node_id}: {e}"))
-        })
+        })?;
+        if let Some(ref fid) = found_in_ctx
+            && !fid.starts_with("iframe:")
+            && fid != self.ctx()
+        {
+            let parent_map = self.conn.context_parents.read().clone();
+            let mut has_chain_to_main = false;
+            {
+                let mut cur = fid.as_str();
+                for _ in 0..32 {
+                    if cur == self.ctx() {
+                        has_chain_to_main = true;
+                        break;
+                    }
+                    let Some(p) = parent_map.get(cur) else {
+                        break;
+                    };
+                    cur = p.as_str();
+                }
+            }
+            let parent_map = if has_chain_to_main {
+                parent_map
+            } else {
+                self.list_frames()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|f| f.parent_frame_id.map(|p| (f.frame_id, p)))
+                    .collect()
+            };
+            let mut cache = HashMap::new();
+            let (_, tf) = self
+                .resolve_frame_cumulative_offset(fid, &parent_map, &mut cache)
+                .await;
+            tf.apply(&mut bbox);
+        }
+        Ok(bbox)
     }
 
     async fn resolve_selector_box(&self, selector: &str) -> Result<BoundingBox> {
@@ -1730,6 +2662,282 @@ impl DriverSession for BidiSession {
         serde_json::from_value::<BoundingBox>(val).map_err(|e| {
             MimikyuError::ElementNotFound(format!("invalid bounding box for '{selector}': {e}"))
         })
+    }
+
+    async fn viewport_size(&self) -> Result<(f64, f64)> {
+        let val = self
+            .eval_isolated(
+                r#"(() => {
+                    const iw = window.innerWidth || 1280;
+                    const ih = window.innerHeight || 800;
+                    const cw = (document.documentElement && document.documentElement.clientWidth) || iw;
+                    const ch = (document.documentElement && document.documentElement.clientHeight) || ih;
+                    return { w: Math.min(iw, cw), h: Math.min(ih, ch) };
+                })()"#,
+            )
+            .await?;
+        let w = val["w"].as_f64().unwrap_or(1280.0).max(1.0);
+        let h = val["h"].as_f64().unwrap_or(800.0).max(1.0);
+        Ok((w, h))
+    }
+
+    async fn scroll_into_view(
+        &self,
+        backend_node_id: Option<i64>,
+        frame_id: Option<&str>,
+        selector: Option<&str>,
+    ) -> Result<()> {
+        if let Some(bid) = backend_node_id {
+            let res = self
+                .call_function_on_node(
+                    bid,
+                    frame_id,
+                    "function() { this.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' }); return true; }",
+                    vec![],
+                )
+                .await?;
+            if res.as_bool() == Some(true) {
+                return Ok(());
+            }
+        }
+        if let Some(sel) = selector {
+            let ok = self
+                .call_sandbox_fn_in_frame(
+                    r#"(sel) => {
+                        const el = document.querySelector(sel);
+                        if (!el) return false;
+                        el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+                        return true;
+                    }"#,
+                    vec![json!({ "type": "string", "value": sel })],
+                    frame_id,
+                )
+                .await?;
+            if ok.as_bool() == Some(true) {
+                return Ok(());
+            }
+            return Err(MimikyuError::ElementNotFound(format!(
+                "selector '{sel}' matched no element"
+            )));
+        }
+        Err(MimikyuError::InvalidConfig(
+            "scroll_into_view requires backend_node_id or selector".to_string(),
+        ))
+    }
+
+    async fn clear_node_value(
+        &self,
+        backend_node_id: Option<i64>,
+        frame_id: Option<&str>,
+        selector: Option<&str>,
+    ) -> Result<()> {
+        let clear_fn = r#"function() {
+            if (!this) return false;
+            if (typeof this.focus === 'function') this.focus();
+            const tag = this.tagName;
+            if (tag === 'INPUT' || tag === 'TEXTAREA') {
+                const proto = tag === 'INPUT' ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+                const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                if (setter) setter.call(this, '');
+                else this.value = '';
+                this.dispatchEvent(new Event('input', { bubbles: true }));
+                return true;
+            }
+            if (this.isContentEditable) {
+                this.textContent = '';
+                this.dispatchEvent(new Event('input', { bubbles: true }));
+                return true;
+            }
+            return false;
+        }"#;
+        if let Some(bid) = backend_node_id {
+            let ok = self
+                .call_function_on_node(bid, frame_id, clear_fn, vec![])
+                .await?;
+            if ok.as_bool() == Some(true) {
+                return Ok(());
+            }
+            return Err(MimikyuError::ElementNotFound(format!(
+                "backend_node_id {bid} is not clearable"
+            )));
+        }
+        if let Some(sel) = selector {
+            let ok = self
+                .call_sandbox_fn_in_frame(
+                    r#"(sel) => {
+                        const el = document.querySelector(sel);
+                        if (!el) return false;
+                        el.focus();
+                        const tag = el.tagName;
+                        if (tag === 'INPUT' || tag === 'TEXTAREA') {
+                            const proto = tag === 'INPUT' ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;
+                            const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+                            if (setter) setter.call(el, '');
+                            else el.value = '';
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            return true;
+                        }
+                        if (el.isContentEditable) {
+                            el.textContent = '';
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            return true;
+                        }
+                        return false;
+                    }"#,
+                    vec![json!({ "type": "string", "value": sel })],
+                    frame_id,
+                )
+                .await?;
+            if ok.as_bool() == Some(true) {
+                return Ok(());
+            }
+            return Err(MimikyuError::ElementNotFound(format!(
+                "selector '{sel}' matched no clearable element"
+            )));
+        }
+        Err(MimikyuError::InvalidConfig(
+            "clear_node_value requires backend_node_id or selector".to_string(),
+        ))
+    }
+
+    async fn select_option(
+        &self,
+        backend_node_id: Option<i64>,
+        frame_id: Option<&str>,
+        selector: Option<&str>,
+        by: SelectBy,
+    ) -> Result<String> {
+        let (mode, val_arg): (&str, Value) = match by {
+            SelectBy::Value(v) => ("value", json!(v)),
+            SelectBy::Label(l) => ("label", json!(l)),
+            SelectBy::Index(i) => ("index", json!(i)),
+            SelectBy::Auto(a) => ("auto", json!(a)),
+        };
+        let select_fn = r#"function(mode, target) {
+            if (!this || this.tagName !== 'SELECT') {
+                return { ok: false, error: 'element is not a <select>' };
+            }
+            const opts = Array.from(this.options || []);
+            let idx = -1;
+            if (mode === 'index') {
+                const i = Number(target);
+                if (Number.isInteger(i) && i >= 0 && i < opts.length) idx = i;
+            } else if (mode === 'value') {
+                idx = opts.findIndex(o => o.value === String(target));
+            } else if (mode === 'label') {
+                idx = opts.findIndex(o => (o.textContent || '').trim() === String(target));
+            } else {
+                idx = opts.findIndex(o => o.value === String(target));
+                if (idx < 0) idx = opts.findIndex(o => (o.textContent || '').trim() === String(target));
+            }
+            if (idx < 0 || opts[idx].disabled) {
+                return { ok: false, error: 'option not found or disabled' };
+            }
+            this.selectedIndex = idx;
+            opts[idx].selected = true;
+            this.dispatchEvent(new Event('input', { bubbles: true }));
+            this.dispatchEvent(new Event('change', { bubbles: true }));
+            return { ok: true, value: opts[idx].value };
+        }"#;
+        let res = if let Some(bid) = backend_node_id {
+            self.call_function_on_node(bid, frame_id, select_fn, vec![json!(mode), val_arg])
+                .await?
+        } else if let Some(sel) = selector {
+            let target_json = serde_json::to_string(&val_arg)?;
+            self.call_sandbox_fn_in_frame(
+                r#"(sel, mode, targetJson) => {
+                    const el = document.querySelector(sel);
+                    if (!el || el.tagName !== 'SELECT') {
+                        return { ok: false, error: 'element is not a <select>' };
+                    }
+                    const target = JSON.parse(targetJson);
+                    const opts = Array.from(el.options || []);
+                    let idx = -1;
+                    if (mode === 'index') {
+                        const i = Number(target);
+                        if (Number.isInteger(i) && i >= 0 && i < opts.length) idx = i;
+                    } else if (mode === 'value') {
+                        idx = opts.findIndex(o => o.value === String(target));
+                    } else if (mode === 'label') {
+                        idx = opts.findIndex(o => (o.textContent || '').trim() === String(target));
+                    } else {
+                        idx = opts.findIndex(o => o.value === String(target));
+                        if (idx < 0) idx = opts.findIndex(o => (o.textContent || '').trim() === String(target));
+                    }
+                    if (idx < 0 || opts[idx].disabled) {
+                        return { ok: false, error: 'option not found or disabled' };
+                    }
+                    el.selectedIndex = idx;
+                    opts[idx].selected = true;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                    return { ok: true, value: opts[idx].value };
+                }"#,
+                vec![
+                    json!({ "type": "string", "value": sel }),
+                    json!({ "type": "string", "value": mode }),
+                    json!({ "type": "string", "value": target_json }),
+                ],
+                frame_id,
+            )
+            .await?
+        } else {
+            return Err(MimikyuError::InvalidConfig(
+                "select_option requires backend_node_id or selector".to_string(),
+            ));
+        };
+        if res["ok"].as_bool() == Some(true) {
+            return Ok(res["value"].as_str().unwrap_or_default().to_string());
+        }
+        Err(MimikyuError::ElementNotFound(
+            res["error"]
+                .as_str()
+                .unwrap_or("select_option failed")
+                .to_string(),
+        ))
+    }
+
+    async fn css_selector_for_node(
+        &self,
+        backend_node_id: i64,
+        frame_id: Option<&str>,
+    ) -> Result<Option<String>> {
+        let Ok(val) = self
+            .call_function_on_node(
+                backend_node_id,
+                frame_id,
+                r#"function() {
+                    if (!this || this.nodeType !== 1) return null;
+                    if (this.getRootNode && this.getRootNode() instanceof ShadowRoot) return null;
+                    if (this.ownerDocument !== document) return null;
+                    if (this.id) return '#' + CSS.escape(this.id);
+                    const parts = [];
+                    let cur = this;
+                    while (cur && cur.nodeType === 1 && cur !== document.documentElement) {
+                        let sel = cur.tagName.toLowerCase();
+                        if (cur.id) {
+                            parts.unshift('#' + CSS.escape(cur.id));
+                            break;
+                        }
+                        const parent = cur.parentElement;
+                        if (parent) {
+                            const sameTag = Array.from(parent.children).filter(c => c.tagName === cur.tagName);
+                            if (sameTag.length > 1) {
+                                sel += `:nth-of-type(${sameTag.indexOf(cur) + 1})`;
+                            }
+                        }
+                        parts.unshift(sel);
+                        cur = parent;
+                    }
+                    return parts.join(' > ');
+                }"#,
+                vec![],
+            )
+            .await
+        else {
+            return Ok(None);
+        };
+        Ok(val.as_str().map(ToString::to_string))
     }
 
     async fn focus_node(
@@ -1761,8 +2969,10 @@ impl DriverSession for BidiSession {
             let ok = self
                 .call_sandbox_fn(
                     r#"(bid) => {
-                        const m = globalThis.__mimikyuAxMap;
-                        const el = m ? m.get(bid) : null;
+                        const st = globalThis.__mimikyuAxState;
+                        const entry = st && st.idToEntry ? st.idToEntry.get(bid) : null;
+                        let el = entry && entry.ref ? entry.ref.deref() : null;
+                        if (!el && globalThis.__mimikyuAxMap) el = globalThis.__mimikyuAxMap.get(bid) || null;
                         if (!el) return false;
                         el.focus();
                         return true;
@@ -1786,11 +2996,12 @@ impl DriverSession for BidiSession {
     async fn set_file_input_files(
         &self,
         backend_node_id: Option<i64>,
+        frame_id: Option<&str>,
         selector: Option<&str>,
         files: Vec<PathBuf>,
     ) -> Result<()> {
-        let elem = self
-            .resolve_shared_element(backend_node_id, selector)
+        let (target_ctx, elem) = self
+            .resolve_shared_element_with_ctx(backend_node_id, frame_id, selector)
             .await?;
         let file_strs: Vec<String> = files
             .into_iter()
@@ -1800,7 +3011,7 @@ impl DriverSession for BidiSession {
             .send(
                 "input.setFiles",
                 json!({
-                    "context": self.ctx(),
+                    "context": target_ctx,
                     "element": elem,
                     "files": file_strs,
                 }),
@@ -1816,9 +3027,15 @@ impl DriverSession for BidiSession {
             MouseButton::Middle => 1,
             MouseButton::Right => 2,
         };
-        let x = ev.x.round() as i64;
-        let y = ev.y.round() as i64;
+        let x = (ev.x.round() as i64).max(0);
+        let y = (ev.y.round() as i64).max(0);
         let clicks = ev.click_count.max(1);
+
+        let pressed = *self.state.pressed_modifiers.lock();
+        let missing = ev.modifiers & !pressed;
+        if missing != 0 {
+            self.send_modifier_key_actions(missing, true).await?;
+        }
 
         let mut actions = Vec::new();
         match ev.event_type {
@@ -1842,7 +3059,8 @@ impl DriverSession for BidiSession {
             }
         }
 
-        self.conn
+        let res = self
+            .conn
             .send(
                 "input.performActions",
                 json!({
@@ -1855,22 +3073,84 @@ impl DriverSession for BidiSession {
                     }],
                 }),
             )
-            .await?;
+            .await;
+
+        if missing != 0 {
+            let _ = self.send_modifier_key_actions(missing, false).await;
+        }
+        res?;
         Ok(())
     }
 
     async fn dispatch_key(&self, ev: KeyEvent) -> Result<()> {
         self.ensure_alive()?;
         let val = map_webdriver_key(&ev.key);
-        let actions = match ev.event_type {
-            KeyEventType::Down => vec![json!({ "type": "keyDown", "value": val })],
-            KeyEventType::Up => vec![json!({ "type": "keyUp", "value": val })],
-            KeyEventType::Char => vec![
-                json!({ "type": "keyDown", "value": val }),
-                json!({ "type": "keyUp", "value": val }),
-            ],
+        let mod_bit = modifier_bit_for_key(&ev.key);
+        let pressed = *self.state.pressed_modifiers.lock();
+        let next_pressed = if mod_bit != 0 {
+            match ev.event_type {
+                KeyEventType::Down => pressed | mod_bit,
+                KeyEventType::Up => pressed & !mod_bit,
+                KeyEventType::Char => pressed,
+            }
+        } else {
+            pressed
         };
-        self.conn
+
+        let missing = ev.modifiers & !next_pressed;
+        let effective_mods = ev.modifiers | next_pressed;
+        let non_text_mod_active = (effective_mods & (MOD_ALT | MOD_CONTROL | MOD_META)) != 0;
+        let suppress_text_insert = non_text_mod_active
+            && mod_bit == 0
+            && ev.text.is_none()
+            && matches!(ev.event_type, KeyEventType::Char | KeyEventType::Down);
+
+        let mut actions = Vec::new();
+        if missing != 0 {
+            actions.extend(build_modifier_key_actions(missing, true));
+        }
+        match ev.event_type {
+            KeyEventType::Down => actions.push(json!({ "type": "keyDown", "value": val })),
+            KeyEventType::Up => actions.push(json!({ "type": "keyUp", "value": val })),
+            KeyEventType::Char => {
+                actions.push(json!({ "type": "keyDown", "value": val }));
+                actions.push(json!({ "type": "keyUp", "value": val }));
+            }
+        }
+        if missing != 0 {
+            actions.extend(build_modifier_key_actions(missing, false));
+        }
+
+        let guard_frames: Vec<String> = if suppress_text_insert {
+            let mut frames = self
+                .list_frames()
+                .await
+                .map(|fs| fs.into_iter().map(|f| f.frame_id).collect::<Vec<_>>())
+                .unwrap_or_default();
+            let root = self.ctx().to_string();
+            if !frames.iter().any(|f| f == &root) {
+                frames.insert(0, root);
+            }
+            let install_js = r#"(() => {
+                if (!globalThis.__mimikyuBeforeInputGuard) {
+                    globalThis.__mimikyuBeforeInputGuard = (e) => {
+                        if (e.inputType && e.inputType.startsWith('insert')) {
+                            e.preventDefault();
+                        }
+                    };
+                }
+                window.addEventListener('beforeinput', globalThis.__mimikyuBeforeInputGuard, true);
+            })()"#;
+            for fid in &frames {
+                let _ = self.eval_isolated_in_frame(install_js, Some(fid)).await;
+            }
+            frames
+        } else {
+            Vec::new()
+        };
+
+        let send_res = self
+            .conn
             .send(
                 "input.performActions",
                 json!({
@@ -1882,13 +3162,40 @@ impl DriverSession for BidiSession {
                     }],
                 }),
             )
-            .await?;
+            .await;
+
+        if suppress_text_insert {
+            let remove_js = r#"(() => {
+                if (globalThis.__mimikyuBeforeInputGuard) {
+                    window.removeEventListener('beforeinput', globalThis.__mimikyuBeforeInputGuard, true);
+                }
+            })()"#;
+            for fid in &guard_frames {
+                let _ = self.eval_isolated_in_frame(remove_js, Some(fid)).await;
+            }
+        }
+
+        send_res?;
+        if mod_bit != 0 {
+            let mut guard = self.state.pressed_modifiers.lock();
+            match ev.event_type {
+                KeyEventType::Down => *guard |= mod_bit,
+                KeyEventType::Up => *guard &= !mod_bit,
+                KeyEventType::Char => {}
+            }
+        }
         Ok(())
     }
 
     async fn dispatch_wheel(&self, ev: WheelEvent) -> Result<()> {
         self.ensure_alive()?;
-        self.conn
+        let pressed = *self.state.pressed_modifiers.lock();
+        let missing = ev.modifiers & !pressed;
+        if missing != 0 {
+            self.send_modifier_key_actions(missing, true).await?;
+        }
+        let res = self
+            .conn
             .send(
                 "input.performActions",
                 json!({
@@ -1898,15 +3205,19 @@ impl DriverSession for BidiSession {
                         "id": "mimikyu_wheel",
                         "actions": [{
                             "type": "scroll",
-                            "x": ev.x.round() as i64,
-                            "y": ev.y.round() as i64,
+                            "x": (ev.x.round() as i64).max(0),
+                            "y": (ev.y.round() as i64).max(0),
                             "deltaX": ev.delta_x.round() as i64,
                             "deltaY": ev.delta_y.round() as i64,
                         }],
                     }],
                 }),
             )
-            .await?;
+            .await;
+        if missing != 0 {
+            let _ = self.send_modifier_key_actions(missing, false).await;
+        }
+        res?;
         Ok(())
     }
 
@@ -1917,9 +3228,19 @@ impl DriverSession for BidiSession {
         }
         let mut actions = Vec::with_capacity(text.chars().count() * 2);
         for ch in text.chars() {
-            let s = ch.to_string();
+            if ch == '\r' {
+                continue;
+            }
+            let s = match ch {
+                '\n' => "\u{E007}".to_string(),
+                '\t' => "\u{E004}".to_string(),
+                other => other.to_string(),
+            };
             actions.push(json!({ "type": "keyDown", "value": s }));
             actions.push(json!({ "type": "keyUp", "value": s }));
+        }
+        if actions.is_empty() {
+            return Ok(());
         }
         self.conn
             .send(
@@ -1939,9 +3260,10 @@ impl DriverSession for BidiSession {
 
     async fn screenshot(&self, opts: ScreenshotOpts) -> Result<Vec<u8>> {
         self.ensure_alive()?;
+        let use_document_origin = opts.full_page || opts.clip.is_some();
         let mut params = json!({
             "context": self.ctx(),
-            "origin": if opts.full_page { "document" } else { "viewport" },
+            "origin": if use_document_origin { "document" } else { "viewport" },
         });
         params["format"] = match opts.format {
             ScreenshotFormat::Png => json!({ "type": "image/png" }),
@@ -1950,11 +3272,19 @@ impl DriverSession for BidiSession {
                 json!({ "type": "image/jpeg", "quality": q })
             }
         };
-        if let Some(clip) = opts.clip {
+        if let Some(clip) = opts.clip
+            && !opts.full_page
+        {
+            let scroll = self
+                .eval_isolated("({ sx: window.scrollX || 0, sy: window.scrollY || 0 })")
+                .await
+                .unwrap_or(Value::Null);
+            let sx = scroll["sx"].as_f64().unwrap_or(0.0);
+            let sy = scroll["sy"].as_f64().unwrap_or(0.0);
             params["clip"] = json!({
                 "type": "box",
-                "x": clip.x,
-                "y": clip.y,
+                "x": (clip.x + sx).max(0.0),
+                "y": (clip.y + sy).max(0.0),
                 "width": clip.width,
                 "height": clip.height,
             });
@@ -2004,27 +3334,58 @@ impl DriverSession for BidiSession {
     }
 
     async fn set_instant_animations(&self, enabled: bool) -> Result<()> {
-        self.call_sandbox_fn(
-            r#"(enabled) => {
-                const id = '__mimikyu_instant_anim';
-                let st = document.getElementById(id);
-                if (enabled) {
-                    if (!st && document.head) {
-                        st = document.createElement('style');
-                        st.id = id;
-                        st.textContent = '*, *::before, *::after { transition-duration: 0s !important; animation-duration: 0s !important; animation-delay: 0s !important; }';
-                        document.head.appendChild(st);
-                    }
-                    for (const anim of document.getAnimations()) {
-                        try { anim.finish(); } catch {}
-                    }
-                } else if (st) {
-                    st.remove();
+        self.ensure_alive()?;
+        self.state
+            .instant_animations
+            .store(enabled, Ordering::SeqCst);
+
+        {
+            let mut guard = self.state.anim_script_id.lock().await;
+            if let Some(old_id) = guard.take() {
+                let _ = self
+                    .conn
+                    .send("script.removePreloadScript", json!({ "script": old_id }))
+                    .await;
+            }
+            if enabled {
+                let fn_decl = format!(
+                    "() => {{\n{}\n}}",
+                    BIDI_INSTANT_ANIM_ENABLE_SCRIPT
+                );
+                if let Ok(res) = self
+                    .conn
+                    .send(
+                        "script.addPreloadScript",
+                        json!({
+                            "functionDeclaration": fn_decl,
+                            "contexts": [self.ctx()],
+                            "sandbox": ISOLATED_SANDBOX,
+                        }),
+                    )
+                    .await
+                    && let Some(sid) = res["script"].as_str()
+                {
+                    *guard = Some(sid.to_string());
                 }
-            }"#,
-            vec![json!({ "type": "boolean", "value": enabled })],
-        )
-        .await?;
+            }
+        }
+
+        let frames = self.list_frames().await.unwrap_or_default();
+        let target_frames: Vec<Option<String>> = if frames.is_empty() {
+            vec![None]
+        } else {
+            frames.into_iter().map(|f| Some(f.frame_id)).collect()
+        };
+        let fn_decl = if enabled {
+            format!("() => {{\n{}\n}}", BIDI_INSTANT_ANIM_ENABLE_SCRIPT)
+        } else {
+            BIDI_INSTANT_ANIM_DISABLE_FN.to_string()
+        };
+        for fid in target_frames {
+            let _ = self
+                .call_sandbox_fn_in_frame(&fn_decl, vec![], fid.as_deref())
+                .await;
+        }
         Ok(())
     }
 
@@ -2431,6 +3792,11 @@ impl DriverSession for BidiSession {
         Ok(self.state.telemetry.inflight_count())
     }
 
+    async fn inflight_activity(&self, ignore_long_lived: bool) -> Result<(usize, u64)> {
+        self.ensure_alive()?;
+        Ok(self.state.telemetry.inflight_stats(ignore_long_lived))
+    }
+
     async fn document_ready_state(&self) -> Result<String> {
         let val = self.eval_isolated("document.readyState").await?;
         Ok(val.as_str().unwrap_or("loading").to_string())
@@ -2458,10 +3824,9 @@ impl DriverSession for BidiSession {
                 }
             });
             if !removed_cids.is_empty() {
-                let mut parents = self.conn.context_parents.write();
-                parents.retain(|cid, parent| {
-                    !removed_cids.contains(cid) && !removed_cids.contains(parent)
-                });
+                for cid in &removed_cids {
+                    self.conn.cleanup_destroyed_context(cid);
+                }
             }
             self.conn.isolated_contexts.write().remove(uc);
             self.conn
@@ -2533,6 +3898,50 @@ fn btree_to_bidi_headers(headers: &BTreeMap<String, String>) -> Vec<Value> {
         .collect()
 }
 
+fn parse_bidi_walker_result(
+    val: Value,
+    owner_ctx: &str,
+    inline_owners: &mut HashMap<String, String>,
+) -> Vec<AxNode> {
+    let mut win_map: HashMap<String, String> = HashMap::new();
+    if let Some(wins) = val.get("iframeWins").and_then(|v| v.as_array()) {
+        for pair in wins {
+            if let Some(arr) = pair.as_array()
+                && arr.len() == 2
+                && let (Some(sub_fid), Some(ctx)) =
+                    (arr[0].as_str(), arr[1].get("context").and_then(|c| c.as_str()))
+            {
+                win_map.insert(sub_fid.to_string(), ctx.to_string());
+                inline_owners.insert(ctx.to_string(), owner_ctx.to_string());
+            }
+        }
+    }
+    let arr = val
+        .get("nodes")
+        .and_then(|v| v.as_array())
+        .or_else(|| val.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        if let Ok(mut node) = serde_json::from_value::<AxNode>(item) {
+            match node.frame_id.as_deref() {
+                Some(fid) if fid.starts_with("iframe:") => {
+                    if let Some(real_ctx) = win_map.get(fid) {
+                        node.frame_id = Some(real_ctx.clone());
+                    }
+                }
+                None => {
+                    node.frame_id = Some(owner_ctx.to_string());
+                }
+                _ => {}
+            }
+            out.push(node);
+        }
+    }
+    out
+}
+
 fn parse_bidi_script_result(res: &Value) -> Result<Value> {
     if res.get("type").and_then(|v| v.as_str()) == Some("exception") {
         let text = res["exceptionDetails"]["text"]
@@ -2601,6 +4010,17 @@ fn bidi_remote_value_to_json(val: &Value) -> Value {
     }
 }
 
+fn is_bidi_sse_response(
+    mime_type: Option<&str>,
+    response_headers: &BTreeMap<String, String>,
+) -> bool {
+    mime_type.is_some_and(|m| m.to_ascii_lowercase().contains("text/event-stream"))
+        || response_headers.iter().any(|(k, v)| {
+            k.eq_ignore_ascii_case("content-type")
+                && v.to_ascii_lowercase().contains("text/event-stream")
+        })
+}
+
 fn bidi_headers_to_btree(val: Option<&Value>) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     if let Some(arr) = val.and_then(|v| v.as_array()) {
@@ -2661,6 +4081,110 @@ fn map_webdriver_key(key: &str) -> String {
     }
 }
 
+const BIDI_INSTANT_ANIM_ENABLE_SCRIPT: &str = r#"
+const css = '*, *::before, *::after { transition-duration: 0s !important; transition-delay: 0s !important; animation-duration: 0s !important; animation-delay: 0s !important; animation-iteration-count: 1 !important; scroll-behavior: auto !important; }';
+const apply = () => {
+    try {
+        if (document.adoptedStyleSheets && typeof window.CSSStyleSheet === 'function') {
+            if (!globalThis.__mimikyuAnimSheet) {
+                const sheet = new window.CSSStyleSheet();
+                sheet.replaceSync(css);
+                globalThis.__mimikyuAnimSheet = sheet;
+            }
+            const cur = Array.from(document.adoptedStyleSheets);
+            if (!cur.includes(globalThis.__mimikyuAnimSheet)) {
+                document.adoptedStyleSheets = [...cur, globalThis.__mimikyuAnimSheet];
+            }
+            return;
+        }
+    } catch {}
+    const host = document.head || document.documentElement;
+    if (host) {
+        if (!globalThis.__mimikyuAnimEl || !globalThis.__mimikyuAnimEl.isConnected) {
+            const st = document.createElement('style');
+            st.textContent = css;
+            host.appendChild(st);
+            globalThis.__mimikyuAnimEl = st;
+        }
+    }
+};
+if (document.documentElement) apply();
+else document.addEventListener('DOMContentLoaded', apply, { once: true });
+try {
+    for (const anim of document.getAnimations()) {
+        const t = anim.effect && anim.effect.getComputedTiming ? anim.effect.getComputedTiming() : null;
+        if (!t || Number.isFinite(t.iterations)) {
+            try { anim.finish(); } catch {}
+        }
+    }
+} catch {}
+"#;
+
+const BIDI_INSTANT_ANIM_DISABLE_FN: &str = r#"() => {
+    try {
+        if (globalThis.__mimikyuAnimSheet && document.adoptedStyleSheets) {
+            document.adoptedStyleSheets = Array.from(document.adoptedStyleSheets).filter(s => s !== globalThis.__mimikyuAnimSheet);
+            globalThis.__mimikyuAnimSheet = null;
+        }
+    } catch {}
+    if (globalThis.__mimikyuAnimEl) {
+        try { globalThis.__mimikyuAnimEl.remove(); } catch {}
+        globalThis.__mimikyuAnimEl = null;
+    }
+}"#;
+
+fn collect_bidi_frames(ctx_node: &Value, parent_id: Option<&str>, out: &mut Vec<FrameInfo>) {
+    let Some(cid) = ctx_node["context"].as_str() else {
+        return;
+    };
+    let url = ctx_node["url"].as_str().unwrap_or_default().to_string();
+    out.push(FrameInfo {
+        frame_id: cid.to_string(),
+        parent_frame_id: parent_id.map(ToString::to_string),
+        name: None,
+        url,
+        is_main: parent_id.is_none(),
+    });
+    if let Some(children) = ctx_node["children"].as_array() {
+        for child in children {
+            collect_bidi_frames(child, Some(cid), out);
+        }
+    }
+}
+
+fn modifier_bit_for_key(key: &str) -> u32 {
+    match key {
+        "Alt" => MOD_ALT,
+        "Control" => MOD_CONTROL,
+        "Meta" => MOD_META,
+        "Shift" => MOD_SHIFT,
+        _ => 0,
+    }
+}
+
+fn build_modifier_key_actions(mask: u32, down: bool) -> Vec<Value> {
+    let mut mods = Vec::new();
+    if mask & MOD_CONTROL != 0 {
+        mods.push("\u{E009}");
+    }
+    if mask & MOD_ALT != 0 {
+        mods.push("\u{E00A}");
+    }
+    if mask & MOD_SHIFT != 0 {
+        mods.push("\u{E008}");
+    }
+    if mask & MOD_META != 0 {
+        mods.push("\u{E03D}");
+    }
+    if !down {
+        mods.reverse();
+    }
+    let kind = if down { "keyDown" } else { "keyUp" };
+    mods.into_iter()
+        .map(|val| json!({ "type": kind, "value": val }))
+        .collect()
+}
+
 fn normalize_bidi_same_site(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
         "strict" => Some("strict"),
@@ -2703,5 +4227,38 @@ mod tests {
         assert_eq!(map_webdriver_key("Meta"), "\u{E03D}");
         assert_eq!(map_webdriver_key("a"), "a");
         assert_eq!(map_webdriver_key("é"), "é");
+    }
+
+    #[test]
+    fn frame_transform_composes_nested_scale_and_offset() {
+        // Outer iframe content origin at (20, 10) with scale (2.0, 2.0)
+        let outer = FrameTransform {
+            ox: 20.0,
+            oy: 10.0,
+            sx: 2.0,
+            sy: 2.0,
+        };
+        // Inner iframe content origin at (39, 15) inside outer, with scale (1.5, 1.5)
+        let inner = FrameTransform {
+            ox: 39.0,
+            oy: 15.0,
+            sx: 1.5,
+            sy: 1.5,
+        };
+        let total = outer.compose_inner(inner.compose_inner(FrameTransform::identity()));
+        let mut bbox = BoundingBox {
+            x: 10.0,
+            y: 4.0,
+            width: 50.0,
+            height: 20.0,
+        };
+        total.apply(&mut bbox);
+        // Expected x = 20 + (39 + 10 * 1.5) * 2 = 128
+        // Expected y = 10 + (15 + 4 * 1.5) * 2 = 52
+        // Expected w = 50 * 1.5 * 2 = 150, h = 20 * 1.5 * 2 = 60
+        assert!((bbox.x - 128.0).abs() < 1e-6);
+        assert!((bbox.y - 52.0).abs() < 1e-6);
+        assert!((bbox.width - 150.0).abs() < 1e-6);
+        assert!((bbox.height - 60.0).abs() < 1e-6);
     }
 }

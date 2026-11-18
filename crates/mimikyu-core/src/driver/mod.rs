@@ -252,6 +252,46 @@ pub struct ContextOptions {
     pub telemetry_capacity: Option<usize>,
 }
 
+pub const MOD_ALT: u32 = 1;
+pub const MOD_CONTROL: u32 = 2;
+pub const MOD_META: u32 = 4;
+pub const MOD_SHIFT: u32 = 8;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EvalOptions {
+    pub main_world: bool,
+    pub frame_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FrameInfo {
+    pub frame_id: String,
+    pub parent_frame_id: Option<String>,
+    pub name: Option<String>,
+    pub url: String,
+    pub is_main: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowMatch {
+    pub backend_node_id: Option<i64>,
+    pub frame_id: Option<String>,
+    pub tag_name: String,
+    pub text: String,
+    pub html: Option<String>,
+    pub attributes: BTreeMap<String, String>,
+    pub bounds: Option<BoundingBox>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "by", content = "value", rename_all = "snake_case")]
+pub enum SelectBy {
+    Value(String),
+    Label(String),
+    Index(usize),
+    Auto(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DriverCapabilities {
     pub engine: EngineKind,
@@ -260,6 +300,7 @@ pub struct DriverCapabilities {
     pub supports_per_context_proxy: bool,
     pub supports_native_ax_tree: bool,
     pub supports_isolated_world: bool,
+    pub supports_closed_shadow_dom: bool,
     pub supports_pdf: bool,
     pub supports_network_intercept: bool,
 }
@@ -405,6 +446,12 @@ pub struct ScreenshotOpts {
     pub full_page: bool,
     pub clip: Option<BoundingBox>,
     pub omit_background: bool,
+    #[serde(default)]
+    pub scale: Option<f64>,
+    #[serde(default)]
+    pub max_width: Option<u32>,
+    #[serde(default)]
+    pub max_height: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -517,6 +564,31 @@ pub trait DriverSession: Send + Sync {
     // Execution (isolated by default; main-world opt-in)
     async fn eval_isolated(&self, expr: &str) -> Result<Value>;
     async fn eval_main_world(&self, expr: &str) -> Result<Value>;
+    async fn list_frames(&self) -> Result<Vec<FrameInfo>>;
+    async fn eval_isolated_in_frame(&self, expr: &str, frame_id: Option<&str>) -> Result<Value>;
+    async fn eval_main_world_in_frame(&self, expr: &str, frame_id: Option<&str>) -> Result<Value>;
+    async fn eval_with_options(&self, expr: &str, opts: &EvalOptions) -> Result<Value> {
+        if opts.main_world {
+            self.eval_main_world_in_frame(expr, opts.frame_id.as_deref())
+                .await
+        } else {
+            self.eval_isolated_in_frame(expr, opts.frame_id.as_deref())
+                .await
+        }
+    }
+    async fn call_function_on_node(
+        &self,
+        backend_node_id: i64,
+        frame_id: Option<&str>,
+        function_declaration: &str,
+        args: Vec<Value>,
+    ) -> Result<Value>;
+    async fn query_shadow(
+        &self,
+        selector_chain: &[String],
+        frame_id: Option<&str>,
+    ) -> Result<Vec<ShadowMatch>>;
+    async fn closed_shadow_hosts(&self, frame_id: Option<&str>) -> Result<Vec<i64>>;
     async fn add_init_script(&self, script: &str) -> Result<String>;
     async fn remove_init_script(&self, script_id: &str) -> Result<()>;
 
@@ -528,14 +600,40 @@ pub trait DriverSession: Send + Sync {
         frame_id: Option<&str>,
     ) -> Result<BoundingBox>;
     async fn resolve_selector_box(&self, selector: &str) -> Result<BoundingBox>;
+    async fn viewport_size(&self) -> Result<(f64, f64)>;
+    async fn scroll_into_view(
+        &self,
+        backend_node_id: Option<i64>,
+        frame_id: Option<&str>,
+        selector: Option<&str>,
+    ) -> Result<()>;
+    async fn clear_node_value(
+        &self,
+        backend_node_id: Option<i64>,
+        frame_id: Option<&str>,
+        selector: Option<&str>,
+    ) -> Result<()>;
+    async fn select_option(
+        &self,
+        backend_node_id: Option<i64>,
+        frame_id: Option<&str>,
+        selector: Option<&str>,
+        by: SelectBy,
+    ) -> Result<String>;
     async fn focus_node(&self, backend_node_id: Option<i64>, selector: Option<&str>)
         -> Result<()>;
     async fn set_file_input_files(
         &self,
         backend_node_id: Option<i64>,
+        frame_id: Option<&str>,
         selector: Option<&str>,
         files: Vec<PathBuf>,
     ) -> Result<()>;
+    async fn css_selector_for_node(
+        &self,
+        backend_node_id: i64,
+        frame_id: Option<&str>,
+    ) -> Result<Option<String>>;
 
     // Chokepoint Input Primitives
     async fn dispatch_mouse(&self, ev: MouseEvent) -> Result<()>;
@@ -574,6 +672,7 @@ pub trait DriverSession: Send + Sync {
     async fn drain_network_events(&self) -> Result<Vec<NetworkEvent>>;
     async fn clear_telemetry(&self) -> Result<()>;
     async fn inflight_requests(&self) -> Result<usize>;
+    async fn inflight_activity(&self, ignore_long_lived: bool) -> Result<(usize, u64)>;
     async fn document_ready_state(&self) -> Result<String>;
 
     // Lifecycle
