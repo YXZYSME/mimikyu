@@ -370,8 +370,12 @@ impl DaemonServer {
                     }
                 }
                 _ = idle_tick.tick() => {
-                    if pool.is_idle_expired() {
-                        tracing::info!("daemon idle timeout reached");
+                    if pool.is_idle_expired()
+                        || !self.paths.state_dir.exists()
+                        || fs::symlink_metadata(&self.paths.bound_sock).is_err()
+                        || fs::symlink_metadata(&self.paths.sock_link).is_err()
+                    {
+                        tracing::info!("daemon idle timeout or state_dir/socket removed; shutting down");
                         pool.request_shutdown();
                         break;
                     }

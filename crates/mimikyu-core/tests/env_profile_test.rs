@@ -178,6 +178,18 @@ async fn assert_cross_frame_and_worker_consistency(engine: EngineKind) {
         probe["webglRenderer"],
         profile.webgl_renderer.as_deref().unwrap()
     );
+    assert!(
+        probe["glVendor"].as_str().is_some_and(|s| !s.trim().is_empty()),
+        "{engine}: gl.getParameter(gl.VENDOR) must be non-empty: {probe:?}"
+    );
+    assert!(
+        probe["glRenderer"].as_str().is_some_and(|s| !s.trim().is_empty()),
+        "{engine}: gl.getParameter(gl.RENDERER) must be non-empty: {probe:?}"
+    );
+    assert!(
+        probe["glVersion"].as_str().is_some_and(|s| !s.trim().is_empty()),
+        "{engine}: gl.getParameter(gl.VERSION) must be non-empty: {probe:?}"
+    );
     if engine == EngineKind::Chromium {
         assert_eq!(probe["deviceMemory"], 8);
         assert_eq!(probe["userAgentData"]["platform"], "Linux");

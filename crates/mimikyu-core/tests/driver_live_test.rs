@@ -742,3 +742,185 @@ async fn live_chromium_cdp_integration() {
 async fn live_firefox_bidi_integration() {
     exercise_engine_full(EngineKind::Firefox).await;
 }
+
+async fn wait_for_download_file(path: &std::path::Path, expected_len: usize) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+    loop {
+        if let Ok(bytes) = std::fs::read(path)
+            && bytes.len() == expected_len
+        {
+            return bytes;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for downloaded file {} ({expected_len} bytes)",
+            path.display()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn live_chromium_download_behavior_ephemeral_and_virtual() {
+    let server = TestServer::start().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dl_ephem = tmp.path().join("ephem-dl");
+    let dl_ctx = tmp.path().join("ctx-dl");
+    let expected_payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+
+    let driver = driver_for(EngineKind::Chromium);
+    let session = driver
+        .launch(LaunchOptions {
+            engine: EngineKind::Chromium,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            download_dir: Some(dl_ephem.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("launch chromium with download_dir");
+    let pid = session.info().pid.expect("pid");
+
+    session
+        .navigate(&server.url("/download-page"))
+        .await
+        .expect("navigate /download-page");
+    let link_box = session
+        .resolve_selector_box("#dl-bin")
+        .await
+        .expect("resolve #dl-bin");
+    let (lx, ly) = link_box.center();
+    session
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: lx,
+            y: ly,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #dl-bin");
+
+    let ephem_file = dl_ephem.join("sample-rust-test.bin");
+    let got_ephem = wait_for_download_file(&ephem_file, expected_payload.len()).await;
+    assert_eq!(got_ephem, expected_payload);
+    assert!(
+        server
+            .hits()
+            .iter()
+            .any(|h| h.contains("/download/sample-rust-test.bin")),
+        "expected /download/sample-rust-test.bin server hit"
+    );
+
+    // Virtual context download isolation into dl_ctx (not dl_ephem)
+    let ctx = session
+        .new_context(ContextOptions {
+            download_dir: Some(dl_ctx.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("new_context with download_dir");
+    ctx.navigate(&server.url("/download-page"))
+        .await
+        .expect("ctx navigate /download-page");
+    let ctx_box = ctx
+        .resolve_selector_box("#dl-bin")
+        .await
+        .expect("ctx resolve #dl-bin");
+    let (cx, cy) = ctx_box.center();
+    ctx.dispatch_mouse(MouseEvent {
+        event_type: MouseEventType::Click,
+        x: cx,
+        y: cy,
+        button: MouseButton::Left,
+        click_count: 1,
+        modifiers: 0,
+    })
+    .await
+    .expect("ctx click #dl-bin");
+
+    let ctx_file = dl_ctx.join("sample-rust-test.bin");
+    let got_ctx = wait_for_download_file(&ctx_file, expected_payload.len()).await;
+    assert_eq!(got_ctx, expected_payload);
+    assert!(
+        !dl_ephem.join("sample-rust-test.bin (1)").exists(),
+        "virtual context must not download into root ephemeral dir"
+    );
+
+    if let Some(home_dl) = dirs::download_dir() {
+        assert!(
+            !home_dl.join("sample-rust-test.bin").exists(),
+            "must not write into user Downloads directory"
+        );
+    }
+
+    ctx.dispose().await.expect("dispose ctx");
+    session.dispose().await.expect("dispose session");
+    let rc = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
+    assert_eq!(rc, -1, "browser process group should be gone after dispose");
+}
+
+#[tokio::test]
+async fn live_firefox_download_isolation_ephemeral() {
+    let server = TestServer::start().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dl_ff = tmp.path().join("ff-dl");
+    let expected_payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+
+    let driver = driver_for(EngineKind::Firefox);
+    let session = driver
+        .launch(LaunchOptions {
+            engine: EngineKind::Firefox,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            download_dir: Some(dl_ff.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("launch firefox with download_dir");
+    let pid = session.info().pid.expect("pid");
+
+    session
+        .navigate(&server.url("/download-page"))
+        .await
+        .expect("navigate /download-page");
+    let link_box = session
+        .resolve_selector_box("#dl-bin")
+        .await
+        .expect("resolve #dl-bin");
+    let (lx, ly) = link_box.center();
+    session
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: lx,
+            y: ly,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #dl-bin");
+
+    let ff_file = dl_ff.join("sample-rust-test.bin");
+    let got_ff = wait_for_download_file(&ff_file, expected_payload.len()).await;
+    assert_eq!(got_ff, expected_payload);
+    assert!(
+        server
+            .hits()
+            .iter()
+            .any(|h| h.contains("/download/sample-rust-test.bin")),
+        "expected /download/sample-rust-test.bin server hit"
+    );
+
+    if let Some(home_dl) = dirs::download_dir() {
+        assert!(
+            !home_dl.join("sample-rust-test.bin").exists(),
+            "Firefox must not write into user Downloads directory"
+        );
+    }
+
+    session.dispose().await.expect("dispose firefox session");
+    let rc = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
+    assert_eq!(rc, -1, "firefox process group should be gone after dispose");
+}

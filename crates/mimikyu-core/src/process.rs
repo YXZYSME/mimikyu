@@ -470,15 +470,16 @@ pub fn build_chromium_args(
         if !env.locale.is_empty() {
             args.push(format!("--lang={}", env.locale));
         }
-        match env.webrtc_policy {
-            WebRtcPolicy::Default => {}
-            WebRtcPolicy::DisableNonProxiedUdp => {
-                args.push("--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string());
-            }
-            WebRtcPolicy::DisableAll => {
-                args.push("--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string());
-                args.push("--enforce-webrtc-ip-permission-check".to_string());
-            }
+    }
+
+    match effective_webrtc_policy(opts) {
+        WebRtcPolicy::Default => {}
+        WebRtcPolicy::DisableNonProxiedUdp => {
+            args.push("--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string());
+        }
+        WebRtcPolicy::DisableAll => {
+            args.push("--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string());
+            args.push("--enforce-webrtc-ip-permission-check".to_string());
         }
     }
 
@@ -496,6 +497,16 @@ pub fn build_chromium_args(
     }
 
     args
+}
+
+fn effective_webrtc_policy(opts: &LaunchOptions) -> WebRtcPolicy {
+    match opts.env_profile.as_ref().map(|e| e.webrtc_policy) {
+        Some(policy) => policy,
+        None if opts.profile_mode == ProfileMode::VirtualContext || opts.proxy.is_some() => {
+            WebRtcPolicy::DisableNonProxiedUdp
+        }
+        None => WebRtcPolicy::Default,
+    }
 }
 
 fn apply_firefox_crashreporter_env(cmd: &mut Command) {
@@ -778,16 +789,17 @@ pub fn write_firefox_user_js(profile_dir: &Path, opts: &LaunchOptions) -> Result
                 serde_json::to_string(&env.locale)?
             ));
         }
-        match env.webrtc_policy {
-            WebRtcPolicy::Default => {}
-            WebRtcPolicy::DisableNonProxiedUdp => {
-                prefs.push_str("user_pref(\"media.peerconnection.ice.default_address_only\", true);\n");
-                prefs.push_str("user_pref(\"media.peerconnection.ice.no_host\", true);\n");
-                prefs.push_str("user_pref(\"media.peerconnection.ice.proxy_only_if_behind_proxy\", true);\n");
-            }
-            WebRtcPolicy::DisableAll => {
-                prefs.push_str("user_pref(\"media.peerconnection.enabled\", false);\n");
-            }
+    }
+
+    match effective_webrtc_policy(opts) {
+        WebRtcPolicy::Default => {}
+        WebRtcPolicy::DisableNonProxiedUdp => {
+            prefs.push_str("user_pref(\"media.peerconnection.ice.default_address_only\", true);\n");
+            prefs.push_str("user_pref(\"media.peerconnection.ice.no_host\", true);\n");
+            prefs.push_str("user_pref(\"media.peerconnection.ice.proxy_only_if_behind_proxy\", true);\n");
+        }
+        WebRtcPolicy::DisableAll => {
+            prefs.push_str("user_pref(\"media.peerconnection.enabled\", false);\n");
         }
     }
 
@@ -798,6 +810,30 @@ pub fn write_firefox_user_js(profile_dir: &Path, opts: &LaunchOptions) -> Result
     } else if opts.proxy.is_none() && opts.profile_mode != ProfileMode::VirtualContext {
         prefs.push_str("user_pref(\"network.proxy.type\", 0);\n");
     }
+
+    let dl_dir = opts
+        .download_dir
+        .clone()
+        .unwrap_or_else(|| profile_dir.join("downloads"));
+    fs::create_dir_all(&dl_dir)?;
+    let abs_dl_dir = fs::canonicalize(&dl_dir).or_else(|_| {
+        if dl_dir.is_absolute() {
+            Ok(dl_dir.clone())
+        } else {
+            std::env::current_dir().map(|cwd| cwd.join(&dl_dir))
+        }
+    })?;
+    prefs.push_str("user_pref(\"browser.download.folderList\", 2);\n");
+    prefs.push_str(&format!(
+        "user_pref(\"browser.download.dir\", {});\n",
+        serde_json::to_string(abs_dl_dir.to_string_lossy().as_ref())?
+    ));
+    prefs.push_str("user_pref(\"browser.download.useDownloadDir\", true);\n");
+    prefs.push_str("user_pref(\"browser.download.alwaysOpenPanel\", false);\n");
+    prefs.push_str("user_pref(\"browser.download.manager.showWhenStarting\", false);\n");
+    prefs.push_str(
+        "user_pref(\"browser.helperApps.neverAsk.saveToDisk\", \"application/octet-stream,text/plain,application/pdf,application/zip,application/json,text/csv\");\n",
+    );
 
     let extra: &BTreeMap<String, Value> = &opts.extra_prefs;
     for (k, v) in extra {
@@ -1200,6 +1236,123 @@ mod tests {
                 "expected {var} to be explicitly removed"
             );
         }
+    }
+
+    #[test]
+    fn virtual_context_and_proxy_without_env_profile_default_to_disable_non_proxied_udp() {
+        let hs = DiscoveredBrowser {
+            engine: EngineKind::Chromium,
+            kind: ChromiumFlavor::HeadlessShell,
+            path: PathBuf::from("/tmp/chrome-headless-shell"),
+            version: "143.0".to_string(),
+            source: DiscoverySource::PlaywrightCache,
+            supports_headed: false,
+            supports_headless: true,
+        };
+
+        // 1. VirtualContext with env_profile: None enables disable_non_proxied_udp without leaking --lang or --no-proxy-server
+        let opts_virtual = LaunchOptions {
+            engine: EngineKind::Chromium,
+            profile_mode: ProfileMode::VirtualContext,
+            env_profile: None,
+            proxy: None,
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_webrtc_policy(&opts_virtual),
+            WebRtcPolicy::DisableNonProxiedUdp
+        );
+        let args_virtual = build_chromium_args(&hs, &opts_virtual, Path::new("/tmp/prof"));
+        assert!(
+            args_virtual.contains(&"--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string()),
+            "expected disable_non_proxied_udp flag for VirtualContext: {args_virtual:?}"
+        );
+        assert!(!args_virtual.contains(&"--enforce-webrtc-ip-permission-check".to_string()));
+        assert!(!args_virtual.iter().any(|a| a.starts_with("--lang=")));
+        assert!(!args_virtual.contains(&"--no-proxy-server".to_string()));
+
+        // 2. EphemeralDir with proxy and env_profile: None also defaults to DisableNonProxiedUdp
+        let opts_proxied = LaunchOptions {
+            engine: EngineKind::Chromium,
+            profile_mode: ProfileMode::EphemeralDir,
+            env_profile: None,
+            proxy: Some(crate::driver::ProxyConfig {
+                server: "http://127.0.0.1:8080".to_string(),
+                username: None,
+                password: None,
+                bypass: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_webrtc_policy(&opts_proxied),
+            WebRtcPolicy::DisableNonProxiedUdp
+        );
+        let args_proxied = build_chromium_args(&hs, &opts_proxied, Path::new("/tmp/prof"));
+        assert!(args_proxied
+            .contains(&"--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string()));
+
+        // 3. EphemeralDir with no proxy and env_profile: None stays Default
+        let opts_plain = LaunchOptions {
+            engine: EngineKind::Chromium,
+            profile_mode: ProfileMode::EphemeralDir,
+            env_profile: None,
+            proxy: None,
+            ..Default::default()
+        };
+        assert_eq!(effective_webrtc_policy(&opts_plain), WebRtcPolicy::Default);
+        let args_plain = build_chromium_args(&hs, &opts_plain, Path::new("/tmp/prof"));
+        assert!(!args_plain
+            .iter()
+            .any(|a| a.starts_with("--force-webrtc-ip-handling-policy")));
+
+        // 4. Firefox VirtualContext with env_profile: None writes ICE no-host prefs without disabling RTCPeerConnection or UA/locale
+        let dir = tempfile::tempdir().unwrap();
+        let ff_virtual = LaunchOptions {
+            engine: EngineKind::Firefox,
+            profile_mode: ProfileMode::VirtualContext,
+            env_profile: None,
+            proxy: None,
+            ..Default::default()
+        };
+        write_firefox_user_js(dir.path(), &ff_virtual).unwrap();
+        let ff_content = fs::read_to_string(dir.path().join("user.js")).unwrap();
+        assert!(ff_content.contains("user_pref(\"media.peerconnection.ice.default_address_only\", true);"));
+        assert!(ff_content.contains("user_pref(\"media.peerconnection.ice.no_host\", true);"));
+        assert!(ff_content.contains("user_pref(\"media.peerconnection.ice.proxy_only_if_behind_proxy\", true);"));
+        assert!(!ff_content.contains("media.peerconnection.enabled"));
+        assert!(!ff_content.contains("general.useragent.override"));
+        assert!(!ff_content.contains("intl.accept_languages"));
+        assert!(!ff_content.contains("network.proxy.type"));
+        assert!(ff_content.contains("user_pref(\"browser.download.folderList\", 2);"));
+        assert!(ff_content.contains("user_pref(\"browser.download.useDownloadDir\", true);"));
+        assert!(ff_content.contains("user_pref(\"browser.download.alwaysOpenPanel\", false);"));
+        assert!(ff_content.contains("user_pref(\"browser.download.manager.showWhenStarting\", false);"));
+        assert!(ff_content.contains("user_pref(\"browser.helperApps.neverAsk.saveToDisk\","));
+        assert!(dir.path().join("downloads").is_dir());
+    }
+
+    #[test]
+    fn write_firefox_user_js_uses_explicit_download_dir_and_escapes_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prof_dir = tmp.path().join("profile");
+        fs::create_dir_all(&prof_dir).unwrap();
+        let custom_dl = tmp.path().join("dl\"quote'dir");
+        let opts = LaunchOptions {
+            engine: EngineKind::Firefox,
+            profile_mode: ProfileMode::EphemeralDir,
+            download_dir: Some(custom_dl.clone()),
+            ..Default::default()
+        };
+        write_firefox_user_js(&prof_dir, &opts).unwrap();
+        assert!(custom_dl.is_dir());
+        let expected_abs = fs::canonicalize(&custom_dl).unwrap();
+        let expected_json = serde_json::to_string(expected_abs.to_string_lossy().as_ref()).unwrap();
+        let content = fs::read_to_string(prof_dir.join("user.js")).unwrap();
+        assert!(
+            content.contains(&format!("user_pref(\"browser.download.dir\", {expected_json});")),
+            "expected escaped download.dir {expected_json} in:\n{content}"
+        );
     }
 }
 

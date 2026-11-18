@@ -300,6 +300,31 @@ pub fn target_click_point(bbox: BoundingBox, vp_w: f64, vp_h: f64) -> (f64, f64)
     clamp_point_to_viewport(raw_x, raw_y, vp_w, vp_h)
 }
 
+pub(crate) fn resolve_safe_click_point(
+    bbox: BoundingBox,
+    vp_w: f64,
+    vp_h: f64,
+    gutter_r: f64,
+    gutter_b: f64,
+) -> Result<(f64, f64)> {
+    let safe_w = (vp_w - gutter_r.max(0.0)).max(1.0);
+    let safe_h = (vp_h - gutter_b.max(0.0)).max(1.0);
+    let in_raw_vp = bbox.x.max(0.0) < vp_w
+        && (bbox.x + bbox.width).min(vp_w) > 0.0
+        && bbox.y.max(0.0) < vp_h
+        && (bbox.y + bbox.height).min(vp_h) > 0.0;
+    let in_safe_vp = bbox.x.max(0.0) < safe_w
+        && (bbox.x + bbox.width).min(safe_w) > 0.0
+        && bbox.y.max(0.0) < safe_h
+        && (bbox.y + bbox.height).min(safe_h) > 0.0;
+    if in_raw_vp && !in_safe_vp {
+        return Err(MimikyuError::ElementNotFound(
+            "target element is occluded by viewport scrollbar".to_string(),
+        ));
+    }
+    Ok(target_click_point(bbox, safe_w, safe_h))
+}
+
 #[derive(Debug, Default)]
 struct InputState {
     cursor: Option<(f64, f64)>,
@@ -429,6 +454,12 @@ impl ChokepointInput {
         let (vp_w, vp_h) = self
             .run_with_ack(ack, "viewport_size", self.session.viewport_size())
             .await?;
+        let (gutter_r, gutter_b) = self
+            .run_with_ack(ack, "scrollbar_gutters", self.session.scrollbar_gutters())
+            .await
+            .unwrap_or((0.0, 0.0));
+        let safe_w = (vp_w - gutter_r.max(0.0)).max(1.0);
+        let safe_h = (vp_h - gutter_b.max(0.0)).max(1.0);
         let mut bbox = self.resolve_box_for_target(resolved, ack).await?;
         if !bbox.is_visible() {
             return Err(MimikyuError::ElementNotFound(
@@ -436,17 +467,33 @@ impl ChokepointInput {
             ));
         }
 
-        let (cx, cy) = bbox.center();
-        let offscreen = cx < 0.0
-            || cx >= vp_w
-            || cy < 0.0
-            || cy >= vp_h
-            || bbox.x + bbox.width <= 0.0
-            || bbox.y + bbox.height <= 0.0
-            || bbox.x >= vp_w
-            || bbox.y >= vp_h;
+        const MAX_SCROLL_ATTEMPTS: usize = 3;
+        let is_offscreen = |b: BoundingBox| -> bool {
+            let (cx, cy) = b.center();
+            cx < 0.0
+                || cx >= safe_w
+                || cy < 0.0
+                || cy >= safe_h
+                || b.x + b.width <= 0.0
+                || b.y + b.height <= 0.0
+                || b.x >= safe_w
+                || b.y >= safe_h
+        };
 
-        if offscreen {
+        let mut offscreen = is_offscreen(bbox);
+        let mut attempts = 0usize;
+        while offscreen && attempts < MAX_SCROLL_ATTEMPTS {
+            attempts += 1;
+            let prev_bbox = bbox;
+            let before_main = self
+                .read_scroll_offset(safe_w * 0.5, safe_h * 0.5, None, ack)
+                .await;
+            let before_frame = if let Some(fid) = resolved.frame_id.as_deref() {
+                self.read_scroll_offset(safe_w * 0.5, safe_h * 0.5, Some(fid), ack)
+                    .await
+            } else {
+                None
+            };
             let _ = self
                 .run_with_ack(
                     ack,
@@ -458,15 +505,32 @@ impl ChokepointInput {
                     ),
                 )
                 .await;
+            let mut scroll_moved = false;
+            if let (Some(fid), Some(bf)) = (resolved.frame_id.as_deref(), before_frame) {
+                scroll_moved |= self
+                    .wait_for_scroll_settle(bf, safe_w * 0.5, safe_h * 0.5, Some(fid), ack)
+                    .await;
+            }
+            if let Some(bm) = before_main {
+                scroll_moved |= self
+                    .wait_for_scroll_settle(bm, safe_w * 0.5, safe_h * 0.5, None, ack)
+                    .await;
+            }
             bbox = self.resolve_box_for_target(resolved, ack).await?;
             if !bbox.is_visible() {
                 return Err(MimikyuError::ElementNotFound(
                     "target element became non-visible after scrolling".to_string(),
                 ));
             }
+            offscreen = is_offscreen(bbox);
+            let bbox_unchanged =
+                (bbox.x - prev_bbox.x).abs() < 0.5 && (bbox.y - prev_bbox.y).abs() < 0.5;
+            if !offscreen || (bbox_unchanged && !scroll_moved) {
+                break;
+            }
         }
 
-        let point = target_click_point(bbox, vp_w, vp_h);
+        let point = resolve_safe_click_point(bbox, vp_w, vp_h, gutter_r, gutter_b)?;
         Ok((bbox, vp_w, vp_h, point))
     }
 
@@ -561,20 +625,22 @@ impl ChokepointInput {
         Ok(())
     }
 
-    async fn type_humanized(
+    async fn dispatch_typed_chars(
         &self,
         text: &str,
-        humanize: &HumanizeConfig,
+        humanize: Option<&HumanizeConfig>,
         ack: Duration,
     ) -> Result<()> {
-        let mut rng = make_rng(humanize.seed);
-        let mut prev: Option<char> = None;
+        let mut state = humanize.map(|cfg| (cfg, make_rng(cfg.seed), None::<char>));
         for ch in text.chars() {
             if ch == '\r' {
                 continue;
             }
-            let delay = sample_key_delay_ms(prev, humanize, &mut rng);
-            tokio::time::sleep(Duration::from_millis(delay)).await;
+            if let Some((cfg, rng, prev)) = state.as_mut() {
+                let delay = sample_key_delay_ms(*prev, cfg, rng);
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+                *prev = Some(ch);
+            }
             if ch == '\n' {
                 self.run_with_ack(
                     ack,
@@ -619,7 +685,6 @@ impl ChokepointInput {
                 )
                 .await?;
             }
-            prev = Some(ch);
         }
         Ok(())
     }
@@ -1048,7 +1113,8 @@ impl ChokepointInput {
 
         if !value.is_empty() {
             if opts.humanize.enabled {
-                self.type_humanized(value, &opts.humanize, ack).await?;
+                self.dispatch_typed_chars(value, Some(&opts.humanize), ack)
+                    .await?;
             } else {
                 self.run_with_ack(ack, "insert_text", self.session.insert_text(value))
                     .await?;
@@ -1108,12 +1174,12 @@ impl ChokepointInput {
         }
 
         if !text.is_empty() {
-            if opts.humanize.enabled {
-                self.type_humanized(text, &opts.humanize, ack).await?;
-            } else {
-                self.run_with_ack(ack, "insert_text", self.session.insert_text(text))
-                    .await?;
-            }
+            self.dispatch_typed_chars(
+                text,
+                opts.humanize.enabled.then_some(&opts.humanize),
+                ack,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1221,8 +1287,8 @@ impl ChokepointInput {
         ay: f64,
         frame_id: Option<&str>,
         ack: Duration,
-    ) {
-        let cap_ms = (ack.as_millis() as u64).clamp(50, 600);
+    ) -> bool {
+        let cap_ms = (ack.as_millis() as u64).clamp(50, 700);
         let read_body = if frame_id.is_some() {
             "return [window.scrollX || 0, window.scrollY || 0];".to_string()
         } else {
@@ -1253,13 +1319,13 @@ impl ChokepointInput {
                 let frames = 0;
                 const start = performance.now();
                 let timer = 0;
-                const finish = (pos) => {{
+                const finish = () => {{
                     if (done) return;
                     done = true;
                     clearTimeout(timer);
-                    resolve(pos);
+                    resolve(moved);
                 }};
-                timer = setTimeout(() => finish(read()), capMs);
+                timer = setTimeout(finish, capMs);
                 const step = () => {{
                     if (done) return;
                     frames += 1;
@@ -1275,15 +1341,15 @@ impl ChokepointInput {
                     }}
                     prev = cur;
                     if (moved && stable >= 2) {{
-                        finish(cur);
+                        finish();
                         return;
                     }}
                     if (!moved && elapsed >= Math.min(80, capMs) && frames >= 3) {{
-                        finish(cur);
+                        finish();
                         return;
                     }}
                     if (elapsed >= capMs) {{
-                        finish(cur);
+                        finish();
                         return;
                     }}
                     requestAnimationFrame(step);
@@ -1293,13 +1359,15 @@ impl ChokepointInput {
             bx = before.0,
             by = before.1,
         );
-        let _ = self
-            .run_with_ack(
-                ack,
-                "wait_for_scroll_settle",
-                self.session.eval_isolated_in_frame(&script, frame_id),
-            )
-            .await;
+        self.run_with_ack(
+            ack,
+            "wait_for_scroll_settle",
+            self.session.eval_isolated_in_frame(&script, frame_id),
+        )
+        .await
+        .ok()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
     }
 
     pub async fn scroll(
@@ -1519,6 +1587,40 @@ mod tests {
         assert_eq!(
             target_click_point(way_beyond, 1280.0, 800.0),
             (1279.0, 799.0)
+        );
+    }
+
+    #[test]
+    fn resolve_safe_click_point_avoids_and_detects_scrollbar_gutter_occlusion() {
+        // Partially overlapping right-edge element (770..810 on 800x600 with 16px right scrollbar gutter):
+        // aims at midpoint of [770, 784] = 777.0, safely left of scrollbar!
+        let partial = BoundingBox {
+            x: 770.0,
+            y: 200.0,
+            width: 40.0,
+            height: 30.0,
+        };
+        assert_eq!(
+            resolve_safe_click_point(partial, 800.0, 600.0, 16.0, 0.0).unwrap(),
+            (777.0, 215.0)
+        );
+
+        // Completely occluded right-edge element (790..830 on 800x600 with 16px right scrollbar gutter):
+        // fails explicitly instead of silently clicking the scrollbar.
+        let occluded = BoundingBox {
+            x: 790.0,
+            y: 200.0,
+            width: 40.0,
+            height: 30.0,
+        };
+        let err = resolve_safe_click_point(occluded, 800.0, 600.0, 16.0, 0.0)
+            .expect_err("fully scrollbar-occluded target must error");
+        assert!(matches!(err, MimikyuError::ElementNotFound(_)));
+
+        // Without scrollbar gutter (short page or Chromium), 790..830 clicks cleanly at 795.0.
+        assert_eq!(
+            resolve_safe_click_point(occluded, 800.0, 600.0, 0.0, 0.0).unwrap(),
+            (795.0, 215.0)
         );
     }
 }

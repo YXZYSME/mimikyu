@@ -1364,7 +1364,25 @@ impl BidiSession {
                 }),
             )
             .await?;
-        parse_bidi_script_result(&res)
+        parse_bidi_script_result_with_window(&res)
+    }
+
+    async fn eval_isolated_with_window(&self, expr: &str, frame_id: Option<&str>) -> Result<Value> {
+        self.ensure_alive()?;
+        let target_ctx = frame_id.unwrap_or_else(|| self.ctx());
+        let res = self
+            .conn
+            .send(
+                "script.evaluate",
+                json!({
+                    "expression": expr,
+                    "target": { "context": target_ctx, "sandbox": ISOLATED_SANDBOX },
+                    "awaitPromise": true,
+                    "resultOwnership": "none",
+                }),
+            )
+            .await?;
+        parse_bidi_script_result_with_window(&res)
     }
 
     async fn send_modifier_key_actions(&self, mask: u32, down: bool) -> Result<()> {
@@ -2485,7 +2503,7 @@ impl DriverSession for BidiSession {
         })()"#;
 
         let mut new_inline_owners: HashMap<String, String> = HashMap::new();
-        let val = self.eval_isolated(walker_js).await?;
+        let val = self.eval_isolated_with_window(walker_js, None).await?;
         let mut nodes = parse_bidi_walker_result(val, self.ctx(), &mut new_inline_owners);
 
         // Cross-origin child contexts (if any whose contentDocument wasn't accessible)
@@ -2513,7 +2531,10 @@ impl DriverSession for BidiSession {
             if same_origin_walked {
                 continue;
             }
-            if let Ok(sub_val) = self.eval_isolated_in_frame(walker_js, Some(&f.frame_id)).await {
+            if let Ok(sub_val) = self
+                .eval_isolated_with_window(walker_js, Some(&f.frame_id))
+                .await
+            {
                 let sub_nodes =
                     parse_bidi_walker_result(sub_val, &f.frame_id, &mut new_inline_owners);
                 let prefix = format!("{}::", f.frame_id);
@@ -2679,6 +2700,37 @@ impl DriverSession for BidiSession {
         let w = val["w"].as_f64().unwrap_or(1280.0).max(1.0);
         let h = val["h"].as_f64().unwrap_or(800.0).max(1.0);
         Ok((w, h))
+    }
+
+    async fn scrollbar_gutters(&self) -> Result<(f64, f64)> {
+        let val = self
+            .eval_isolated(
+                r#"(() => {
+                    const iw = window.innerWidth || 0;
+                    const ih = window.innerHeight || 0;
+                    const de = document.documentElement;
+                    const cw = (de && de.clientWidth) || iw;
+                    const ch = (de && de.clientHeight) || ih;
+                    const se = document.scrollingElement || de;
+                    if (!se) return { right: 0, bottom: 0 };
+                    const deStyle = de ? getComputedStyle(de) : null;
+                    const bodyStyle = document.body ? getComputedStyle(document.body) : null;
+                    const sbWidth = deStyle ? deStyle.scrollbarWidth : '';
+                    const ovY = deStyle && deStyle.overflowY !== 'visible'
+                        ? deStyle.overflowY
+                        : (bodyStyle ? bodyStyle.overflowY : 'visible');
+                    const ovX = deStyle && deStyle.overflowX !== 'visible'
+                        ? deStyle.overflowX
+                        : (bodyStyle ? bodyStyle.overflowX : 'visible');
+                    const hasV = cw >= iw && se.scrollHeight > ih + 1 && ovY !== 'hidden' && ovY !== 'clip' && sbWidth !== 'none';
+                    const hasH = ch >= ih && se.scrollWidth > iw + 1 && ovX !== 'hidden' && ovX !== 'clip' && sbWidth !== 'none';
+                    return { right: hasV ? 16 : 0, bottom: hasH ? 16 : 0 };
+                })()"#,
+            )
+            .await?;
+        let right = val["right"].as_f64().unwrap_or(0.0).max(0.0);
+        let bottom = val["bottom"].as_f64().unwrap_or(0.0).max(0.0);
+        Ok((right, bottom))
     }
 
     async fn scroll_into_view(
@@ -3943,6 +3995,14 @@ fn parse_bidi_walker_result(
 }
 
 fn parse_bidi_script_result(res: &Value) -> Result<Value> {
+    parse_bidi_script_result_inner(res, false)
+}
+
+fn parse_bidi_script_result_with_window(res: &Value) -> Result<Value> {
+    parse_bidi_script_result_inner(res, true)
+}
+
+fn parse_bidi_script_result_inner(res: &Value, allow_window: bool) -> Result<Value> {
     if res.get("type").and_then(|v| v.as_str()) == Some("exception") {
         let text = res["exceptionDetails"]["text"]
             .as_str()
@@ -3950,63 +4010,191 @@ fn parse_bidi_script_result(res: &Value) -> Result<Value> {
             .to_string();
         return Err(MimikyuError::EvalFailed(text));
     }
-    Ok(bidi_remote_value_to_json(&res["result"]))
+    let mut ancestors = HashSet::new();
+    let mut seen = HashMap::new();
+    bidi_remote_value_to_json(&res["result"], &mut ancestors, &mut seen, allow_window)
 }
 
-fn bidi_remote_value_to_json(val: &Value) -> Value {
+fn bidi_remote_value_to_json(
+    val: &Value,
+    ancestors: &mut HashSet<String>,
+    seen: &mut HashMap<String, Value>,
+    allow_window: bool,
+) -> Result<Value> {
     let t = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
     match t {
-        "undefined" | "null" => Value::Null,
-        "boolean" => val.get("value").cloned().unwrap_or(Value::Null),
-        "string" => val.get("value").cloned().unwrap_or(Value::Null),
-        "number" => {
-            if let Some(n) = val.get("value") {
-                if n.is_number() {
-                    return n.clone();
-                }
-                if let Some(s) = n.as_str() {
-                    if s == "-0" {
-                        return json!(0);
-                    }
-                    return Value::String(s.to_string());
-                }
-            }
-            Value::Null
-        }
-        "bigint" => val
+        "undefined" | "null" => Ok(Value::Null),
+        "boolean" => val
+            .get("value")
+            .and_then(|v| v.as_bool())
+            .map(Value::Bool)
+            .ok_or_else(|| {
+                MimikyuError::EvalFailed("JavaScript evaluation returned invalid boolean value".into())
+            }),
+        "string" => val
             .get("value")
             .and_then(|v| v.as_str())
             .map(|s| Value::String(s.to_string()))
-            .unwrap_or(Value::Null),
-        "array" | "set" => {
-            let items = val["value"]
-                .as_array()
-                .map(|arr| arr.iter().map(bidi_remote_value_to_json).collect())
-                .unwrap_or_default();
-            Value::Array(items)
+            .ok_or_else(|| {
+                MimikyuError::EvalFailed("JavaScript evaluation returned invalid string value".into())
+            }),
+        "number" => {
+            if let Some(n) = val.get("value") {
+                if n.is_number() {
+                    return Ok(n.clone());
+                }
+                if let Some(s) = n.as_str() {
+                    if s == "-0" {
+                        return Ok(json!(0));
+                    }
+                    return Err(MimikyuError::EvalFailed(format!(
+                        "JavaScript evaluation returned non-JSON-serializable value (number: {s})"
+                    )));
+                }
+            }
+            Err(MimikyuError::EvalFailed(
+                "JavaScript evaluation returned non-JSON-serializable number".into(),
+            ))
         }
-        "object" | "map" => {
-            let mut obj = serde_json::Map::new();
-            if let Some(pairs) = val["value"].as_array() {
-                for pair in pairs {
-                    if let Some(pair_arr) = pair.as_array()
-                        && pair_arr.len() == 2
-                    {
-                        let key = if let Some(s) = pair_arr[0].as_str() {
-                            s.to_string()
-                        } else {
-                            bidi_remote_value_to_json(&pair_arr[0])
-                                .as_str()
-                                .map(ToString::to_string)
-                                .unwrap_or_else(|| pair_arr[0].to_string())
-                        };
-                        obj.insert(key, bidi_remote_value_to_json(&pair_arr[1]));
+        "bigint" => {
+            let detail = val
+                .get("value")
+                .and_then(|v| v.as_str())
+                .unwrap_or("bigint");
+            Err(MimikyuError::EvalFailed(format!(
+                "JavaScript evaluation returned non-JSON-serializable value (bigint: {detail})"
+            )))
+        }
+        "window" if allow_window => val.get("value").cloned().ok_or_else(|| {
+            MimikyuError::EvalFailed("JavaScript evaluation returned window without context".into())
+        }),
+        "array" => {
+            let internal_id = val.get("internalId").and_then(|v| v.as_str());
+            if let Some(id) = internal_id {
+                if ancestors.contains(id) {
+                    return Err(MimikyuError::EvalFailed(
+                        "JavaScript evaluation returned cyclic value that cannot be serialized to JSON"
+                            .into(),
+                    ));
+                }
+                if val.get("value").is_none() {
+                    if let Some(cached) = seen.get(id) {
+                        return Ok(cached.clone());
+                    }
+                    return Err(MimikyuError::EvalFailed(
+                        "JavaScript evaluation returned cyclic or unserializable collection reference"
+                            .into(),
+                    ));
+                }
+            }
+            let Some(arr) = val.get("value").and_then(|v| v.as_array()) else {
+                return Err(MimikyuError::EvalFailed(format!(
+                    "JavaScript evaluation returned non-JSON-serializable {t} without value"
+                )));
+            };
+            if let Some(id) = internal_id {
+                ancestors.insert(id.to_string());
+            }
+            let mut items = Vec::with_capacity(arr.len());
+            let mut err = None;
+            for item in arr {
+                match bidi_remote_value_to_json(item, ancestors, seen, allow_window) {
+                    Ok(v) => items.push(v),
+                    Err(e) => {
+                        err = Some(e);
+                        break;
                     }
                 }
             }
-            Value::Object(obj)
+            if let Some(id) = internal_id {
+                ancestors.remove(id);
+            }
+            if let Some(e) = err {
+                return Err(e);
+            }
+            let out = Value::Array(items);
+            if let Some(id) = internal_id {
+                seen.insert(id.to_string(), out.clone());
+            }
+            Ok(out)
         }
-        _ => val.get("value").cloned().unwrap_or(Value::Null),
+        "object" => {
+            let internal_id = val.get("internalId").and_then(|v| v.as_str());
+            if let Some(id) = internal_id {
+                if ancestors.contains(id) {
+                    return Err(MimikyuError::EvalFailed(
+                        "JavaScript evaluation returned cyclic object that cannot be serialized to JSON"
+                            .into(),
+                    ));
+                }
+                if val.get("value").is_none() {
+                    if let Some(cached) = seen.get(id) {
+                        return Ok(cached.clone());
+                    }
+                    return Err(MimikyuError::EvalFailed(
+                        "JavaScript evaluation returned cyclic or unserializable object reference"
+                            .into(),
+                    ));
+                }
+            }
+            let Some(pairs) = val.get("value").and_then(|v| v.as_array()) else {
+                return Err(MimikyuError::EvalFailed(format!(
+                    "JavaScript evaluation returned non-JSON-serializable {t} without value"
+                )));
+            };
+            if let Some(id) = internal_id {
+                ancestors.insert(id.to_string());
+            }
+            let mut obj = serde_json::Map::new();
+            let mut err = None;
+            for pair in pairs {
+                if let Some(pair_arr) = pair.as_array()
+                    && pair_arr.len() == 2
+                {
+                    let key = if let Some(s) = pair_arr[0].as_str() {
+                        s.to_string()
+                    } else {
+                        match bidi_remote_value_to_json(&pair_arr[0], ancestors, seen, allow_window)
+                        {
+                            Ok(v) => v
+                                .as_str()
+                                .map(ToString::to_string)
+                                .unwrap_or_else(|| v.to_string()),
+                            Err(e) => {
+                                err = Some(e);
+                                break;
+                            }
+                        }
+                    };
+                    match bidi_remote_value_to_json(&pair_arr[1], ancestors, seen, allow_window) {
+                        Ok(v) => {
+                            obj.insert(key, v);
+                        }
+                        Err(e) => {
+                            err = Some(e);
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(id) = internal_id {
+                ancestors.remove(id);
+            }
+            if let Some(e) = err {
+                return Err(e);
+            }
+            let out = Value::Object(obj);
+            if let Some(id) = internal_id {
+                seen.insert(id.to_string(), out.clone());
+            }
+            Ok(out)
+        }
+        other => {
+            let kind = if other.is_empty() { "unknown" } else { other };
+            Err(MimikyuError::EvalFailed(format!(
+                "JavaScript evaluation returned non-JSON-serializable value ({kind})"
+            )))
+        }
     }
 }
 
@@ -4260,5 +4448,92 @@ mod tests {
         assert!((bbox.y - 52.0).abs() < 1e-6);
         assert!((bbox.width - 150.0).abs() < 1e-6);
         assert!((bbox.height - 60.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_bidi_script_result_matches_cdp_eval_semantics() {
+        assert_eq!(
+            parse_bidi_script_result(&json!({
+                "type": "success",
+                "result": { "type": "undefined" }
+            }))
+            .unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            parse_bidi_script_result(&json!({
+                "type": "success",
+                "result": { "type": "null" }
+            }))
+            .unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            parse_bidi_script_result(&json!({
+                "type": "success",
+                "result": { "type": "number", "value": "-0" }
+            }))
+            .unwrap(),
+            json!(0)
+        );
+
+        // Shared DAG reference (same internalId appearing in sibling properties) is valid JSON
+        let dag = parse_bidi_script_result(&json!({
+            "type": "success",
+            "result": {
+                "type": "object",
+                "value": [
+                    ["a", { "type": "object", "internalId": "shared", "value": [["x", { "type": "number", "value": 7 }]] }],
+                    ["b", { "type": "object", "internalId": "shared" }]
+                ]
+            }
+        }))
+        .unwrap();
+        assert_eq!(dag, json!({ "a": { "x": 7 }, "b": { "x": 7 } }));
+
+        // Cyclic object via ancestor internalId must fail
+        let cyclic_err = parse_bidi_script_result(&json!({
+            "type": "success",
+            "result": {
+                "type": "object",
+                "internalId": "1",
+                "value": [
+                    ["x", { "type": "number", "value": 1 }],
+                    ["self", { "type": "object", "internalId": "1" }]
+                ]
+            }
+        }))
+        .expect_err("cyclic object must fail");
+        assert!(matches!(cyclic_err, MimikyuError::EvalFailed(_)));
+
+        // Non-JSON-serializable values must fail in public eval
+        for bad in [
+            json!({ "type": "success", "result": { "type": "bigint", "value": "42" } }),
+            json!({ "type": "success", "result": { "type": "number", "value": "NaN" } }),
+            json!({ "type": "success", "result": { "type": "number", "value": "Infinity" } }),
+            json!({ "type": "success", "result": { "type": "number", "value": "-Infinity" } }),
+            json!({ "type": "success", "result": { "type": "symbol" } }),
+            json!({ "type": "success", "result": { "type": "function" } }),
+            json!({ "type": "success", "result": { "type": "object" } }),
+            json!({ "type": "success", "result": { "type": "map", "value": [["k", { "type": "string", "value": "v" }]] } }),
+            json!({ "type": "success", "result": { "type": "set", "value": [{ "type": "number", "value": 1 }] } }),
+            json!({ "type": "success", "result": { "type": "date", "value": "2026-01-01T00:00:00.000Z" } }),
+            json!({ "type": "success", "result": { "type": "regexp", "value": { "pattern": "a" } } }),
+            json!({ "type": "success", "result": { "type": "error" } }),
+            json!({ "type": "success", "result": { "type": "node", "value": {} } }),
+            json!({ "type": "success", "result": { "type": "window", "value": { "context": "ctx-1" } } }),
+        ] {
+            let err = parse_bidi_script_result(&bad)
+                .expect_err(&format!("expected EvalFailed for {bad}"));
+            assert!(matches!(err, MimikyuError::EvalFailed(_)));
+        }
+
+        // Internal walker/frame-rect helpers retain window context handles
+        let win_val = parse_bidi_script_result_with_window(&json!({
+            "type": "success",
+            "result": { "type": "window", "value": { "context": "ctx-1" } }
+        }))
+        .unwrap();
+        assert_eq!(win_val, json!({ "context": "ctx-1" }));
     }
 }

@@ -151,10 +151,15 @@ pub fn build_semantic_tree(
         })
         .collect();
 
+    let ctx = NormalizeCtx {
+        by_id: &by_id,
+        children_map: &children_map,
+        max_depth: opts.max_depth,
+    };
     let mut visited = HashSet::new();
     let mut normalized_roots = Vec::new();
     for root in roots {
-        let mut built = normalize_subtree(root, None, &by_id, &children_map, &mut visited);
+        let mut built = normalize_subtree(root, None, true, 0, &ctx, &mut visited);
         normalized_roots.append(&mut built);
     }
 
@@ -185,16 +190,35 @@ pub fn build_semantic_tree(
     (final_tree, ref_map)
 }
 
+struct NormalizeCtx<'a> {
+    by_id: &'a HashMap<&'a str, &'a AxNode>,
+    children_map: &'a HashMap<&'a str, Vec<&'a str>>,
+    max_depth: Option<usize>,
+}
+
 fn normalize_subtree<'a>(
     node: &'a AxNode,
     parent_name_if_owned: Option<&str>,
-    by_id: &HashMap<&'a str, &'a AxNode>,
-    children_map: &HashMap<&'a str, Vec<&'a str>>,
+    at_root: bool,
+    raw_depth: usize,
+    ctx: &NormalizeCtx<'a>,
     visited: &mut HashSet<&'a str>,
 ) -> Vec<SemanticNode> {
+    if let Some(limit) = ctx.max_depth
+        && raw_depth > limit
+    {
+        return Vec::new();
+    }
     if !visited.insert(node.node_id.as_str()) {
         return Vec::new();
     }
+
+    let is_top_level_root_web_area = at_root && node.role.eq_ignore_ascii_case("RootWebArea");
+    let child_raw_depth = if is_top_level_root_web_area {
+        raw_depth
+    } else {
+        raw_depth + 1
+    };
 
     let trimmed_name = node
         .name
@@ -210,14 +234,15 @@ fn normalize_subtree<'a>(
     };
 
     let mut children = Vec::new();
-    if let Some(cids) = children_map.get(node.node_id.as_str()) {
+    if let Some(cids) = ctx.children_map.get(node.node_id.as_str()) {
         for cid in cids {
-            if let Some(child_ax) = by_id.get(cid) {
+            if let Some(child_ax) = ctx.by_id.get(cid) {
                 children.extend(normalize_subtree(
                     child_ax,
                     child_owned_name,
-                    by_id,
-                    children_map,
+                    false,
+                    child_raw_depth,
+                    ctx,
                     visited,
                 ));
             }
@@ -253,6 +278,12 @@ fn normalize_subtree<'a>(
     if node.role.eq_ignore_ascii_case("generic")
         && trimmed_name.is_none()
         && node.value.is_none()
+        && !node.focusable
+        && !node.focused
+        && !node.disabled
+        && node.checked.is_none()
+        && node.expanded.is_none()
+        && node.selected.is_none()
         && children.len() == 1
     {
         return children;
@@ -316,30 +347,49 @@ fn assign_depths_and_prune_depth(
     }
 }
 
+fn is_ref_eligible(node: &SemanticNode) -> bool {
+    if node.focusable || is_interactive_role(&node.role) {
+        return true;
+    }
+    !matches!(
+        node.role.to_ascii_lowercase().as_str(),
+        "statictext"
+            | "text"
+            | "inlinetextbox"
+            | "linebreak"
+            | "labeltext"
+            | "label"
+            | "legend"
+            | "menulistpopup"
+    )
+}
+
 fn assign_refs_preorder(
     nodes: &mut [SemanticNode],
     next_ref: &mut usize,
     ref_map: &mut RefMap,
 ) {
     for node in nodes.iter_mut() {
-        let ref_id = format!("@e{}", *next_ref);
-        *next_ref += 1;
-        node.ref_id = Some(ref_id.clone());
-        ref_map.insert(RefEntry {
-            ref_id,
-            role: node.role.clone(),
-            name: node.name.clone(),
-            value: node.value.clone(),
-            frame_id: node.frame_id.clone(),
-            backend_node_id: node.backend_node_id,
-            bounds: node.bounds,
-            css_fallback: node.css_fallback.clone(),
-            disabled: node.disabled,
-            focused: node.focused,
-            checked: node.checked,
-            expanded: node.expanded,
-            selected: node.selected,
-        });
+        if is_ref_eligible(node) {
+            let ref_id = format!("@e{}", *next_ref);
+            *next_ref += 1;
+            node.ref_id = Some(ref_id.clone());
+            ref_map.insert(RefEntry {
+                ref_id,
+                role: node.role.clone(),
+                name: node.name.clone(),
+                value: node.value.clone(),
+                frame_id: node.frame_id.clone(),
+                backend_node_id: node.backend_node_id,
+                bounds: node.bounds,
+                css_fallback: node.css_fallback.clone(),
+                disabled: node.disabled,
+                focused: node.focused,
+                checked: node.checked,
+                expanded: node.expanded,
+                selected: node.selected,
+            });
+        }
         assign_refs_preorder(&mut node.children, next_ref, ref_map);
     }
 }
@@ -514,5 +564,236 @@ mod tests {
         assert_eq!(inter[1].ref_id.as_deref(), Some("@e2"));
         assert_eq!(inter[1].name.as_deref(), Some("Inner"));
         assert_eq!(refs.len(), 2);
+    }
+
+    #[test]
+    fn skips_refs_for_non_focusable_label_and_static_text_while_preserving_controls() {
+        let mut root = mk_ax("1", None, "RootWebArea", None);
+        root.child_ids = vec![
+            "2".into(),
+            "4".into(),
+            "8".into(),
+            "10".into(),
+            "13".into(),
+        ];
+
+        // LabelText -> StaticText "Role" followed by combobox "Role" -> MenuListPopup -> option "Admin"
+        let mut lbl_role = mk_ax("2", Some("1"), "LabelText", None);
+        lbl_role.child_ids = vec!["3".into()];
+        let txt_role = mk_ax("3", Some("2"), "StaticText", Some("Role"));
+
+        let mut combo = mk_ax("4", Some("1"), "combobox", Some("Role"));
+        combo.child_ids = vec!["5".into()];
+        let mut popup = mk_ax("5", Some("4"), "MenuListPopup", None);
+        popup.child_ids = vec!["6".into()];
+        let opt = mk_ax("6", Some("5"), "option", Some("Admin"));
+
+        // LabelText -> StaticText "Upload File" followed by button "Upload File"
+        let mut lbl_upload = mk_ax("8", Some("1"), "LabelText", None);
+        lbl_upload.child_ids = vec!["9".into()];
+        let txt_upload = mk_ax("9", Some("8"), "StaticText", Some("Upload File"));
+        let btn_upload = mk_ax("10", Some("1"), "button", Some("Upload File"));
+
+        // Legend -> StaticText "Tier"
+        let mut legend = mk_ax("13", Some("1"), "Legend", None);
+        legend.child_ids = vec!["14".into()];
+        let txt_tier = mk_ax("14", Some("13"), "StaticText", Some("Tier"));
+
+        let (tree, refs) = build_semantic_tree(
+            &[
+                root, lbl_role, txt_role, combo, popup, opt, lbl_upload, txt_upload, btn_upload,
+                legend, txt_tier,
+            ],
+            &SnapshotOptions::default(),
+        );
+
+        assert_eq!(tree.len(), 5);
+        // LabelText & StaticText stay in tree for readable text/diff, without @eN refs
+        assert_eq!(tree[0].role, "LabelText");
+        assert_eq!(tree[0].ref_id, None);
+        assert_eq!(tree[0].children[0].role, "StaticText");
+        assert_eq!(tree[0].children[0].ref_id, None);
+
+        // combobox "Role" gets @e1, MenuListPopup gets None, option "Admin" gets @e2
+        assert_eq!(tree[1].role, "combobox");
+        assert_eq!(tree[1].ref_id.as_deref(), Some("@e1"));
+        assert_eq!(tree[1].children[0].role, "MenuListPopup");
+        assert_eq!(tree[1].children[0].ref_id, None);
+        assert_eq!(tree[1].children[0].children[0].role, "option");
+        assert_eq!(tree[1].children[0].children[0].ref_id.as_deref(), Some("@e2"));
+
+        // Upload LabelText/StaticText get None; button "Upload File" gets @e3
+        assert_eq!(tree[2].ref_id, None);
+        assert_eq!(tree[2].children[0].ref_id, None);
+        assert_eq!(tree[3].role, "button");
+        assert_eq!(tree[3].ref_id.as_deref(), Some("@e3"));
+
+        // Legend/StaticText get None
+        assert_eq!(tree[4].role, "Legend");
+        assert_eq!(tree[4].ref_id, None);
+        assert_eq!(tree[4].children[0].ref_id, None);
+
+        assert_eq!(refs.len(), 3);
+        assert_eq!(refs.get("@e1").unwrap().role, "combobox");
+        assert_eq!(refs.get("@e2").unwrap().role, "option");
+        assert_eq!(refs.get("@e3").unwrap().role, "button");
+
+        let formatted = format_semantic_tree(&tree);
+        assert!(formatted.contains("StaticText \"Role\""));
+        assert!(formatted.contains("@e1 combobox \"Role\""));
+        assert!(formatted.contains("StaticText \"Upload File\""));
+        assert!(formatted.contains("@e3 button \"Upload File\""));
+    }
+
+    #[test]
+    fn preserves_focusable_single_child_generic_and_assigns_ref() {
+        let mut root = mk_ax("1", None, "RootWebArea", None);
+        root.child_ids = vec!["2".into(), "4".into(), "6".into(), "8".into()];
+
+        // <span tabindex="0">Tab Span</span> -> focusable generic with single StaticText child
+        let mut tab_span = mk_ax("2", Some("1"), "generic", None);
+        tab_span.focusable = true;
+        tab_span.child_ids = vec!["3".into()];
+        let txt_span = mk_ax("3", Some("2"), "StaticText", Some("Tab Span"));
+
+        // <div tabindex="0">Tab Div</div> -> focusable generic with single StaticText child
+        let mut tab_div = mk_ax("4", Some("1"), "generic", None);
+        tab_div.focusable = true;
+        tab_div.child_ids = vec!["5".into()];
+        let txt_div = mk_ax("5", Some("4"), "StaticText", Some("Tab Div"));
+
+        // Plain non-focusable single-child generic wrapper around a button -> still collapses
+        let mut plain_wrap = mk_ax("6", Some("1"), "generic", None);
+        plain_wrap.child_ids = vec!["7".into()];
+        let wrapped_btn = mk_ax("7", Some("6"), "button", Some("WrappedBtn"));
+
+        // Disabled single-child generic with StaticText -> preserved in full snapshot
+        let mut disabled_div = mk_ax("8", Some("1"), "generic", None);
+        disabled_div.disabled = true;
+        disabled_div.child_ids = vec!["9".into()];
+        let txt_disabled = mk_ax("9", Some("8"), "StaticText", Some("DisabledDiv"));
+
+        let raw = vec![
+            root,
+            tab_span,
+            txt_span,
+            tab_div,
+            txt_div,
+            plain_wrap,
+            wrapped_btn,
+            disabled_div,
+            txt_disabled,
+        ];
+
+        let (tree, refs) = build_semantic_tree(&raw, &SnapshotOptions::default());
+        assert_eq!(tree.len(), 4);
+
+        assert_eq!(tree[0].role, "generic");
+        assert!(tree[0].focusable);
+        assert_eq!(tree[0].ref_id.as_deref(), Some("@e1"));
+        assert_eq!(tree[0].children.len(), 1);
+        assert_eq!(tree[0].children[0].role, "StaticText");
+        assert_eq!(tree[0].children[0].name.as_deref(), Some("Tab Span"));
+        assert_eq!(tree[0].children[0].ref_id, None);
+
+        assert_eq!(tree[1].role, "generic");
+        assert!(tree[1].focusable);
+        assert_eq!(tree[1].ref_id.as_deref(), Some("@e2"));
+        assert_eq!(tree[1].children.len(), 1);
+        assert_eq!(tree[1].children[0].role, "StaticText");
+        assert_eq!(tree[1].children[0].name.as_deref(), Some("Tab Div"));
+        assert_eq!(tree[1].children[0].ref_id, None);
+
+        assert_eq!(tree[2].role, "button");
+        assert_eq!(tree[2].name.as_deref(), Some("WrappedBtn"));
+        assert_eq!(tree[2].ref_id.as_deref(), Some("@e3"));
+
+        assert_eq!(tree[3].role, "generic");
+        assert!(tree[3].disabled);
+        assert_eq!(tree[3].ref_id.as_deref(), Some("@e4"));
+        assert_eq!(tree[3].children[0].role, "StaticText");
+        assert_eq!(tree[3].children[0].ref_id, None);
+
+        assert_eq!(refs.len(), 4);
+        assert_eq!(refs.get("@e1").unwrap().backend_node_id, Some(2));
+        assert_eq!(refs.get("@e2").unwrap().backend_node_id, Some(4));
+
+        // --interactive-only keeps focusable generic nodes and button, omits StaticText & non-focusable disabled generic
+        let (inter, inter_refs) = build_semantic_tree(
+            &raw,
+            &SnapshotOptions {
+                interactive_only: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(inter.len(), 3);
+        assert_eq!(inter[0].role, "generic");
+        assert_eq!(inter[0].ref_id.as_deref(), Some("@e1"));
+        assert_eq!(inter[1].role, "generic");
+        assert_eq!(inter[1].ref_id.as_deref(), Some("@e2"));
+        assert_eq!(inter[2].role, "button");
+        assert_eq!(inter[2].name.as_deref(), Some("WrappedBtn"));
+        assert_eq!(inter[2].ref_id.as_deref(), Some("@e3"));
+        assert_eq!(inter_refs.len(), 3);
+    }
+
+    #[test]
+    fn max_depth_prunes_deeply_nested_transparent_wrappers_regardless_of_ignored_flag() {
+        for ignored_wrappers in [false, true] {
+            let mut raw = vec![mk_ax("root", None, "RootWebArea", None)];
+            raw[0].child_ids = vec!["d1".into()];
+
+            for i in 1..=12usize {
+                let id = format!("d{i}");
+                let pid = if i == 1 {
+                    "root".to_string()
+                } else {
+                    format!("d{}", i - 1)
+                };
+                let cid = if i == 12 {
+                    "btn".to_string()
+                } else {
+                    format!("d{}", i + 1)
+                };
+                let mut div = mk_ax(&id, Some(&pid), "generic", None);
+                div.ignored = ignored_wrappers;
+                div.child_ids = vec![cid];
+                raw.push(div);
+            }
+            raw.push(mk_ax("btn", Some("d12"), "button", Some("DeepTarget")));
+
+            // Full snapshot (max_depth: None) collapses transparent wrappers and keeps DeepTarget
+            let (full_tree, full_refs) = build_semantic_tree(&raw, &SnapshotOptions::default());
+            assert_eq!(full_tree.len(), 1);
+            assert_eq!(full_tree[0].role, "button");
+            assert_eq!(full_tree[0].name.as_deref(), Some("DeepTarget"));
+            assert_eq!(full_refs.len(), 1);
+
+            // max_depth: Some(1) prunes wrappers beyond raw depth 1 before collapsing
+            let (shallow_tree, shallow_refs) = build_semantic_tree(
+                &raw,
+                &SnapshotOptions {
+                    max_depth: Some(1),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                shallow_tree.is_empty(),
+                "ignored={ignored_wrappers}: expected DeepTarget pruned at max_depth=1, got {shallow_tree:?}"
+            );
+            assert!(shallow_refs.is_empty());
+
+            // interactive_only: true + max_depth: Some(1) must also respect max_depth
+            let (shallow_inter, shallow_inter_refs) = build_semantic_tree(
+                &raw,
+                &SnapshotOptions {
+                    max_depth: Some(1),
+                    interactive_only: true,
+                    ..Default::default()
+                },
+            );
+            assert!(shallow_inter.is_empty());
+            assert!(shallow_inter_refs.is_empty());
+        }
     }
 }

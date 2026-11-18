@@ -133,7 +133,18 @@ pub fn build_window_init_script(profile: &EnvProfile, engine: EngineKind) -> Str
           const ctx = origGetContext.apply(this, [kind, ...rest]);
           if (ctx) return ctx;
           if (kind === 'webgl' || kind === 'experimental-webgl' || kind === 'webgl2') {{
+            const isWebgl2 = kind === 'webgl2';
+            const glVersion = isWebgl2
+              ? (cfg.isChromium ? 'WebGL 2.0 (OpenGL ES 3.0 Chromium)' : 'WebGL 2.0')
+              : (cfg.isChromium ? 'WebGL 1.0 (OpenGL ES 2.0 Chromium)' : 'WebGL 1.0');
+            const glslVersion = isWebgl2
+              ? (cfg.isChromium ? 'WebGL GLSL ES 3.00 (OpenGL ES GLSL ES 3.00 Chromium)' : 'WebGL GLSL ES 3.00')
+              : (cfg.isChromium ? 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)' : 'WebGL GLSL ES 1.0');
             return {{
+              VENDOR: 7936,
+              RENDERER: 7937,
+              VERSION: 7938,
+              SHADING_LANGUAGE_VERSION: 35724,
               getExtension(name) {{
                 if (name === 'WEBGL_debug_renderer_info') {{
                   return {{ UNMASKED_VENDOR_WEBGL: 37445, UNMASKED_RENDERER_WEBGL: 37446 }};
@@ -143,6 +154,8 @@ pub fn build_window_init_script(profile: &EnvProfile, engine: EngineKind) -> Str
               getParameter(pname) {{
                 if ((pname === 37445 || pname === 7936) && cfg.webglVendor) return cfg.webglVendor;
                 if ((pname === 37446 || pname === 7937) && cfg.webglRenderer) return cfg.webglRenderer;
+                if (pname === 7938) return glVersion;
+                if (pname === 35724) return glslVersion;
                 return null;
               }},
               getSupportedExtensions() {{
@@ -479,6 +492,10 @@ mod tests {
             assert!(!win_js.contains("__mimikyu"));
             assert!(!wrk_js.contains("__mimikyu"));
             assert!(win_js.contains("Navigator.prototype"));
+            assert!(win_js.contains("VENDOR: 7936"));
+            assert!(win_js.contains("RENDERER: 7937"));
+            assert!(win_js.contains("VERSION: 7938"));
+            assert!(win_js.contains("SHADING_LANGUAGE_VERSION: 35724"));
             assert!(wrk_js.contains("WorkerNavigator.prototype"));
             if engine == EngineKind::Firefox {
                 assert!(

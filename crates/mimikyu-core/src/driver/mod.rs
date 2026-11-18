@@ -288,6 +288,8 @@ pub struct LaunchOptions {
     pub extra_prefs: BTreeMap<String, Value>,
     #[serde(default)]
     pub telemetry_capacity: Option<usize>,
+    #[serde(default)]
+    pub download_dir: Option<PathBuf>,
 }
 
 impl Default for LaunchOptions {
@@ -308,6 +310,7 @@ impl Default for LaunchOptions {
             extra_args: Vec::new(),
             extra_prefs: BTreeMap::new(),
             telemetry_capacity: None,
+            download_dir: None,
         }
     }
 }
@@ -325,6 +328,8 @@ pub struct ContextOptions {
     pub permissions: Vec<PermissionGrant>,
     #[serde(default)]
     pub telemetry_capacity: Option<usize>,
+    #[serde(default)]
+    pub download_dir: Option<PathBuf>,
 }
 
 pub const MOD_ALT: u32 = 1;
@@ -676,6 +681,9 @@ pub trait DriverSession: Send + Sync {
     ) -> Result<BoundingBox>;
     async fn resolve_selector_box(&self, selector: &str) -> Result<BoundingBox>;
     async fn viewport_size(&self) -> Result<(f64, f64)>;
+    async fn scrollbar_gutters(&self) -> Result<(f64, f64)> {
+        Ok((0.0, 0.0))
+    }
     async fn scroll_into_view(
         &self,
         backend_node_id: Option<i64>,

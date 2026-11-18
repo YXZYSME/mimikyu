@@ -469,6 +469,114 @@ async fn live_eval_extract_and_media_firefox() {
     assert_eval_extract_media_parity(EngineKind::Firefox).await;
 }
 
+async fn assert_eval_json_parity(engine: EngineKind) {
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            main_world_eval: true,
+            ..Default::default()
+        })
+        .await
+        .expect("launch browser");
+    let pid = session.info().pid.expect("pid");
+
+    session
+        .navigate("data:text/html,<!doctype html><html><body><p>eval</p></body></html>")
+        .await
+        .expect("navigate data html");
+
+    let valid_cases = [
+        ("undefined", serde_json::json!(null)),
+        ("null", serde_json::json!(null)),
+        ("-0", serde_json::json!(0)),
+        ("1 + 1", serde_json::json!(2)),
+        ("({a: [1, true, 'x']})", serde_json::json!({"a": [1, true, "x"]})),
+        (
+            "(() => { const x = {k: 1}; return {a: x, b: x}; })()",
+            serde_json::json!({"a": {"k": 1}, "b": {"k": 1}}),
+        ),
+        ("({x: -0})", serde_json::json!({"x": 0})),
+        ("Promise.resolve({answer: 42})", serde_json::json!({"answer": 42})),
+    ];
+
+    let invalid_cases = [
+        "BigInt(42)",
+        "NaN",
+        "Infinity",
+        "-Infinity",
+        "Symbol('s')",
+        "(() => {})",
+        "(function foo() {})",
+        "(async () => {})",
+        "(class Foo {})",
+        "(() => { const a = {}; a.self = a; return a; })()",
+        "(() => { const a = []; a.push(a); return a; })()",
+        "({x: NaN})",
+        "({x: Infinity})",
+        "({x: BigInt(42)})",
+        "document.body",
+        "window",
+        "new Map([['k', 'v']])",
+        "new Set([1, 2])",
+        "new Date()",
+        "/abc/",
+        "new Error('e')",
+        "Promise.resolve(() => {})",
+        "Promise.resolve(NaN)",
+    ];
+
+    for main_world in [false, true] {
+        for (expr, expected) in &valid_cases {
+            let actual = if main_world {
+                session.eval_main_world(expr).await
+            } else {
+                session.eval_isolated(expr).await
+            }
+            .unwrap_or_else(|e| panic!("{engine} main_world={main_world} expr={expr}: {e}"));
+            assert_eq!(
+                &actual, expected,
+                "{engine} main_world={main_world} expr={expr}"
+            );
+        }
+        for expr in &invalid_cases {
+            let res = if main_world {
+                session.eval_main_world(expr).await
+            } else {
+                session.eval_isolated(expr).await
+            };
+            assert!(
+                matches!(res, Err(MimikyuError::EvalFailed(_))),
+                "{engine} main_world={main_world} expr={expr}: expected EvalFailed, got {res:?}"
+            );
+        }
+    }
+
+    if engine == EngineKind::Chromium {
+        assert_eq!(
+            session
+                .eval_isolated("new Response('ok')")
+                .await
+                .expect("Response eval on chromium"),
+            serde_json::json!({})
+        );
+    }
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn live_eval_json_parity_chromium() {
+    assert_eval_json_parity(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn live_eval_json_parity_firefox() {
+    assert_eval_json_parity(EngineKind::Firefox).await;
+}
+
 #[tokio::test]
 async fn live_oopif_extract_and_closed_shadow_chromium() {
     let server = TestServer::start().await;

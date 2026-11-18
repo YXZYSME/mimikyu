@@ -303,3 +303,147 @@ async fn daemon_concurrent_multi_client_requests_and_session_isolation() {
     assert!(daemon_stop(&state).await.expect("stop"));
     handle.await.expect("join").expect("run ok");
 }
+
+#[tokio::test]
+async fn daemon_exits_and_reaps_virtual_session_when_state_dir_removed() {
+    let srv = TestServer::start().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state = tmp.path().join("removed_state");
+
+    let server = DaemonServer::bind(DaemonConfig::new(state.clone()))
+        .await
+        .expect("bind");
+    let bound_sock = server.paths().bound_sock.clone();
+    let handle = tokio::spawn(async move { server.run().await });
+
+    let client = DaemonClient::connect(&state).await.expect("connect");
+    client
+        .call(DaemonOp::SessionNew(SessionCreateOpts {
+            session_id: Some("v1".to_string()),
+            virtual_ctx: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("create virtual session");
+    client
+        .call(DaemonOp::Open {
+            session_id: "v1".to_string(),
+            url: srv.url("/"),
+        })
+        .await
+        .expect("open /");
+
+    let eph = client
+        .call(DaemonOp::SessionNew(SessionCreateOpts {
+            session_id: Some("e1".to_string()),
+            ephemeral: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("create ephemeral session");
+    let eph_pid = eph["pid"].as_i64().expect("ephemeral pid") as libc::pid_t;
+
+    // Record child browser processes before deleting state_dir
+    let my_pid = std::process::id().to_string();
+    let pre_children = std::process::Command::new("pgrep")
+        .args(["-P", &my_pid])
+        .output()
+        .expect("pgrep -P");
+    let pre_pids: Vec<libc::pid_t> = String::from_utf8_lossy(&pre_children.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<libc::pid_t>().ok())
+        .collect();
+    assert!(
+        pre_pids.contains(&eph_pid) && pre_pids.len() >= 2,
+        "expected both virtual root browser and ephemeral browser under {my_pid}, got {pre_pids:?}"
+    );
+
+    drop(client);
+    fs::remove_dir_all(&state).expect("delete state_dir externally");
+
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("daemon must exit promptly after state_dir removal")
+        .expect("join ok")
+        .expect("daemon run ok");
+
+    assert!(!bound_sock.exists(), "bound_sock must be cleaned up");
+    for child_pid in pre_pids {
+        assert_pgid_gone(child_pid);
+    }
+}
+
+#[tokio::test]
+async fn daemon_exits_and_reaps_virtual_session_when_sock_link_removed_on_long_state_dir() {
+    let srv = TestServer::start().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let deep = tmp
+        .path()
+        .join("long_segment_for_sock_link_removal_test_01")
+        .join("long_segment_for_sock_link_removal_test_02")
+        .join("long_segment_for_sock_link_removal_test_03");
+    fs::create_dir_all(&deep).unwrap();
+    let sock_link = deep.join("daemon.sock");
+    assert!(
+        sock_link.as_os_str().as_encoded_bytes().len() > 110,
+        "expected path > 110 bytes, got {}",
+        sock_link.display()
+    );
+
+    let server = DaemonServer::bind(DaemonConfig::new(deep.clone()))
+        .await
+        .expect("bind");
+    let bound_sock = server.paths().bound_sock.clone();
+    assert_ne!(bound_sock, sock_link);
+    assert!(fs::symlink_metadata(&sock_link).unwrap().file_type().is_symlink());
+    let handle = tokio::spawn(async move { server.run().await });
+
+    let client = DaemonClient::connect(&deep).await.expect("connect");
+    client
+        .call(DaemonOp::SessionNew(SessionCreateOpts {
+            session_id: Some("v_link".to_string()),
+            virtual_ctx: true,
+            ..Default::default()
+        }))
+        .await
+        .expect("create virtual session");
+    client
+        .call(DaemonOp::Open {
+            session_id: "v_link".to_string(),
+            url: srv.url("/"),
+        })
+        .await
+        .expect("open /");
+
+    let my_pid = std::process::id().to_string();
+    let pre_children = std::process::Command::new("pgrep")
+        .args(["-P", &my_pid])
+        .output()
+        .expect("pgrep -P");
+    let pre_pids: Vec<libc::pid_t> = String::from_utf8_lossy(&pre_children.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<libc::pid_t>().ok())
+        .collect();
+    assert!(
+        !pre_pids.is_empty(),
+        "expected virtual browser child under {my_pid}"
+    );
+
+    drop(client);
+    // Remove ONLY the symlink, leaving deep state_dir and bound_sock intact
+    fs::remove_file(&sock_link).expect("unlink sock_link");
+    assert!(deep.exists());
+    assert!(bound_sock.exists());
+
+    tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("daemon must exit promptly after sock_link removal")
+        .expect("join ok")
+        .expect("daemon run ok");
+
+    assert!(!bound_sock.exists(), "bound_sock must be cleaned up");
+    assert!(!deep.join("daemon.pid").exists(), "pid_file must be cleaned up");
+    for child_pid in pre_pids {
+        assert_pgid_gone(child_pid);
+    }
+}

@@ -132,6 +132,46 @@ async fn assert_chokepoint_and_humanize_parity(engine: EngineKind) {
         direct_track["len"]
     );
 
+    // Non-humanized type_text must still dispatch real keydown/keyup events per character
+    session
+        .eval_isolated(
+            r#"(() => {
+                window.__typeKeysDown = [];
+                window.__typeKeysUp = [];
+                const el = document.getElementById('type-target');
+                el.addEventListener('keydown', (e) => window.__typeKeysDown.push(e.key));
+                el.addEventListener('keyup', (e) => window.__typeKeysUp.push(e.key));
+            })()"#,
+        )
+        .await
+        .expect("attach key listeners");
+    input
+        .type_text(
+            &InputTarget::Selector("#type-target".into()),
+            None,
+            "abc",
+            &TypeOptions::default(),
+        )
+        .await
+        .expect("non-humanized type_text");
+    let key_res = session
+        .eval_isolated("({ value: document.getElementById('type-target').value, down: window.__typeKeysDown, up: window.__typeKeysUp })")
+        .await
+        .expect("read key events");
+    assert_eq!(key_res["value"], "abc", "{engine}: non-humanized type_text value");
+    let down = key_res["down"].as_array().expect("down array");
+    let up = key_res["up"].as_array().expect("up array");
+    assert_eq!(
+        down.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>(),
+        vec!["a", "b", "c"],
+        "{engine}: non-humanized type_text must fire per-char keydown"
+    );
+    assert_eq!(
+        up.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>(),
+        vec!["a", "b", "c"],
+        "{engine}: non-humanized type_text must fire per-char keyup"
+    );
+
     // 2. Edge clamping (y=-1 wedge avoidance) + offscreen scroll-into-view + wheel-notch scrolling
     session
         .navigate(&server.url("/edge-and-scroll"))
@@ -1902,4 +1942,208 @@ async fn live_scaled_cross_origin_iframe_click_chromium() {
 #[tokio::test]
 async fn live_scaled_cross_origin_iframe_click_firefox() {
     assert_scaled_cross_origin_iframe_click(EngineKind::Firefox).await;
+}
+
+async fn assert_clamped_scroll_then_offscreen_click(engine: EngineKind) {
+    let server = TestServer::start().await;
+    let env_profile = mimikyu_core::env_profile::EnvProfileBuilder::from_preset(
+        mimikyu_core::env_profile::PresetKind::MacOs,
+        engine,
+    )
+    .viewport(800, 600)
+    .build()
+    .expect("env profile");
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            env_profile: Some(env_profile),
+            ..Default::default()
+        })
+        .await
+        .expect("launch browser");
+    let pid = session.info().pid.expect("pid");
+
+    let input = Arc::new(ChokepointInput::new(session.clone()));
+    session
+        .navigate(&server.url("/edge-and-scroll"))
+        .await
+        .expect("navigate /edge-and-scroll");
+
+    input
+        .scroll(0.0, 1800.0, None, None, &ScrollOptions::default())
+        .await
+        .expect("scroll down");
+    input
+        .scroll(-50.0, -5000.0, None, None, &ScrollOptions::default())
+        .await
+        .expect("clamped scroll back up");
+
+    // Immediately click offscreen button at y=2200 without artificial sleep
+    input
+        .click(
+            &InputTarget::Selector("#offscreen-btn".into()),
+            None,
+            &ClickOptions::default(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{engine}: click(#offscreen-btn) after clamped scroll failed: {e}"));
+
+    let hits = session
+        .eval_isolated("JSON.parse(document.documentElement.dataset.edgeHits || '[]')")
+        .await
+        .expect("read edgeHits");
+    let hits_arr = hits.as_array().expect("edgeHits array");
+    assert!(
+        hits_arr.iter().any(|v| v == "offscreen-btn"),
+        "{engine}: expected #offscreen-btn click to land after clamped scroll, got {hits_arr:?}"
+    );
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn live_clamped_scroll_then_offscreen_click_chromium() {
+    assert_clamped_scroll_then_offscreen_click(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn live_clamped_scroll_then_offscreen_click_firefox() {
+    assert_clamped_scroll_then_offscreen_click(EngineKind::Firefox).await;
+}
+
+async fn assert_fixed_right_edge_scrollbar_handling(engine: EngineKind) {
+    let env_profile = mimikyu_core::env_profile::EnvProfileBuilder::from_preset(
+        mimikyu_core::env_profile::PresetKind::MacOs,
+        engine,
+    )
+    .viewport(800, 600)
+    .build()
+    .expect("env profile");
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            env_profile: Some(env_profile),
+            ..Default::default()
+        })
+        .await
+        .expect("launch browser");
+    let pid = session.info().pid.expect("pid");
+
+    let tall_html = r#"<!doctype html><html><body style="margin:0;height:3000px;">
+        <button id="b770" style="position:fixed;top:200px;left:770px;width:40px;height:30px;">B770</button>
+        <button id="fixed-right-edge" style="position:fixed;top:300px;left:790px;width:40px;height:30px;">Edge</button>
+        <script>
+          const hits = [];
+          document.documentElement.dataset.hits = '[]';
+          document.getElementById('b770').addEventListener('click', () => { hits.push('b770'); document.documentElement.dataset.hits = JSON.stringify(hits); });
+          document.getElementById('fixed-right-edge').addEventListener('click', () => { hits.push('fixed-right-edge'); document.documentElement.dataset.hits = JSON.stringify(hits); });
+        </script>
+    </body></html>"#;
+    let tall_url = format!(
+        "data:text/html,{}",
+        url::form_urlencoded::byte_serialize(tall_html.as_bytes())
+            .collect::<String>()
+            .replace('+', "%20")
+    );
+    session.navigate(&tall_url).await.expect("navigate tall");
+
+    let input = Arc::new(ChokepointInput::new(session.clone()));
+    input
+        .click(
+            &InputTarget::Selector("#b770".into()),
+            None,
+            &ClickOptions::default(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{engine}: click(#b770) on tall page failed: {e}"));
+
+    let hits_after_b770 = session
+        .eval_isolated("JSON.parse(document.documentElement.dataset.hits || '[]')")
+        .await
+        .expect("read hits");
+    assert_eq!(
+        hits_after_b770,
+        serde_json::json!(["b770"]),
+        "{engine}: #b770 click must deliver"
+    );
+
+    let edge_res = input
+        .click(
+            &InputTarget::Selector("#fixed-right-edge".into()),
+            None,
+            &ClickOptions::default(),
+        )
+        .await;
+    match edge_res {
+        Ok(()) => {
+            let hits = session
+                .eval_isolated("JSON.parse(document.documentElement.dataset.hits || '[]')")
+                .await
+                .expect("read hits");
+            assert_eq!(
+                hits,
+                serde_json::json!(["b770", "fixed-right-edge"]),
+                "{engine}: click(#fixed-right-edge) returned Ok(()) without delivering click!"
+            );
+        }
+        Err(e) => {
+            assert_eq!(
+                engine,
+                EngineKind::Firefox,
+                "{engine}: unexpected error on #fixed-right-edge: {e}"
+            );
+        }
+    }
+
+    // Short page (no vertical scrollbar): #fixed-right-edge at left:790px must click cleanly on both engines
+    let short_html = r#"<!doctype html><html><body style="margin:0;height:400px;">
+        <button id="fixed-right-edge" style="position:fixed;top:200px;left:790px;width:40px;height:30px;">Edge</button>
+        <script>
+          const hits = [];
+          document.documentElement.dataset.hits = '[]';
+          document.getElementById('fixed-right-edge').addEventListener('click', () => { hits.push('fixed-right-edge'); document.documentElement.dataset.hits = JSON.stringify(hits); });
+        </script>
+    </body></html>"#;
+    let short_url = format!(
+        "data:text/html,{}",
+        url::form_urlencoded::byte_serialize(short_html.as_bytes())
+            .collect::<String>()
+            .replace('+', "%20")
+    );
+    session.navigate(&short_url).await.expect("navigate short");
+    input
+        .click(
+            &InputTarget::Selector("#fixed-right-edge".into()),
+            None,
+            &ClickOptions::default(),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{engine}: click(#fixed-right-edge) on short page failed: {e}"));
+    let short_hits = session
+        .eval_isolated("JSON.parse(document.documentElement.dataset.hits || '[]')")
+        .await
+        .expect("read short hits");
+    assert_eq!(
+        short_hits,
+        serde_json::json!(["fixed-right-edge"]),
+        "{engine}: short page #fixed-right-edge must deliver click"
+    );
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn live_fixed_right_edge_scrollbar_handling_chromium() {
+    assert_fixed_right_edge_scrollbar_handling(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn live_fixed_right_edge_scrollbar_handling_firefox() {
+    assert_fixed_right_edge_scrollbar_handling(EngineKind::Firefox).await;
 }

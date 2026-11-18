@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
@@ -204,6 +204,11 @@ impl BrowserDriver for CdpDriver {
 
         conn.set_active_target(context_id.as_deref(), &target_id);
 
+        let dl_dir = opts
+            .download_dir
+            .clone()
+            .unwrap_or_else(|| profile_dir.join("downloads"));
+
         let info = SessionInfo {
             session_id: cdp_session_id.clone(),
             engine: EngineKind::Chromium,
@@ -218,7 +223,7 @@ impl BrowserDriver for CdpDriver {
         let session = CdpSession::create(
             conn,
             info,
-            context_id,
+            context_id.clone(),
             owns_context,
             true,
             opts.main_world_eval,
@@ -227,7 +232,14 @@ impl BrowserDriver for CdpDriver {
         )
         .await?;
 
-        session
+        if let Err(err) =
+            configure_cdp_download_behavior(&session.conn, context_id.as_deref(), &dl_dir).await
+        {
+            let _ = session.dispose().await;
+            return Err(err);
+        }
+
+        if let Err(err) = session
             .apply_initial_options(
                 opts.env_profile,
                 Vec::new(),
@@ -236,10 +248,40 @@ impl BrowserDriver for CdpDriver {
                 opts.block_fonts,
                 opts.instant_animations,
             )
-            .await?;
+            .await
+        {
+            let _ = session.dispose().await;
+            return Err(err);
+        }
 
         Ok(session)
     }
+}
+
+async fn configure_cdp_download_behavior(
+    conn: &CdpConnection,
+    context_id: Option<&str>,
+    download_dir: &Path,
+) -> Result<()> {
+    std::fs::create_dir_all(download_dir)?;
+    let abs_dir = std::fs::canonicalize(download_dir).or_else(|_| {
+        if download_dir.is_absolute() {
+            Ok(download_dir.to_path_buf())
+        } else {
+            std::env::current_dir().map(|cwd| cwd.join(download_dir))
+        }
+    })?;
+    let mut params = json!({
+        "behavior": "allow",
+        "downloadPath": abs_dir.to_string_lossy(),
+        "eventsEnabled": true,
+    });
+    if let Some(ctx_id) = context_id {
+        params["browserContextId"] = json!(ctx_id);
+    }
+    conn.send_browser("Browser.setDownloadBehavior", params)
+        .await?;
+    Ok(())
 }
 
 fn cdp_capabilities() -> DriverCapabilities {
@@ -1707,6 +1749,59 @@ impl CdpSession {
         self.conn.send_raw(Some(sid), method, params).await
     }
 
+    async fn resolve_cdp_eval_result(
+        &self,
+        target_frame_id: Option<&str>,
+        res: Value,
+    ) -> Result<Value> {
+        if let Some(exc) = res.get("exceptionDetails") {
+            let text = exc["exception"]["description"]
+                .as_str()
+                .or_else(|| exc["text"].as_str())
+                .unwrap_or("JavaScript exception")
+                .to_string();
+            return Err(MimikyuError::EvalFailed(text));
+        }
+        let result = &res["result"];
+        match classify_cdp_eval_remote_object(result) {
+            CdpEvalAction::Resolved(outcome) => {
+                if outcome.is_err()
+                    && let Some(oid) = result.get("objectId").and_then(|v| v.as_str())
+                {
+                    let _ = self
+                        .call_for_frame(
+                            target_frame_id,
+                            "Runtime.releaseObject",
+                            json!({ "objectId": oid }),
+                        )
+                        .await;
+                }
+                outcome
+            }
+            CdpEvalAction::ValidateObject { object_id } => {
+                let fn_res = self
+                    .call_for_frame(
+                        target_frame_id,
+                        "Runtime.callFunctionOn",
+                        json!({
+                            "objectId": object_id,
+                            "functionDeclaration": CDP_EVAL_JSON_VALIDATOR,
+                            "returnByValue": true,
+                        }),
+                    )
+                    .await;
+                let _ = self
+                    .call_for_frame(
+                        target_frame_id,
+                        "Runtime.releaseObject",
+                        json!({ "objectId": object_id }),
+                    )
+                    .await;
+                parse_eval_result(fn_res?)
+            }
+        }
+    }
+
     async fn main_frame_id(&self) -> Result<String> {
         if let Some(fid) = self.state.main_frame_id.lock().clone() {
             return Ok(fid);
@@ -2013,8 +2108,12 @@ impl CdpSession {
     async fn capture_dom_snapshot_bounds(
         &self,
         frames: &[FrameInfo],
-    ) -> HashMap<(Option<String>, i64), BoundingBox> {
+    ) -> (
+        HashMap<(Option<String>, i64), BoundingBox>,
+        HashSet<(Option<String>, i64)>,
+    ) {
         let mut map = HashMap::new();
+        let mut shell_bids = HashSet::new();
         let main_fid = self.main_frame_id().await.ok();
         let parent_map: HashMap<String, String> = frames
             .iter()
@@ -2097,6 +2196,16 @@ impl CdpSession {
                     continue;
                 };
                 let node_names = doc["nodes"]["nodeName"].as_array();
+                if let Some(names) = node_names {
+                    for (ni, bid_val) in backend_ids.iter().enumerate() {
+                        if let Some(bid) = bid_val.as_i64()
+                            && let Some(tag) = names.get(ni).and_then(&str_at)
+                            && (tag.eq_ignore_ascii_case("HTML") || tag.eq_ignore_ascii_case("BODY"))
+                        {
+                            shell_bids.insert((doc_fid.clone(), bid));
+                        }
+                    }
+                }
                 let node_attrs = doc["nodes"]["attributes"].as_array();
                 let Some(node_indices) = doc["layout"]["nodeIndex"].as_array() else {
                     continue;
@@ -2173,7 +2282,7 @@ impl CdpSession {
                 }
             }
         }
-        map
+        (map, shell_bids)
     }
 
     async fn wait_for_load_complete(&self) -> Result<()> {
@@ -2365,6 +2474,16 @@ impl DriverSession for CdpSession {
             })?
             .to_string();
 
+        let fallback_profile_dir = self
+            .info
+            .profile_dir
+            .clone()
+            .unwrap_or_else(std::env::temp_dir);
+        let dl_dir = opts
+            .download_dir
+            .clone()
+            .unwrap_or_else(|| fallback_profile_dir.join("downloads").join(&ctx_id));
+
         let mut info = self.info.clone();
         info.session_id = cdp_session_id;
         info.context_id = Some(ctx_id.clone());
@@ -2373,7 +2492,7 @@ impl DriverSession for CdpSession {
         let session = CdpSession::create(
             Arc::clone(&self.conn),
             info,
-            Some(ctx_id),
+            Some(ctx_id.clone()),
             true,
             false,
             opts.main_world_eval,
@@ -2382,7 +2501,14 @@ impl DriverSession for CdpSession {
         )
         .await?;
 
-        session
+        if let Err(err) =
+            configure_cdp_download_behavior(&session.conn, Some(ctx_id.as_str()), &dl_dir).await
+        {
+            let _ = session.dispose().await;
+            return Err(err);
+        }
+
+        if let Err(err) = session
             .apply_initial_options(
                 opts.env_profile,
                 opts.permissions,
@@ -2391,7 +2517,11 @@ impl DriverSession for CdpSession {
                 opts.block_fonts,
                 opts.instant_animations,
             )
-            .await?;
+            .await
+        {
+            let _ = session.dispose().await;
+            return Err(err);
+        }
 
         Ok(session)
     }
@@ -2881,14 +3011,14 @@ impl DriverSession for CdpSession {
                     json!({
                         "expression": expr,
                         "contextId": ctx_id,
-                        "returnByValue": true,
+                        "returnByValue": false,
                         "awaitPromise": true,
                     }),
                 )
                 .await;
 
             match res {
-                Ok(v) => return parse_eval_result(v),
+                Ok(v) => return self.resolve_cdp_eval_result(Some(&fid), v).await,
                 Err(MimikyuError::Protocol { ref message, .. })
                     if attempt == 0 && message.contains("Cannot find context") =>
                 {
@@ -2914,12 +3044,12 @@ impl DriverSession for CdpSession {
                     "Runtime.evaluate",
                     json!({
                         "expression": expr,
-                        "returnByValue": true,
+                        "returnByValue": false,
                         "awaitPromise": true,
                     }),
                 )
                 .await?;
-            return parse_eval_result(res);
+            return self.resolve_cdp_eval_result(None, res).await;
         };
 
         let main_fid = self.main_frame_id().await.ok();
@@ -2929,19 +3059,19 @@ impl DriverSession for CdpSession {
                     "Runtime.evaluate",
                     json!({
                         "expression": expr,
-                        "returnByValue": true,
+                        "returnByValue": false,
                         "awaitPromise": true,
                     }),
                 )
                 .await?;
-            return parse_eval_result(res);
+            return self.resolve_cdp_eval_result(None, res).await;
         }
 
         if self.state.iframe_sessions.lock().contains_key(fid) {
             let ctx_id = self.state.default_contexts.lock().get(fid).copied();
             let mut params = json!({
                 "expression": expr,
-                "returnByValue": true,
+                "returnByValue": false,
                 "awaitPromise": true,
             });
             if let Some(cid) = ctx_id {
@@ -2950,7 +3080,7 @@ impl DriverSession for CdpSession {
             let res = self
                 .call_for_frame(Some(fid), "Runtime.evaluate", params)
                 .await?;
-            return parse_eval_result(res);
+            return self.resolve_cdp_eval_result(Some(fid), res).await;
         }
 
         let ctx_id = self.state.default_contexts.lock().get(fid).copied();
@@ -2965,12 +3095,12 @@ impl DriverSession for CdpSession {
                 json!({
                     "expression": expr,
                     "contextId": ctx_id,
-                    "returnByValue": true,
+                    "returnByValue": false,
                     "awaitPromise": true,
                 }),
             )
             .await?;
-        parse_eval_result(res)
+        self.resolve_cdp_eval_result(None, res).await
     }
 
     async fn call_function_on_node(
@@ -3121,7 +3251,7 @@ impl DriverSession for CdpSession {
         let frames = self.list_frames().await.unwrap_or_default();
 
         // Capture bulk bounding boxes via DOMSnapshot (best-effort single RPC per renderer).
-        let bounds_map = self.capture_dom_snapshot_bounds(&frames).await;
+        let (bounds_map, shell_bids) = self.capture_dom_snapshot_bounds(&frames).await;
 
         let res = self.call("Accessibility.getFullAXTree", json!({})).await?;
         let main_raw = res["nodes"].as_array().cloned().unwrap_or_default();
@@ -3242,7 +3372,7 @@ impl DriverSession for CdpSession {
             nodes.extend(sub_nodes);
         }
 
-        Ok(nodes)
+        Ok(unwrap_document_shell_nodes(nodes, &shell_bids))
     }
 
     async fn resolve_node_box(
@@ -4589,6 +4719,172 @@ fn normalize_cdp_same_site(raw: &str) -> Option<&'static str> {
     }
 }
 
+const CDP_EVAL_JSON_VALIDATOR: &str = r#"function() {
+    const ancestors = new Set();
+    const toString = Object.prototype.toString;
+    const nonJsonTags = new Set([
+        '[object Window]',
+        '[object global]',
+        '[object Document]',
+        '[object HTMLDocument]',
+        '[object XMLDocument]',
+        '[object DocumentFragment]',
+        '[object ShadowRoot]',
+        '[object Text]',
+        '[object Comment]',
+        '[object Map]',
+        '[object Set]',
+        '[object WeakMap]',
+        '[object WeakSet]',
+        '[object Date]',
+        '[object RegExp]',
+        '[object Error]',
+        '[object Promise]',
+        '[object ArrayBuffer]',
+        '[object SharedArrayBuffer]',
+        '[object DataView]',
+        '[object Generator]',
+        '[object AsyncGenerator]'
+    ]);
+    const isRejectedObject = (v) => {
+        if (v === globalThis) return true;
+        if (typeof Node === 'function' && v instanceof Node) return true;
+        if (ArrayBuffer.isView(v)) return true;
+        const tag = toString.call(v);
+        if (nonJsonTags.has(tag)) return true;
+        if (tag.startsWith('[object HTML') || tag.startsWith('[object SVG') || tag.startsWith('[object MathML')) {
+            return true;
+        }
+        return false;
+    };
+    const walk = (v) => {
+        if (v === null) return null;
+        const t = typeof v;
+        if (t === 'boolean' || t === 'string') return v;
+        if (t === 'number') {
+            if (!Number.isFinite(v)) {
+                throw new TypeError('JavaScript evaluation returned non-JSON-serializable value (number: ' + String(v) + ')');
+            }
+            return Object.is(v, -0) ? 0 : v;
+        }
+        if (t !== 'object') {
+            throw new TypeError('JavaScript evaluation returned non-JSON-serializable value (' + t + ')');
+        }
+        if (ancestors.has(v)) {
+            throw new TypeError('Converting circular structure to JSON');
+        }
+        if (Array.isArray(v)) {
+            ancestors.add(v);
+            try {
+                const out = new Array(v.length);
+                for (let i = 0; i < v.length; i++) {
+                    if (i in v) {
+                        const item = v[i];
+                        out[i] = item === undefined ? null : walk(item);
+                    } else {
+                        out[i] = null;
+                    }
+                }
+                return out;
+            } finally {
+                ancestors.delete(v);
+            }
+        }
+        if (isRejectedObject(v)) {
+            throw new TypeError('JavaScript evaluation returned non-JSON-serializable value (' + toString.call(v) + ')');
+        }
+        ancestors.add(v);
+        try {
+            const out = {};
+            for (const k of Object.keys(v)) {
+                const prop = v[k];
+                if (prop !== undefined) {
+                    Object.defineProperty(out, k, {
+                        value: walk(prop),
+                        enumerable: true,
+                        configurable: true,
+                        writable: true
+                    });
+                }
+            }
+            return out;
+        } finally {
+            ancestors.delete(v);
+        }
+    };
+    return walk(this);
+}"#;
+
+#[derive(Debug)]
+enum CdpEvalAction {
+    Resolved(Result<Value>),
+    ValidateObject { object_id: String },
+}
+
+fn classify_cdp_eval_remote_object(result: &Value) -> CdpEvalAction {
+    let r_type = result.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let subtype = result.get("subtype").and_then(|v| v.as_str());
+    match r_type {
+        "undefined" => CdpEvalAction::Resolved(Ok(Value::Null)),
+        "boolean" | "string" => match result.get("value") {
+            Some(v) => CdpEvalAction::Resolved(Ok(v.clone())),
+            None => CdpEvalAction::Resolved(Err(MimikyuError::EvalFailed(format!(
+                "JavaScript evaluation returned {r_type} without value"
+            )))),
+        },
+        "number" => {
+            if result.get("unserializableValue").and_then(|v| v.as_str()) == Some("-0") {
+                return CdpEvalAction::Resolved(Ok(json!(0)));
+            }
+            if let Some(v) = result.get("value")
+                && v.as_f64().is_some_and(f64::is_finite)
+            {
+                return CdpEvalAction::Resolved(Ok(v.clone()));
+            }
+            let detail = result
+                .get("unserializableValue")
+                .and_then(|v| v.as_str())
+                .or_else(|| result.get("description").and_then(|v| v.as_str()))
+                .unwrap_or("non-finite number");
+            CdpEvalAction::Resolved(Err(MimikyuError::EvalFailed(format!(
+                "JavaScript evaluation returned non-JSON-serializable value (number: {detail})"
+            ))))
+        }
+        "object" if subtype == Some("null") => CdpEvalAction::Resolved(Ok(Value::Null)),
+        "object" if subtype.is_none() || subtype == Some("array") => {
+            if let Some(oid) = result.get("objectId").and_then(|v| v.as_str()) {
+                CdpEvalAction::ValidateObject {
+                    object_id: oid.to_string(),
+                }
+            } else if let Some(v) = result.get("value") {
+                CdpEvalAction::Resolved(Ok(v.clone()))
+            } else {
+                CdpEvalAction::Resolved(Err(MimikyuError::EvalFailed(
+                    "JavaScript evaluation returned non-JSON-serializable object without objectId"
+                        .to_string(),
+                )))
+            }
+        }
+        _ => {
+            let detail = result
+                .get("unserializableValue")
+                .and_then(|v| v.as_str())
+                .or_else(|| result.get("description").and_then(|v| v.as_str()))
+                .unwrap_or("non-JSON-serializable value");
+            let kind = if let Some(st) = subtype {
+                st
+            } else if r_type.is_empty() {
+                "unknown"
+            } else {
+                r_type
+            };
+            CdpEvalAction::Resolved(Err(MimikyuError::EvalFailed(format!(
+                "JavaScript evaluation returned non-JSON-serializable value ({kind}: {detail})"
+            ))))
+        }
+    }
+}
+
 fn parse_eval_result(res: Value) -> Result<Value> {
     if let Some(exc) = res.get("exceptionDetails") {
         let text = exc["exception"]["description"]
@@ -4599,13 +4895,27 @@ fn parse_eval_result(res: Value) -> Result<Value> {
         return Err(MimikyuError::EvalFailed(text));
     }
     let result = &res["result"];
-    if result.get("type").and_then(|v| v.as_str()) == Some("undefined") {
+    let r_type = result.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    if r_type == "undefined" {
         return Ok(Value::Null);
     }
     if let Some(v) = result.get("value") {
         return Ok(v.clone());
     }
-    Ok(Value::Null)
+    if r_type == "number"
+        && result.get("unserializableValue").and_then(|v| v.as_str()) == Some("-0")
+    {
+        return Ok(json!(0));
+    }
+    let detail = result
+        .get("unserializableValue")
+        .and_then(|v| v.as_str())
+        .or_else(|| result.get("description").and_then(|v| v.as_str()))
+        .unwrap_or("non-JSON-serializable value");
+    let kind = if r_type.is_empty() { "unknown" } else { r_type };
+    Err(MimikyuError::EvalFailed(format!(
+        "JavaScript evaluation returned non-JSON-serializable value ({kind}: {detail})"
+    )))
 }
 
 fn format_cdp_remote_object(obj: &Value) -> String {
@@ -4943,6 +5253,122 @@ fn parse_cdp_ax_nodes(
     nodes
 }
 
+fn is_unwrappable_doc_shell(
+    node: &AxNode,
+    shell_bids: &HashSet<(Option<String>, i64)>,
+) -> bool {
+    if node.parent_id.is_none() || node.role.eq_ignore_ascii_case("RootWebArea") {
+        return false;
+    }
+    let Some(bid) = node.backend_node_id else {
+        return false;
+    };
+    if !shell_bids.contains(&(node.frame_id.clone(), bid)) {
+        return false;
+    }
+    let role_ok = node.role.eq_ignore_ascii_case("none")
+        || node.role.eq_ignore_ascii_case("generic")
+        || node.ignored;
+    if !role_ok {
+        return false;
+    }
+    node.name.as_deref().map(str::trim).unwrap_or("").is_empty()
+        && !node.focusable
+        && !node.focused
+        && !node.disabled
+        && node.checked.is_none()
+        && node.expanded.is_none()
+        && node.selected.is_none()
+}
+
+fn unwrap_document_shell_nodes(
+    nodes: Vec<AxNode>,
+    shell_bids: &HashSet<(Option<String>, i64)>,
+) -> Vec<AxNode> {
+    if shell_bids.is_empty() || nodes.is_empty() {
+        return nodes;
+    }
+    let removed: HashSet<String> = nodes
+        .iter()
+        .filter(|n| is_unwrappable_doc_shell(n, shell_bids))
+        .map(|n| n.node_id.clone())
+        .collect();
+    if removed.is_empty() {
+        return nodes;
+    }
+
+    let mut parent_of: HashMap<String, Option<String>> = HashMap::with_capacity(nodes.len());
+    let mut children_of: HashMap<String, Vec<String>> = HashMap::with_capacity(nodes.len());
+    for n in &nodes {
+        parent_of.insert(n.node_id.clone(), n.parent_id.clone());
+        children_of
+            .entry(n.node_id.clone())
+            .or_default()
+            .extend(n.child_ids.iter().cloned());
+    }
+    for n in &nodes {
+        if let Some(ref pid) = n.parent_id {
+            let list = children_of.entry(pid.clone()).or_default();
+            if !list.contains(&n.node_id) {
+                list.push(n.node_id.clone());
+            }
+        }
+    }
+
+    let resolve_parent = |start: Option<&str>| -> Option<String> {
+        let mut cur = start;
+        let mut seen = HashSet::new();
+        while let Some(pid) = cur {
+            if !removed.contains(pid) {
+                return Some(pid.to_string());
+            }
+            if !seen.insert(pid) {
+                return None;
+            }
+            cur = parent_of.get(pid).and_then(|p| p.as_deref());
+        }
+        None
+    };
+
+    fn expand_children(
+        cids: &[String],
+        removed: &HashSet<String>,
+        children_of: &HashMap<String, Vec<String>>,
+        visited: &mut HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        for cid in cids {
+            if removed.contains(cid) {
+                if visited.insert(cid.clone())
+                    && let Some(grand) = children_of.get(cid)
+                {
+                    expand_children(grand, removed, children_of, visited, out);
+                }
+            } else if !out.contains(cid) {
+                out.push(cid.clone());
+            }
+        }
+    }
+
+    let mut out = Vec::with_capacity(nodes.len().saturating_sub(removed.len()));
+    for mut node in nodes {
+        if removed.contains(&node.node_id) {
+            continue;
+        }
+        node.parent_id = resolve_parent(node.parent_id.as_deref());
+        let raw_cids = children_of
+            .get(&node.node_id)
+            .cloned()
+            .unwrap_or_else(|| std::mem::take(&mut node.child_ids));
+        let mut expanded = Vec::with_capacity(raw_cids.len());
+        let mut visited = HashSet::new();
+        expand_children(&raw_cids, &removed, &children_of, &mut visited, &mut expanded);
+        node.child_ids = expanded;
+        out.push(node);
+    }
+    out
+}
+
 fn named_key_cdp_spec(key: &str) -> Option<(&'static str, &'static str, u32, Option<&'static str>)> {
     match key {
         "Cancel" => Some(("Cancel", "Cancel", 3, None)),
@@ -5266,5 +5692,167 @@ mod tests {
         assert!((bbox.y - (42.4 + 40.0 * 1.0)).abs() < 1e-9);
         assert!((bbox.width - 96.0).abs() < 1e-9);
         assert!((bbox.height - 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_eval_result_handles_undefined_null_neg_zero_and_rejects_unserializable() {
+        assert_eq!(
+            parse_eval_result(json!({ "result": { "type": "undefined" } })).unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            parse_eval_result(json!({
+                "result": { "type": "object", "subtype": "null", "value": null }
+            }))
+            .unwrap(),
+            Value::Null
+        );
+        assert_eq!(
+            parse_eval_result(json!({
+                "result": { "type": "number", "value": 42 }
+            }))
+            .unwrap(),
+            json!(42)
+        );
+        assert_eq!(
+            parse_eval_result(json!({
+                "result": { "type": "number", "unserializableValue": "-0", "description": "-0" }
+            }))
+            .unwrap(),
+            json!(0)
+        );
+
+        for unserializable in [
+            json!({ "result": { "type": "bigint", "unserializableValue": "42n", "description": "42n" } }),
+            json!({ "result": { "type": "number", "unserializableValue": "NaN", "description": "NaN" } }),
+            json!({ "result": { "type": "number", "unserializableValue": "Infinity", "description": "Infinity" } }),
+            json!({ "result": { "type": "number", "unserializableValue": "-Infinity", "description": "-Infinity" } }),
+            json!({ "result": { "type": "symbol", "description": "Symbol(s)", "objectId": "obj-1" } }),
+            json!({ "result": { "type": "function", "description": "() => {}", "objectId": "obj-2" } }),
+            json!({ "result": { "type": "object", "description": "Object", "objectId": "obj-3" } }),
+        ] {
+            let err = parse_eval_result(unserializable.clone())
+                .expect_err(&format!("expected EvalFailed for {unserializable}"));
+            assert!(
+                matches!(err, MimikyuError::EvalFailed(_)),
+                "unexpected error type: {err:?}"
+            );
+        }
+
+        let exc_err = parse_eval_result(json!({
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": { "description": "TypeError: Converting circular structure to JSON" }
+            }
+        }))
+        .expect_err("exceptionDetails must fail");
+        assert!(matches!(exc_err, MimikyuError::EvalFailed(msg) if msg.contains("circular")));
+    }
+
+    #[test]
+    fn classify_cdp_eval_remote_object_handles_primitives_rejects_non_json_and_validates_objects() {
+        // Primitives resolve immediately
+        match classify_cdp_eval_remote_object(&json!({ "type": "undefined" })) {
+            CdpEvalAction::Resolved(Ok(v)) => assert_eq!(v, Value::Null),
+            other => panic!("unexpected action: {other:?}"),
+        }
+        match classify_cdp_eval_remote_object(&json!({ "type": "object", "subtype": "null", "value": null })) {
+            CdpEvalAction::Resolved(Ok(v)) => assert_eq!(v, Value::Null),
+            other => panic!("unexpected action: {other:?}"),
+        }
+        match classify_cdp_eval_remote_object(&json!({ "type": "number", "unserializableValue": "-0" })) {
+            CdpEvalAction::Resolved(Ok(v)) => assert_eq!(v, json!(0)),
+            other => panic!("unexpected action: {other:?}"),
+        }
+        match classify_cdp_eval_remote_object(&json!({ "type": "boolean", "value": true })) {
+            CdpEvalAction::Resolved(Ok(v)) => assert_eq!(v, json!(true)),
+            other => panic!("unexpected action: {other:?}"),
+        }
+        match classify_cdp_eval_remote_object(&json!({ "type": "string", "value": "hi" })) {
+            CdpEvalAction::Resolved(Ok(v)) => assert_eq!(v, json!("hi")),
+            other => panic!("unexpected action: {other:?}"),
+        }
+
+        // Functions, symbols, bigint, non-finite numbers, and non-JSON object subtypes reject in 1 call
+        for bad in [
+            json!({ "type": "function", "description": "() => {}", "objectId": "f-1" }),
+            json!({ "type": "function", "description": "class Foo {}", "objectId": "f-2" }),
+            json!({ "type": "bigint", "unserializableValue": "42n" }),
+            json!({ "type": "symbol", "description": "Symbol(s)", "objectId": "s-1" }),
+            json!({ "type": "number", "unserializableValue": "NaN" }),
+            json!({ "type": "number", "unserializableValue": "Infinity" }),
+            json!({ "type": "number", "unserializableValue": "-Infinity" }),
+            json!({ "type": "object", "subtype": "node", "objectId": "n-1" }),
+            json!({ "type": "object", "subtype": "map", "objectId": "m-1" }),
+            json!({ "type": "object", "subtype": "set", "objectId": "st-1" }),
+            json!({ "type": "object", "subtype": "date", "objectId": "d-1" }),
+            json!({ "type": "object", "subtype": "regexp", "objectId": "r-1" }),
+            json!({ "type": "object", "subtype": "error", "objectId": "e-1" }),
+        ] {
+            match classify_cdp_eval_remote_object(&bad) {
+                CdpEvalAction::Resolved(Err(MimikyuError::EvalFailed(_))) => {}
+                other => panic!("expected EvalFailed for {bad}, got {other:?}"),
+            }
+        }
+
+        // Plain objects & arrays trigger deep JSON validator
+        for obj in [
+            json!({ "type": "object", "description": "Object", "objectId": "o-1" }),
+            json!({ "type": "object", "subtype": "array", "objectId": "a-1" }),
+        ] {
+            match classify_cdp_eval_remote_object(&obj) {
+                CdpEvalAction::ValidateObject { object_id } => assert!(!object_id.is_empty()),
+                other => panic!("expected ValidateObject for {obj}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn unwrap_document_shell_nodes_strips_html_and_body_only() {
+        let mk = |id: &str, pid: Option<&str>, cids: Vec<&str>, role: &str, bid: Option<i64>, ignored: bool| {
+            AxNode {
+                node_id: id.to_string(),
+                parent_id: pid.map(ToString::to_string),
+                child_ids: cids.into_iter().map(ToString::to_string).collect(),
+                role: role.to_string(),
+                name: None,
+                value: None,
+                description: None,
+                backend_node_id: bid,
+                frame_id: Some("f1".to_string()),
+                ignored,
+                focusable: false,
+                focused: false,
+                disabled: false,
+                checked: None,
+                expanded: None,
+                selected: None,
+                required: false,
+                level: None,
+                bounds: None,
+            }
+        };
+
+        let raw = vec![
+            mk("1", None, vec!["2"], "RootWebArea", Some(1), false),
+            mk("2", Some("1"), vec!["3"], "none", Some(2), true),      // <html>
+            mk("3", Some("2"), vec!["4", "5"], "generic", Some(3), false), // <body>
+            mk("4", Some("3"), vec![], "button", Some(4), false),    // <button>
+            mk("5", Some("3"), vec!["6"], "generic", Some(5), false), // user <div>
+            mk("6", Some("5"), vec![], "button", Some(6), false),    // nested <button>
+        ];
+        let mut shell_bids = HashSet::new();
+        shell_bids.insert((Some("f1".to_string()), 2));
+        shell_bids.insert((Some("f1".to_string()), 3));
+
+        let unwrapped = unwrap_document_shell_nodes(raw, &shell_bids);
+        let ids: Vec<&str> = unwrapped.iter().map(|n| n.node_id.as_str()).collect();
+        assert_eq!(ids, vec!["1", "4", "5", "6"]);
+        assert_eq!(unwrapped[0].child_ids, vec!["4", "5"]);
+        assert_eq!(unwrapped[1].parent_id.as_deref(), Some("1"));
+        assert_eq!(unwrapped[2].parent_id.as_deref(), Some("1"));
+        // User <div> ("5") is NOT unwrapped
+        assert_eq!(unwrapped[2].child_ids, vec!["6"]);
+        assert_eq!(unwrapped[3].parent_id.as_deref(), Some("5"));
     }
 }

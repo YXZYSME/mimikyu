@@ -6,10 +6,11 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tempfile::{Builder, NamedTempFile, TempDir};
 
-use crate::driver::{now_ms, DriverSession, StorageState};
+use crate::driver::{now_ms, Cookie, DriverSession, StorageState};
 use crate::error::{MimikyuError, Result};
 
 pub const LOCK_FILE_NAME: &str = ".mimikyu.lock";
+pub const SESSION_COOKIES_FILE: &str = ".mimikyu.session_cookies.json";
 
 /// Cross-process advisory `flock` lock protecting a persistent profile directory.
 pub struct ProfileLock {
@@ -394,6 +395,63 @@ pub fn load_storage_state(path: &Path) -> Result<StorageState> {
     Ok(state)
 }
 
+/// Persist non-persistent session cookies (`expires.is_none()`) atomically with `0o600` permissions.
+/// Removes the sidecar file if no session cookies remain.
+pub fn save_session_cookies(profile_dir: &Path, cookies: &[Cookie]) -> Result<()> {
+    let path = profile_dir.join(SESSION_COOKIES_FILE);
+    let session_cookies: Vec<&Cookie> = cookies.iter().filter(|c| c.expires.is_none()).collect();
+    if session_cookies.is_empty() {
+        match fs::remove_file(&path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(MimikyuError::Io(e)),
+        }
+    }
+
+    fs::create_dir_all(profile_dir)?;
+    let json_bytes = serde_json::to_vec_pretty(&session_cookies)?;
+    let mut tmp = NamedTempFile::new_in(profile_dir)?;
+    tmp.write_all(&json_bytes)?;
+    tmp.as_file().flush()?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(tmp.path(), perms)?;
+    }
+
+    tmp.persist(&path).map_err(|e| MimikyuError::Io(e.error))?;
+    Ok(())
+}
+
+/// Load and validate persisted session cookies for a persistent profile directory.
+pub fn load_session_cookies(profile_dir: &Path) -> Result<Vec<Cookie>> {
+    let path = profile_dir.join(SESSION_COOKIES_FILE);
+    let bytes = match fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(MimikyuError::Io(e)),
+    };
+    let cookies: Vec<Cookie> = serde_json::from_slice(&bytes)?;
+    for c in &cookies {
+        if c.name.trim().is_empty() {
+            return Err(MimikyuError::InvalidConfig(
+                "session cookies file contains a cookie with empty name".to_string(),
+            ));
+        }
+        if let Some(exp) = c.expires
+            && !exp.is_finite()
+        {
+            return Err(MimikyuError::InvalidConfig(format!(
+                "cookie '{}' has non-finite expiry",
+                c.name
+            )));
+        }
+    }
+    Ok(cookies)
+}
+
 pub async fn export_storage_state(session: &dyn DriverSession, path: &Path) -> Result<StorageState> {
     let state = session.storage_state().await?;
     save_storage_state(path, &state)?;
@@ -524,5 +582,64 @@ mod tests {
         assert_eq!(loaded.cookies.len(), 1);
         assert_eq!(loaded.cookies[0].name, "sid");
         assert_eq!(loaded.origins.len(), 1);
+    }
+
+    #[test]
+    fn session_cookies_atomic_save_filter_validate_and_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_session_cookies(dir.path()).unwrap().is_empty());
+
+        let cookies = vec![
+            Cookie {
+                name: "sess".to_string(),
+                value: "s1".to_string(),
+                domain: "127.0.0.1".to_string(),
+                path: "/".to_string(),
+                expires: None,
+                http_only: true,
+                secure: false,
+                same_site: Some("Lax".to_string()),
+            },
+            Cookie {
+                name: "persist".to_string(),
+                value: "p1".to_string(),
+                domain: "127.0.0.1".to_string(),
+                path: "/".to_string(),
+                expires: Some(1_900_000_000.0),
+                http_only: false,
+                secure: false,
+                same_site: None,
+            },
+        ];
+
+        save_session_cookies(dir.path(), &cookies).unwrap();
+        let path = dir.path().join(SESSION_COOKIES_FILE);
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let loaded = load_session_cookies(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "sess");
+        assert_eq!(loaded[0].value, "s1");
+        assert!(loaded[0].http_only);
+        assert!(loaded[0].expires.is_none());
+
+        // Saving with only persistent cookies or empty removes the file
+        save_session_cookies(dir.path(), &cookies[1..]).unwrap();
+        assert!(!path.exists());
+        assert!(load_session_cookies(dir.path()).unwrap().is_empty());
+
+        // Validation rejects empty cookie name
+        fs::write(
+            &path,
+            r#"[{"name":" ","value":"v","domain":"127.0.0.1","path":"/","expires":null,"http_only":false,"secure":false,"same_site":null}]"#,
+        )
+        .unwrap();
+        assert!(load_session_cookies(dir.path()).is_err());
     }
 }

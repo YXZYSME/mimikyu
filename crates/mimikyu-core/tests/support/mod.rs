@@ -257,6 +257,15 @@ impl TestServer {
                                     .unwrap_or_default(),
                             )
                         }
+                        ("GET", "/iso/clear-cookies") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![
+                                ("Set-Cookie", "iso_http=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax".to_string()),
+                                ("Set-Cookie", "iso_js=; Path=/; Max-Age=0".to_string()),
+                            ],
+                            br#"<!doctype html><html><body>cleared</body></html>"#.to_vec(),
+                        ),
                         ("GET", "/iso/cache-counter") => {
                             let n = cache_req.fetch_add(1, Ordering::SeqCst) + 1;
                             (
@@ -283,10 +292,16 @@ impl TestServer {
   <script>
     let webglVendor = null;
     let webglRenderer = null;
+    let glVendor = null;
+    let glRenderer = null;
+    let glVersion = null;
     try {
       const c = document.createElement('canvas');
-      const gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+      const gl = c.getContext('webgl2') || c.getContext('webgl') || c.getContext('experimental-webgl');
       if (gl) {
+        glVendor = gl.getParameter(gl.VENDOR);
+        glRenderer = gl.getParameter(gl.RENDERER);
+        glVersion = gl.getParameter(gl.VERSION);
         const ext = gl.getExtension('WEBGL_debug_renderer_info');
         if (ext) {
           webglVendor = gl.getParameter(ext.UNMASKED_VENDOR_WEBGL);
@@ -334,6 +349,9 @@ impl TestServer {
       tzOffset: new Date().getTimezoneOffset(),
       webglVendor,
       webglRenderer,
+      glVendor,
+      glRenderer,
+      glVersion,
       audioSampleRate,
       audioBaseLatency,
       rtcBlocked,
@@ -2230,6 +2248,32 @@ self.onconnect = (e) => {
 </html>"#
                                 .to_vec(),
                         ),
+                        ("GET", "/download-page") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Download Test Page</title></head>
+<body>
+  <h1>Download Test</h1>
+  <a id="dl-bin" href="/download/sample-rust-test.bin" download="sample-rust-test.bin">Download Sample Bin</a>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/download/sample-rust-test.bin") => {
+                            let payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+                            (
+                                "200 OK",
+                                "application/octet-stream",
+                                vec![(
+                                    "Content-Disposition",
+                                    "attachment; filename=\"sample-rust-test.bin\"".to_string(),
+                                )],
+                                payload,
+                            )
+                        }
                         _ => (
                             "404 Not Found",
                             "text/plain",

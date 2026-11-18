@@ -1089,3 +1089,353 @@ async fn per_session_concurrency_does_not_block_distinct_sessions() {
 
     mgr.shutdown_all().await.expect("shutdown_all");
 }
+
+async fn assert_persistent_session_cookies(engine: EngineKind) {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let server = TestServer::start().await;
+    let mgr = SessionManager::new(state_dir.clone()).expect("SessionManager");
+
+    let s1 = mgr
+        .create_session(SessionCreateOpts {
+            session_id: Some("sc1".into()),
+            engine: Some(engine),
+            profile: Some("session-cookies".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("create persistent sc1");
+    let s1_pid = s1.pid.expect("sc1 pid");
+
+    mgr.open("sc1", &server.url("/iso/set-all"))
+        .await
+        .expect("open /iso/set-all");
+    mgr.wait(
+        "sc1",
+        WaitRequest {
+            text: Some("ready".into()),
+            timeout_ms: Some(5000),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("wait ready");
+
+    mgr.close_session("sc1").await.expect("close sc1");
+    assert_pgid_gone(s1_pid as libc::pid_t);
+
+    let sidecar = state_dir
+        .join("profiles")
+        .join("session-cookies")
+        .join(mimikyu_core::isolation::SESSION_COOKIES_FILE);
+    assert!(
+        sidecar.is_file(),
+        "{engine}: expected session cookies sidecar at {}",
+        sidecar.display()
+    );
+
+    // Reopen in a fresh SessionManager and verify both HttpOnly and normal session cookies survived.
+    let mgr2 = SessionManager::new(state_dir).expect("SessionManager 2");
+    let s2 = mgr2
+        .create_session(SessionCreateOpts {
+            session_id: Some("sc2".into()),
+            engine: Some(engine),
+            profile: Some("session-cookies".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("reopen persistent sc2");
+    let s2_pid = s2.pid.expect("sc2 pid");
+
+    mgr2.open("sc2", &server.url("/iso/echo-cookies"))
+        .await
+        .expect("open /iso/echo-cookies");
+    let body = serde_json::to_string(
+        &mgr2
+            .extract("sc2", ExtractMode::Text)
+            .await
+            .expect("extract echo-cookies"),
+    )
+    .unwrap();
+    assert!(
+        body.contains("iso_http=http_secret") && body.contains("iso_js=js_secret"),
+        "{engine}: session cookies did not persist across close_session/reopen: {body}"
+    );
+
+    // Clear the session cookies and confirm they stay cleared across close + reopen.
+    mgr2.open("sc2", &server.url("/iso/clear-cookies"))
+        .await
+        .expect("open /iso/clear-cookies");
+    mgr2.close_session("sc2").await.expect("close sc2");
+    assert_pgid_gone(s2_pid as libc::pid_t);
+    assert!(
+        !sidecar.exists(),
+        "{engine}: expected session cookies sidecar to be removed after clearing cookies"
+    );
+
+    let s3 = mgr2
+        .create_session(SessionCreateOpts {
+            session_id: Some("sc3".into()),
+            engine: Some(engine),
+            profile: Some("session-cookies".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("reopen persistent sc3");
+    let s3_pid = s3.pid.expect("sc3 pid");
+    mgr2.open("sc3", &server.url("/iso/echo-cookies"))
+        .await
+        .expect("open /iso/echo-cookies after clear");
+    let body_after = serde_json::to_string(
+        &mgr2
+            .extract("sc3", ExtractMode::Text)
+            .await
+            .expect("extract echo-cookies after clear"),
+    )
+    .unwrap();
+    assert!(
+        !body_after.contains("iso_http=http_secret") && !body_after.contains("iso_js=js_secret"),
+        "{engine}: cleared session cookies unexpectedly persisted: {body_after}"
+    );
+
+    mgr2.close_session("sc3").await.expect("close sc3");
+    assert_pgid_gone(s3_pid as libc::pid_t);
+    mgr2.shutdown_all().await.expect("shutdown_all");
+}
+
+#[tokio::test]
+async fn persistent_profile_persists_and_clears_session_cookies_chromium() {
+    assert_persistent_session_cookies(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn persistent_profile_persists_and_clears_session_cookies_firefox() {
+    assert_persistent_session_cookies(EngineKind::Firefox).await;
+}
+
+async fn assert_virtual_context_webrtc_no_host_candidate_under_proxy(engine: EngineKind) {
+    let server = TestServer::start().await;
+    let proxy = LocalHttpProxy::start(None).await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mgr = SessionManager::new(tmp.path().join("state")).expect("SessionManager");
+
+    // Initialize shared virtual pool WITHOUT preset/proxy first (env_profile: None)
+    mgr.create_session(SessionCreateOpts {
+        session_id: Some("v_plain".into()),
+        engine: Some(engine),
+        virtual_ctx: true,
+        ..Default::default()
+    })
+    .await
+    .expect("create v_plain");
+
+    // Create proxied virtual context with preset + locale + timezone
+    mgr.create_session(SessionCreateOpts {
+        session_id: Some("v_rtc".into()),
+        engine: Some(engine),
+        virtual_ctx: true,
+        proxy: Some(proxy.proxy_url()),
+        preset: Some(PresetKind::MacOs),
+        locale: Some("en-US".into()),
+        timezone: Some("America/New_York".into()),
+        ..Default::default()
+    })
+    .await
+    .expect("create v_rtc");
+
+    mgr.open("v_rtc", &server.url("/isolation"))
+        .await
+        .expect("open /isolation in v_rtc");
+    assert!(
+        !proxy.hits().is_empty(),
+        "{engine}: expected v_rtc traffic routed through LocalHttpProxy"
+    );
+
+    let probe = mgr
+        .eval(
+            "v_rtc",
+            r#"(() => new Promise(async (resolve) => {
+                const PC = window.RTCPeerConnection || window.webkitRTCPeerConnection || window.mozRTCPeerConnection;
+                if (!PC) return resolve({ status: "unavailable", candidates: [], hasHostCandidate: false });
+                let pc;
+                try { pc = new PC({ iceServers: [] }); }
+                catch (e) { return resolve({ status: "blocked", error: String(e), candidates: [], hasHostCandidate: false }); }
+                const cands = [];
+                let settled = false;
+                const finish = (status) => {
+                    if (settled) return;
+                    settled = true;
+                    try { pc.close(); } catch {}
+                    const hasHost = cands.some((c) => /\btyp\s+host\b/i.test(c));
+                    resolve({ status, candidates: cands, hasHostCandidate: hasHost });
+                };
+                const timer = setTimeout(() => finish("timeout"), 1200);
+                pc.onicecandidate = (ev) => {
+                    if (ev && ev.candidate && ev.candidate.candidate) {
+                        cands.push(ev.candidate.candidate);
+                    } else if (!ev.candidate) {
+                        clearTimeout(timer);
+                        finish("ok");
+                    }
+                };
+                try {
+                    pc.createDataChannel("probe");
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                } catch (e) {
+                    clearTimeout(timer);
+                    finish("error:" + String(e));
+                }
+            }))()"#,
+            false,
+        )
+        .await
+        .expect("eval WebRTC probe");
+
+    assert_ne!(
+        probe["status"], "blocked",
+        "{engine}: DisableNonProxiedUdp must NOT block RTCPeerConnection construction: {probe}"
+    );
+    assert_eq!(
+        probe["hasHostCandidate"], false,
+        "{engine}: VirtualContext under proxy leaked WebRTC host candidates: {probe}"
+    );
+
+    mgr.shutdown_all().await.expect("shutdown_all");
+}
+
+#[tokio::test]
+async fn virtual_context_webrtc_no_host_candidate_under_proxy_chromium() {
+    assert_virtual_context_webrtc_no_host_candidate_under_proxy(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn virtual_context_webrtc_no_host_candidate_under_proxy_firefox() {
+    assert_virtual_context_webrtc_no_host_candidate_under_proxy(EngineKind::Firefox).await;
+}
+
+async fn wait_for_file_bytes(path: &std::path::Path, expected_len: usize) -> Vec<u8> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+    loop {
+        if let Ok(bytes) = std::fs::read(path)
+            && bytes.len() == expected_len
+        {
+            return bytes;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for file {} ({expected_len} bytes)",
+            path.display()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn assert_session_download_isolation(engine: EngineKind, test_virtual: bool) {
+    let server = TestServer::start().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let mgr = SessionManager::new(state_dir.clone()).expect("SessionManager");
+    let expected_payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+
+    // 1. Ephemeral session download isolation + cleanup on close
+    mgr.create_session(SessionCreateOpts {
+        session_id: Some("dl-ephem".into()),
+        engine: Some(engine),
+        ephemeral: true,
+        block_images: true,
+        block_media: true,
+        ..Default::default()
+    })
+    .await
+    .expect("create dl-ephem");
+
+    mgr.open("dl-ephem", &server.url("/download-page"))
+        .await
+        .expect("open /download-page");
+    let snap = mgr
+        .snapshot("dl-ephem", SnapshotOptions::default())
+        .await
+        .expect("snapshot");
+    let dl_ref = find_ref_by_name_substr(&snap, "Download Sample Bin");
+    mgr.click("dl-ephem", &dl_ref, None)
+        .await
+        .expect("click download link");
+
+    let ephem_dl_dir = state_dir.join("downloads").join("dl-ephem");
+    let ephem_file = ephem_dl_dir.join("sample-rust-test.bin");
+    let got = wait_for_file_bytes(&ephem_file, expected_payload.len()).await;
+    assert_eq!(got, expected_payload);
+    assert!(
+        server
+            .hits()
+            .iter()
+            .any(|h| h.contains("/download/sample-rust-test.bin"))
+    );
+
+    mgr.close_session("dl-ephem")
+        .await
+        .expect("close dl-ephem");
+    assert!(
+        !ephem_dl_dir.exists(),
+        "ephemeral download dir {} must be cleaned up on close",
+        ephem_dl_dir.display()
+    );
+
+    // 2. Virtual context download isolation + cleanup on close (Chromium CDP)
+    if test_virtual {
+        mgr.create_session(SessionCreateOpts {
+            session_id: Some("dl-virt".into()),
+            engine: Some(engine),
+            virtual_ctx: true,
+            block_images: true,
+            block_media: true,
+            ..Default::default()
+        })
+        .await
+        .expect("create dl-virt");
+
+        mgr.open("dl-virt", &server.url("/download-page"))
+            .await
+            .expect("open /download-page in virtual");
+        let vsnap = mgr
+            .snapshot("dl-virt", SnapshotOptions::default())
+            .await
+            .expect("snapshot virtual");
+        let vref = find_ref_by_name_substr(&vsnap, "Download Sample Bin");
+        mgr.click("dl-virt", &vref, None)
+            .await
+            .expect("click virtual download link");
+
+        let virt_dl_dir = state_dir.join("downloads").join("dl-virt");
+        let virt_file = virt_dl_dir.join("sample-rust-test.bin");
+        let got_virt = wait_for_file_bytes(&virt_file, expected_payload.len()).await;
+        assert_eq!(got_virt, expected_payload);
+
+        mgr.close_session("dl-virt").await.expect("close dl-virt");
+        assert!(
+            !virt_dl_dir.exists(),
+            "virtual download dir {} must be cleaned up on close",
+            virt_dl_dir.display()
+        );
+    }
+
+    if let Some(home_dl) = dirs::download_dir() {
+        assert!(
+            !home_dl.join("sample-rust-test.bin").exists(),
+            "{engine}: must not write into user Downloads directory"
+        );
+    }
+
+    mgr.shutdown_all().await.expect("shutdown_all");
+}
+
+#[tokio::test]
+async fn session_manager_download_isolation_and_ephemeral_cleanup_chromium() {
+    assert_session_download_isolation(EngineKind::Chromium, true).await;
+}
+
+#[tokio::test]
+async fn session_manager_download_isolation_and_ephemeral_cleanup_firefox() {
+    assert_session_download_isolation(EngineKind::Firefox, false).await;
+}

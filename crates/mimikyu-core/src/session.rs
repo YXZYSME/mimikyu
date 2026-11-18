@@ -25,8 +25,8 @@ use crate::input::{
     TypeOptions,
 };
 use crate::isolation::{
-    export_storage_state, import_storage_state, NamedProfileInfo, ProfileLock, ProfileStore,
-    VirtualContext, VirtualContextPool,
+    export_storage_state, import_storage_state, load_session_cookies, save_session_cookies,
+    NamedProfileInfo, ProfileLock, ProfileStore, VirtualContext, VirtualContextPool,
 };
 use crate::network::BlockPolicy;
 use crate::snapshot::{
@@ -252,6 +252,8 @@ struct ManagedSession {
     meta: Arc<parking_lot::RwLock<SessionSummary>>,
     driver: Arc<dyn DriverSession>,
     virtual_ctx: Option<VirtualContext>,
+    persistent_path: Option<PathBuf>,
+    ephemeral_download_dir: Option<PathBuf>,
     chokepoint: ChokepointInput,
     snapshot_state: SnapshotState,
     default_humanize: bool,
@@ -448,6 +450,13 @@ impl SessionManager {
             blocked_urls: Vec::new(),
         };
 
+        let download_dir = safe_session_download_dir(&self.config.state_dir, &session_id);
+        let mut ephemeral_download_dir = if persistent_path.is_none() {
+            Some(download_dir.clone())
+        } else {
+            None
+        };
+
         let (driver, virtual_ctx, mode, dedicated_pid): (
             Arc<dyn DriverSession>,
             Option<VirtualContext>,
@@ -464,15 +473,25 @@ impl SessionManager {
                 main_world_eval: opts.main_world_eval,
                 permissions: Vec::new(),
                 telemetry_capacity: self.config.default_telemetry_capacity,
+                download_dir: Some(download_dir),
             };
-            let vc = self
+            let vc = match self
                 .create_virtual_context(engine, opts.headless, &session_id, ctx_opts)
-                .await?;
+                .await
+            {
+                Ok(vc) => vc,
+                Err(err) => {
+                    if let Some(ref dl_dir) = ephemeral_download_dir {
+                        cleanup_ephemeral_download_dir(dl_dir);
+                    }
+                    return Err(err);
+                }
+            };
             let drv = Arc::clone(vc.session());
             (drv, Some(vc), "virtual".to_string(), None)
         } else {
-            let (profile_mode, mode_label) = match persistent_path {
-                Some(path) => (ProfileMode::Persistent(path), "persistent".to_string()),
+            let (profile_mode, mode_label) = match persistent_path.as_ref() {
+                Some(path) => (ProfileMode::Persistent(path.clone()), "persistent".to_string()),
                 None => (ProfileMode::EphemeralDir, "ephemeral".to_string()),
             };
             let launch_opts = LaunchOptions {
@@ -488,9 +507,33 @@ impl SessionManager {
                 instant_animations: opts.instant_animations,
                 main_world_eval: opts.main_world_eval,
                 telemetry_capacity: self.config.default_telemetry_capacity,
+                download_dir: Some(download_dir),
                 ..Default::default()
             };
-            let drv = driver_for(engine).launch(launch_opts).await?;
+            let drv = match driver_for(engine).launch(launch_opts).await {
+                Ok(drv) => drv,
+                Err(err) => {
+                    if let Some(ref dl_dir) = ephemeral_download_dir {
+                        cleanup_ephemeral_download_dir(dl_dir);
+                    }
+                    return Err(err);
+                }
+            };
+            if let Some(ref prof_dir) = persistent_path {
+                match load_session_cookies(prof_dir) {
+                    Ok(session_cookies) if !session_cookies.is_empty() => {
+                        if let Err(err) = drv.set_cookies(session_cookies).await {
+                            let _ = drv.dispose().await;
+                            return Err(err);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        let _ = drv.dispose().await;
+                        return Err(err);
+                    }
+                }
+            }
             let pid = drv.info().pid;
             (drv, None, mode_label, pid)
         };
@@ -522,6 +565,8 @@ impl SessionManager {
             meta: Arc::clone(&meta),
             driver: Arc::clone(&driver),
             virtual_ctx,
+            persistent_path,
+            ephemeral_download_dir: ephemeral_download_dir.take(),
             chokepoint,
             snapshot_state: SnapshotState::default(),
             default_humanize: opts.humanize,
@@ -539,7 +584,12 @@ impl SessionManager {
             handle: Arc::new(tokio::sync::Mutex::new(managed)),
         };
 
-        let dispose_on_shutdown: Option<(Option<VirtualContext>, Arc<dyn DriverSession>)> = {
+        struct ShutdownDispose {
+            vc: Option<VirtualContext>,
+            drv: Arc<dyn DriverSession>,
+            dl_dir: Option<PathBuf>,
+        }
+        let dispose_on_shutdown: Option<ShutdownDispose> = {
             let mut reg = self.registry.lock();
             reg.pending.remove(&session_id);
             pending_guard.disarm();
@@ -548,20 +598,25 @@ impl SessionManager {
                     .handle
                     .try_lock()
                     .expect("newly created session handle must be uncontended");
-                let vc = guard.virtual_ctx.take();
-                let drv = Arc::clone(&guard.driver);
-                Some((vc, drv))
+                Some(ShutdownDispose {
+                    vc: guard.virtual_ctx.take(),
+                    drv: Arc::clone(&guard.driver),
+                    dl_dir: guard.ephemeral_download_dir.take(),
+                })
             } else {
                 reg.active.insert(session_id, entry);
                 None
             }
         };
 
-        if let Some((vc, drv)) = dispose_on_shutdown {
-            if let Some(vc) = vc {
+        if let Some(cleanup) = dispose_on_shutdown {
+            if let Some(vc) = cleanup.vc {
                 let _ = vc.dispose().await;
             } else {
-                let _ = drv.dispose().await;
+                let _ = cleanup.drv.dispose().await;
+            }
+            if let Some(ref dl) = cleanup.dl_dir {
+                cleanup_ephemeral_download_dir(dl);
             }
             return Err(MimikyuError::Disposed);
         }
@@ -1318,10 +1373,47 @@ async fn dispose_session_entry(entry: SessionEntry) -> Result<()> {
         return Ok(());
     }
     managed.disposed = true;
-    if let Some(vc) = managed.virtual_ctx.take() {
+    if let Some(ref prof_dir) = managed.persistent_path
+        && let Ok(cookies) = managed.driver.cookies().await
+    {
+        let _ = save_session_cookies(prof_dir, &cookies);
+    }
+    let res = if let Some(vc) = managed.virtual_ctx.take() {
         vc.dispose().await
     } else {
         managed.driver.dispose().await
+    };
+    if let Some(dl_dir) = managed.ephemeral_download_dir.take() {
+        cleanup_ephemeral_download_dir(&dl_dir);
+    }
+    res
+}
+
+fn safe_session_download_dir(state_dir: &Path, session_id: &str) -> PathBuf {
+    let safe_id = if !session_id.is_empty()
+        && session_id != "."
+        && session_id != ".."
+        && !session_id.contains("..")
+        && session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        session_id.to_string()
+    } else {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in session_id.as_bytes() {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0100_0000_01b3);
+        }
+        format!("s-{h:016x}")
+    };
+    state_dir.join("downloads").join(safe_id)
+}
+
+fn cleanup_ephemeral_download_dir(dl_dir: &Path) {
+    let _ = fs::remove_dir_all(dl_dir);
+    if let Some(parent) = dl_dir.parent() {
+        let _ = fs::remove_dir(parent);
     }
 }
 

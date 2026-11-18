@@ -87,6 +87,10 @@ async fn assert_snapshot_and_diff_parity(engine: EngineKind) {
     .await
     .expect("max_depth=0 snapshot");
     assert!(
+        !depth0.tree.is_empty(),
+        "{engine}: max_depth=0 must return top-level body children, got empty tree"
+    );
+    assert!(
         depth0.tree.iter().all(|n| n.children.is_empty()),
         "max_depth=0 must have no nested children"
     );
@@ -1140,4 +1144,149 @@ async fn live_oopif_exec_context_isolation_chromium() {
 
     session.dispose().await.expect("dispose");
     assert_pgid_gone(pid as libc::pid_t);
+}
+
+async fn assert_snapshot_max_depth_parity(engine: EngineKind) {
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            ..Default::default()
+        })
+        .await
+        .expect("launch browser");
+    let pid = session.info().pid.expect("pid");
+
+    let nested = format!(
+        "<!doctype html><html><body>\
+         <button id=\"top-btn\">TopBtn</button>\
+         <nav aria-label=\"Main\"><a href=\"#x\">NavLink</a></nav>\
+         {}<button id=\"deep-btn\">DeepTarget</button>{}\
+         </body></html>",
+        "<div>".repeat(12),
+        "</div>".repeat(12),
+    );
+    let url = format!(
+        "data:text/html,{}",
+        url::form_urlencoded::byte_serialize(nested.as_bytes())
+            .collect::<String>()
+            .replace('+', "%20")
+    );
+    session.navigate(&url).await.expect("navigate nested");
+
+    let mut st0 = SnapshotState::default();
+    let d0 = SnapshotEngine::capture(
+        session.as_ref(),
+        &mut st0,
+        SnapshotOptions {
+            max_depth: Some(0),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("max_depth=0");
+    assert!(
+        d0.text.contains("TopBtn") && d0.text.contains("Main"),
+        "{engine} max_depth=0 must keep shallow body children, got:\n{}",
+        d0.text
+    );
+    assert!(
+        !d0.text.contains("NavLink") && !d0.text.contains("DeepTarget"),
+        "{engine} max_depth=0 must prune deeper children, got:\n{}",
+        d0.text
+    );
+
+    let mut st0_inter = SnapshotState::default();
+    let d0_inter = SnapshotEngine::capture(
+        session.as_ref(),
+        &mut st0_inter,
+        SnapshotOptions {
+            max_depth: Some(0),
+            interactive_only: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("max_depth=0 interactive_only");
+    assert!(
+        d0_inter.text.contains("TopBtn"),
+        "{engine} interactive max_depth=0 must keep TopBtn, got:\n{}",
+        d0_inter.text
+    );
+    assert!(
+        !d0_inter.text.contains("NavLink") && !d0_inter.text.contains("DeepTarget"),
+        "{engine} interactive max_depth=0 must prune deeper nodes, got:\n{}",
+        d0_inter.text
+    );
+
+    let mut st1 = SnapshotState::default();
+    let d1 = SnapshotEngine::capture(
+        session.as_ref(),
+        &mut st1,
+        SnapshotOptions {
+            max_depth: Some(1),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("max_depth=1");
+    assert!(
+        d1.text.contains("TopBtn") && d1.text.contains("Main") && d1.text.contains("NavLink"),
+        "{engine} max_depth=1 must keep TopBtn, Main, NavLink, got:\n{}",
+        d1.text
+    );
+    assert!(
+        !d1.text.contains("DeepTarget"),
+        "{engine} max_depth=1 must prune DeepTarget, got:\n{}",
+        d1.text
+    );
+
+    let mut st1_inter = SnapshotState::default();
+    let d1_inter = SnapshotEngine::capture(
+        session.as_ref(),
+        &mut st1_inter,
+        SnapshotOptions {
+            max_depth: Some(1),
+            interactive_only: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("max_depth=1 interactive_only");
+    assert!(
+        d1_inter.text.contains("TopBtn") && d1_inter.text.contains("NavLink"),
+        "{engine} interactive max_depth=1 must keep TopBtn and NavLink, got:\n{}",
+        d1_inter.text
+    );
+    assert!(
+        !d1_inter.text.contains("DeepTarget"),
+        "{engine} interactive max_depth=1 must prune DeepTarget, got:\n{}",
+        d1_inter.text
+    );
+
+    let mut st_full = SnapshotState::default();
+    let full = SnapshotEngine::capture(session.as_ref(), &mut st_full, SnapshotOptions::default())
+        .await
+        .expect("full snapshot");
+    assert!(
+        full.text.contains("TopBtn")
+            && full.text.contains("NavLink")
+            && full.text.contains("DeepTarget"),
+        "{engine} full snapshot must include all controls, got:\n{}",
+        full.text
+    );
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn live_snapshot_max_depth_parity_chromium() {
+    assert_snapshot_max_depth_parity(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn live_snapshot_max_depth_parity_firefox() {
+    assert_snapshot_max_depth_parity(EngineKind::Firefox).await;
 }
