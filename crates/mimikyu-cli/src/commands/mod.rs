@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use mimikyu_core::bench::{format_bench_human, run_benchmark, BenchOptions};
 use mimikyu_core::daemon::{
     daemon_status, daemon_stop, ensure_daemon, run_daemon_foreground, DaemonConfig,
     DEFAULT_DAEMON_IDLE_TIMEOUT_SECS,
@@ -53,7 +54,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             serve_stdio(mgr).await?;
             Ok(())
         }
-        Commands::Bench(args) => handle_bench(args),
+        Commands::Bench(args) => handle_bench(args, global_engine, json_mode).await,
         cmd => {
             let state_dir = resolve_state_dir(cli.state_dir);
             let client = ExecClient::connect(state_dir, global_engine, no_daemon).await?;
@@ -218,34 +219,22 @@ async fn handle_daemon(
     }
 }
 
-fn handle_bench(args: BenchArgs) -> anyhow::Result<()> {
-    if args.iterations < 1 {
-        return Err(MimikyuError::InvalidConfig(format!(
-            "--iterations must be >= 1, got {}",
-            args.iterations
-        ))
-        .into());
+async fn handle_bench(
+    args: BenchArgs,
+    engine: Option<EngineKind>,
+    json_mode: bool,
+) -> anyhow::Result<()> {
+    let opts = BenchOptions::from_cli(
+        args.iterations,
+        args.warmup,
+        engine.unwrap_or(EngineKind::Chromium),
+        &args.suite,
+    )?;
+    let report = run_benchmark(opts).await?;
+    if json_mode {
+        print_json_ok(&report)?;
+    } else {
+        println!("{}", format_bench_human(&report));
     }
-    if args.warmup < 0 {
-        return Err(MimikyuError::InvalidConfig(format!(
-            "--warmup must be >= 0, got {}",
-            args.warmup
-        ))
-        .into());
-    }
-    match args.suite.trim().to_ascii_lowercase().as_str() {
-        "all" | "speed" | "agentic" => {}
-        other => {
-            return Err(MimikyuError::InvalidConfig(format!(
-                "unknown bench suite '{other}' (expected all|speed|agentic)"
-            ))
-            .into());
-        }
-    }
-
-    Err(MimikyuError::Unsupported {
-        engine: "bench".to_string(),
-        feature: "benchmark runner is scheduled for M4.3".to_string(),
-    }
-    .into())
+    Ok(())
 }
