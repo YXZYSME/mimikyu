@@ -1,14 +1,119 @@
-# mimikyu
+<div align="center">
 
-High-speed Rust agentic browser runtime, session/profile isolation layer, and CLI / Daemon / MCP control plane driving local **Chromium (CDP)** and **Firefox (W3C WebDriver BiDi)** browsers.
+<img src="assets/mimikyu-banner.svg" alt="mimikyu — 16-bit pixel-art banner featuring an original rag-disguise browser sprite mascot, MIMIKYU logo, and runtime HUD" width="100%" />
 
-Inspired by the documented base architecture of [Camoufox](https://camoufox.com/development/) — consistent environment profiles, two-tier browser/context isolation, proxy/GeoIP alignment, kinematic input modeling, and resource control — `mimikyu` pairs those primitives with token-efficient AI-agent tooling (`@eN` accessibility tree snapshots, structural diffs, structured extraction, atomic action batching, a warm Unix-socket daemon, and a stdio MCP server) in a zero-dependency native Rust binary.
+<br />
 
----
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B%20(2024)-f5b841?style=flat-square&labelColor=180d2e)](Cargo.toml)
+[![Engines: CDP + BiDi](https://img.shields.io/badge/engines-Chromium%20CDP%20%2B%20Firefox%20BiDi-4ce0b3?style=flat-square&labelColor=180d2e)](ARCHITECTURE.md)
+[![MCP Server: 31 Tools](https://img.shields.io/badge/MCP%202024--11--05-31%20tools-9d80eb?style=flat-square&labelColor=180d2e)](#mcp-server-configuration)
+[![Verified Suite: 337 Rust + 244 E2E](https://img.shields.io/badge/tests-337%20Rust%20%7C%20244%20E2E-4ce0b3?style=flat-square&labelColor=180d2e)](#testing--verification)
+[![Security Policy](https://img.shields.io/badge/security-R3%20compliant-ff6b8b?style=flat-square&labelColor=180d2e)](SECURITY.md)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-ffe47a?style=flat-square&labelColor=180d2e)](#license--parody-notice)
+
+**High-speed native Rust agentic browser runtime, two-tier session/profile isolation layer, warm Unix-socket daemon, and 31-tool MCP control plane driving local Chromium (CDP) and Firefox (W3C WebDriver BiDi).**
+
+[Install](#installation--updating) · [Quickstart](#quickstart--cli-examples) · [MCP (31 Tools)](#mcp-server-configuration) · [Benchmarks](#reproducible-local-benchmark-suite) · [Architecture](ARCHITECTURE.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
+
+</div>
+
+<p align="center">
+  <img src="assets/pixel-divider.svg" alt="" width="100%" />
+</p>
+
+## `AGENTDEX // ENTRY NO. 031 — MIMIKYU`
+
+<table>
+<tr>
+<td width="152" align="center" valign="middle">
+  <img src="assets/mimikyu-mascot.svg" alt="mimikyu rag-disguise browser sprite mascot" width="128" height="128" />
+  <br />
+  <sub><b>TYPE:</b> <code>SHADOW / BROWSER</code></sub>
+</td>
+<td valign="middle">
+
+> *"A tiny deterministic Rust agent peeking out from beneath a hand-stitched browser-window & rag-fox cloak. Waving its `@e1` cursor wand, it speaks fluent Chromium CDP and Firefox BiDi in single-digit milliseconds without burning your context window."*
+
+**Why `mimikyu` exists:**
+- **Camoufox-Inspired Foundations:** Inspired by the documented base architecture of [Camoufox](https://camoufox.com/development/) — coherent OS environment presets (`win11`, `macos`, `linux`), offline GeoIP alignment, authenticated loopback proxy relaying, two-tier browser/context isolation, kinematic input modeling, and granular resource blocking.
+- **Blazing Native Rust Speed:** Compiled into a single native `mimikyu` binary with a warm auto-spawning Unix-socket daemon — delivering **`~5.0 ms` semantic snapshots**, **`~5.4 ms` Markdown extraction**, and **`~67 ms` warm virtual contexts** with zero Node.js or Python runtime overhead.
+- **Token-Efficient `@eN` Agentic Control:** Compresses sprawling DOMs (including open Shadow DOM and nested/cross-origin iframes) by **`2.79x–3.57x`** into deterministic `@e1`, `@e2` interactive element refs, structural diffs, atomic action batches, and **31 turnkey MCP tools**.
+
+</td>
+</tr>
+</table>
+
+<p align="center">
+  <img src="assets/pixel-divider.svg" alt="" width="100%" />
+</p>
+
+## Installation & Updating
+
+> [!NOTE]
+> Replace `<owner>` below with your GitHub organization or username once published (see [`docs/OPEN_SOURCE_PROCEDURES.md`](docs/OPEN_SOURCE_PROCEDURES.md) for the launch checklist). On a local clone, `--from-source` and `cargo install --path` work immediately offline.
+
+### One-Line POSIX Installer (macOS & Linux)
+
+Downloads the prebuilt release archive (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, or `aarch64-unknown-linux-gnu`), **verifies its SHA-256 checksum against `SHA256SUMS`** before extraction, and installs atomically to `~/.local/bin` (or `$MIMIKYU_INSTALL_DIR`):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | sh
+```
+
+### Updating, Pinning Versions & Uninstalling
+
+```bash
+# Check installed version against the latest GitHub Release and upgrade atomically
+curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | sh -s -- --update
+
+# Pin an exact SemVer tag, custom install directory, or GitHub build provenance attestation check
+curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | sh -s -- \
+  --version v0.1.0 --bin-dir ~/.local/bin --verify-attestation
+
+# Cleanly remove the installed binary
+curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | sh -s -- --uninstall
+```
+
+### Rust / Cargo & `cargo-binstall`
+
+```bash
+# Install directly from Git with Cargo (Rust 1.88+)
+cargo install --git https://github.com/<owner>/mimikyu mimikyu-cli
+
+# Fast prebuilt binary install via cargo-binstall
+cargo binstall mimikyu-cli
+```
+
+### Build & Install from Local Source
+
+```bash
+# Install `mimikyu` into ~/.cargo/bin from a local checkout
+cargo install --locked --path crates/mimikyu-cli
+
+# Or use the POSIX installer's local source mode (installs to ~/.local/bin by default)
+./install.sh --from-source
+
+# Or build the release binary directly in ./target/release/mimikyu
+cargo build --release
+./target/release/mimikyu doctor
+./target/release/mimikyu doctor --json
+```
+
+A Homebrew tap formula template is also maintained at [`packaging/homebrew/mimikyu.rb`](packaging/homebrew/mimikyu.rb) and rendered automatically on tagged releases (see [`RELEASE.md`](RELEASE.md)).
+
+### Runtime Prerequisites
+
+- **Local Browser:** Chromium/Chrome and/or Firefox installation (auto-discovered via explicit override → `MIMIKYU_CHROMIUM_PATH` / `MIMIKYU_FIREFOX_PATH` → Playwright & Puppeteer local caches → system installs & `PATH`)
+- **For Building from Source:** Rust toolchain `1.88+` (`cargo`, `rustc`, Edition 2024)
+- **For Running `e2e/`:** Python 3 (standard library only; zero external `pip` packages)
+
+<p align="center">
+  <img src="assets/pixel-divider.svg" alt="" width="100%" />
+</p>
 
 ## Architecture
 
-`mimikyu` is organized as a two-crate Rust workspace (Edition 2024, MSRV `1.88`) plus an opaque-box Python 3 stdlib end-to-end test suite:
+`mimikyu` is organized as a two-crate Rust workspace (Edition 2024, MSRV `1.88`) plus an opaque-box Python 3 stdlib end-to-end test suite (see [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full module graph and non-negotiable invariants):
 
 ```text
 crates/
@@ -45,7 +150,9 @@ e2e/                      # Opaque-box Python 3 stdlib E2E test suite (Tiers 1�
    - `driver::bidi` speaks W3C WebDriver BiDi over WebSocket for Firefox/Gecko.
    - Both implement `DriverSession` and shut down gracefully via `Browser.close` / `browser.close` before process-group cleanup.
 
----
+<p align="center">
+  <img src="assets/pixel-divider.svg" alt="" width="100%" />
+</p>
 
 ## Features
 
@@ -67,50 +174,39 @@ e2e/                      # Opaque-box Python 3 stdlib E2E test suite (Tiers 1�
 - **Crash-Reporter Suppression & Zero Orphans**: Launches Firefox with `MOZ_CRASHREPORTER_DISABLE=1`, `MOZ_CRASHREPORTER=0`, and `MOZ_CRASHREPORTER_NO_REPORT=1`, isolates every browser process in its own POSIX process group (`setpgid(0, 0)`), and guarantees teardown on shutdown, signal, or `Drop`.
 - **Local Discovery Precedence**: Explicit override path → `MIMIKYU_CHROMIUM_PATH` / `MIMIKYU_FIREFOX_PATH` → Playwright & Puppeteer local caches → system installs & `PATH`.
 
----
+<p align="center">
+  <img src="assets/pixel-divider.svg" alt="" width="100%" />
+</p>
 
-## Build & Quickstart
-
-### Prerequisites
-- Rust toolchain `1.88+` (`cargo`, `rustc`)
-- Local Chromium/Chrome and/or Firefox installation (Playwright/Puppeteer cache, system install, or `MIMIKYU_CHROMIUM_PATH` / `MIMIKYU_FIREFOX_PATH`)
-- Python 3 (stdlib only, for running the `e2e/` suite)
-
-### Build
-
-```bash
-cargo build --release
-./target/release/mimikyu doctor
-./target/release/mimikyu doctor --json
-```
-
-### CLI Examples
+## Quickstart & CLI Examples
 
 All commands support global flags:
 `--json` (machine-readable `{"ok": true, "data": ...}` / `{"ok": false, "error": "..."}`), `--session <ID>` (alias `--context`, default `default`), `--engine <chromium|firefox>`, `--state-dir <DIR>`, and `--no-daemon`.
 
+*(If installed on `PATH`, run `mimikyu ...` directly; from a local release build, use `./target/release/mimikyu ...`.)*
+
 ```bash
 # Start a lightweight virtual session with a consistent preset and resource blocking
-./target/release/mimikyu --session demo session new \
+mimikyu --session demo session new \
   --virtual --preset macos --locale en-US --timezone America/Chicago \
   --viewport 1280x720 --block-media --json
 
 # Navigate, wait for idle, and capture an interactive @eN snapshot
-./target/release/mimikyu --session demo open https://example.com
-./target/release/mimikyu --session demo wait --idle
-./target/release/mimikyu --session demo snapshot --interactive-only
+mimikyu --session demo open https://example.com
+mimikyu --session demo wait --idle
+mimikyu --session demo snapshot --interactive-only
 
 # Interact via @eN refs or CSS selectors, extract markdown, and screenshot
-./target/release/mimikyu --session demo click @e1 --humanize
-./target/release/mimikyu --session demo extract markdown --json
-./target/release/mimikyu --session demo screenshot ./page.png --full-page
+mimikyu --session demo click @e1 --humanize
+mimikyu --session demo extract markdown --json
+mimikyu --session demo screenshot ./page.png --full-page
 
 # Execute an ordered batch of actions in one call
-./target/release/mimikyu --session demo batch \
+mimikyu --session demo batch \
   --ops '[{"op":"fill","target":"@e2","value":"hello"},{"op":"click","target":"@e3"},{"op":"wait","idle":true}]'
 
 # Close session
-./target/release/mimikyu close demo
+mimikyu close demo
 ```
 
 ### Background Daemon
@@ -118,9 +214,9 @@ All commands support global flags:
 CLI commands auto-start the daemon for `--state-dir` (defaulting to the platform local data dir, e.g. `~/Library/Application Support/mimikyu` on macOS, with a 300s default idle timeout). You can also manage it explicitly:
 
 ```bash
-./target/release/mimikyu daemon --idle-timeout 300   # start in background (or --foreground)
-./target/release/mimikyu daemon status --json
-./target/release/mimikyu daemon stop
+mimikyu daemon --idle-timeout 300   # start in background (or --foreground)
+mimikyu daemon status --json
+mimikyu daemon stop
 ```
 
 ### MCP Server Configuration
@@ -129,20 +225,24 @@ CLI commands auto-start the daemon for `--state-dir` (defaulting to the platform
 - **11 `mimikyu_*` tools**: `mimikyu_session_new`, `mimikyu_session_close`, `mimikyu_open`, `mimikyu_snapshot`, `mimikyu_click`, `mimikyu_fill`, `mimikyu_extract`, `mimikyu_wait`, `mimikyu_batch`, `mimikyu_eval`, `mimikyu_screenshot`
 - **20 `browser_*` tools**: `browser_open`, `browser_close`, `browser_snapshot`, `browser_click`, `browser_fill`, `browser_type`, `browser_press`, `browser_select`, `browser_upload`, `browser_scroll`, `browser_eval`, `browser_extract`, `browser_screenshot`, `browser_wait`, `browser_batch`, `browser_context_list`, `browser_context_close`, `browser_profile_export`, `browser_profile_import`, `browser_env_report`
 
-Example MCP client entry:
+Example MCP client entry (or set `"command": "/path/to/mimikyu/target/release/mimikyu"` when running from source):
 
 ```json
 {
   "mcpServers": {
     "mimikyu": {
-      "command": "/path/to/mimikyu/target/release/mimikyu",
+      "command": "mimikyu",
       "args": ["mcp", "--engine", "chromium"]
     }
   }
 }
 ```
 
-### Reproducible Local Benchmark Suite
+<p align="center">
+  <img src="assets/pixel-divider.svg" alt="" width="100%" />
+</p>
+
+## Reproducible Local Benchmark Suite
 
 `mimikyu bench` runs entirely offline against the embedded `127.0.0.1:0` dual-origin harness, measuring cold launch, warm virtual context creation, navigation, snapshot, extraction, batch latency, live process-tree RSS, snapshot token compression ratio, and 5 end-to-end agentic workflows (multi-step wizard, form echo, catalog filter + diff + table extraction, dynamic DOM hydration + batch, and Shadow DOM + nested/cross-origin iframes):
 
@@ -151,7 +251,7 @@ Example MCP client entry:
 ./target/release/mimikyu bench --engine firefox --suite all --json
 ```
 
-#### Measured Release Benchmarks (`--iterations 3 --warmup 1 --suite all`)
+### Measured Release Benchmarks (`--iterations 3 --warmup 1 --suite all`)
 
 | Metric (median) | Chromium (CDP) | Firefox (WebDriver BiDi) |
 | --- | ---: | ---: |
@@ -165,7 +265,9 @@ Example MCP client entry:
 | Snapshot token compression | `2.79x` (`967` → `347` est. tokens) | `3.57x` (`967` → `271` est. tokens) |
 | Agentic workflows passed | **5 / 5 (100%)** | **5 / 5 (100%)** |
 
----
+<p align="center">
+  <img src="assets/pixel-divider.svg" alt="" width="100%" />
+</p>
 
 ## Testing & Verification
 
@@ -202,6 +304,23 @@ Verified E2E results against `./target/release/mimikyu` (**244/244 passed**, 0 f
 - `--tier 4 --engine firefox`: **7/7 passed**
 - Scope compliance & hygiene: **0 R3 violations**, **0 leaked processes**, **0 macOS CrashReporter logs**
 
+<p align="center">
+  <img src="assets/pixel-divider.svg" alt="" width="100%" />
+</p>
+
+## Project Documentation & Governance
+
+| Document | Purpose |
+| --- | --- |
+| [`ARCHITECTURE.md`](ARCHITECTURE.md) | Crate dependency graph, dual-engine `DriverSession` boundary, `ChokepointInput`, and 5 scaling invariants |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | Local dev setup, Conventional Commits, narrow vertical PR rules, and pre-PR test gauntlet |
+| [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) | Contributor Covenant v2.1 community standards |
+| [`SECURITY.md`](SECURITY.md) | Vulnerability reporting, Unix-socket & `ProxyRelay` security model, isolated-world `eval`, and R3 policy |
+| [`RELEASE.md`](RELEASE.md) | Official SemVer branching, `./scripts/release.sh`, provenance attestation, and `install.sh --update` flow |
+| [`CHANGELOG.md`](CHANGELOG.md) | Keep-a-Changelog version history |
+| [`docs/OPEN_SOURCE_PROCEDURES.md`](docs/OPEN_SOURCE_PROCEDURES.md) | Maintainer launch checklist, GitHub Rulesets, safe external PR scaling, and operations runbook |
+| [`LICENSE-MIT`](LICENSE-MIT) / [`LICENSE-APACHE`](LICENSE-APACHE) | Dual open-source license texts (`MIT OR Apache-2.0`) |
+
 ---
 
 ## Scope & Compliance Boundary
@@ -210,6 +329,8 @@ Verified E2E results against `./target/release/mimikyu` (**244/244 passed**, 0 f
 
 ---
 
-## License
+## License & Parody Notice
 
-Dual-licensed under `MIT OR Apache-2.0`.
+Dual-licensed under [`MIT`](LICENSE-MIT) OR [`Apache-2.0`](LICENSE-APACHE) at your option.
+
+`mimikyu` is an independent open-source project and parody homage inspired by [Camoufox](https://camoufox.com/development/); not affiliated with Nintendo, Creatures Inc., GAME FREAK, or the Camoufox authors. All pixel-art illustrations in [`assets/`](assets/) are original works created for this project.
