@@ -4,6 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Fast browser automation, session/profile isolation, and environment consistency CLI, daemon, and MCP server for AI agents"
+documentation = "https://docs.rs/mimikyu-cli"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/mimikyu-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
 
 [[bin]]
 name = "mimikyu"

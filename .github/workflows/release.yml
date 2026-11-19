@@ -1,0 +1,222 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  MOZ_CRASHREPORTER_DISABLE: "1"
+  MOZ_CRASHREPORTER: "0"
+  MOZ_CRASHREPORTER_NO_REPORT: "1"
+
+jobs:
+  verify:
+    name: Verify Release Tag & Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+
+      - name: Verify Cargo.toml, Cargo.lock & CHANGELOG.md match tag
+        run: ./scripts/check-version-sync.sh --tag "${{ github.ref_name }}"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run Clippy (--all-targets -D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Install local Chromium & Firefox for release verification
+        run: npx --yes playwright install --with-deps chromium firefox
+
+      - name: Run workspace tests & E2E harness self-test
+        run: |
+          cargo test --workspace --locked
+          python3 e2e/run_e2e.py --self-test
+
+  build:
+    name: Build Tarball (${{ matrix.target }})
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-14
+            cross: false
+          - target: x86_64-apple-darwin
+            os: macos-14
+            cross: false
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: false
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            cross: true
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain & target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux ARM64 cross-linker
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+
+      - name: Cache Cargo registry & target build
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary (${{ matrix.target }})
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo build --release --locked --target "${{ matrix.target }}" -p mimikyu-cli
+
+      - name: Package mimikyu-${{ matrix.target }}.tar.gz
+        run: |
+          STAGE_DIR="$RUNNER_TEMP/stage-${{ matrix.target }}"
+          mkdir -p "$STAGE_DIR"
+          cp "target/${{ matrix.target }}/release/mimikyu" "$STAGE_DIR/mimikyu"
+          chmod 0755 "$STAGE_DIR/mimikyu"
+          cp README.md CHANGELOG.md "$STAGE_DIR/"
+          for lic in LICENSE LICENSE-MIT LICENSE-APACHE; do
+            if [ -f "$lic" ]; then
+              cp "$lic" "$STAGE_DIR/"
+            fi
+          done
+          mkdir -p dist
+          tar -C "$STAGE_DIR" -czf "dist/mimikyu-${{ matrix.target }}.tar.gz" .
+
+      - name: Upload release tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/mimikyu-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Checksums, Provenance Attestation & GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+
+      - name: Download all built tarballs
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify all 4 platform tarballs & generate SHA256SUMS
+        run: |
+          cd release-assets
+          for target in \
+            aarch64-apple-darwin \
+            x86_64-apple-darwin \
+            x86_64-unknown-linux-gnu \
+            aarch64-unknown-linux-gnu; do
+            test -f "mimikyu-${target}.tar.gz"
+          done
+          sha256sum mimikyu-*.tar.gz | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Render updated Homebrew formula (mimikyu.rb)
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          REL_VER="${TAG_NAME#v}"
+          SHA_DARWIN_ARM64=$(awk '$2 == "mimikyu-aarch64-apple-darwin.tar.gz" {print $1}' release-assets/SHA256SUMS)
+          SHA_DARWIN_X86_64=$(awk '$2 == "mimikyu-x86_64-apple-darwin.tar.gz" {print $1}' release-assets/SHA256SUMS)
+          SHA_LINUX_ARM64=$(awk '$2 == "mimikyu-aarch64-unknown-linux-gnu.tar.gz" {print $1}' release-assets/SHA256SUMS)
+          SHA_LINUX_X86_64=$(awk '$2 == "mimikyu-x86_64-unknown-linux-gnu.tar.gz" {print $1}' release-assets/SHA256SUMS)
+
+          sed \
+            -e "s#<owner>/mimikyu#${REPO_SLUG}#g" \
+            -e "s#version \"[^\"]*\"#version \"${REL_VER}\"#g" \
+            -e "s#PLACEHOLDER_SHA256_DARWIN_ARM64#${SHA_DARWIN_ARM64}#g" \
+            -e "s#PLACEHOLDER_SHA256_DARWIN_X86_64#${SHA_DARWIN_X86_64}#g" \
+            -e "s#PLACEHOLDER_SHA256_LINUX_ARM64#${SHA_LINUX_ARM64}#g" \
+            -e "s#PLACEHOLDER_SHA256_LINUX_X86_64#${SHA_LINUX_X86_64}#g" \
+            packaging/homebrew/mimikyu.rb > release-assets/mimikyu.rb
+
+      - name: Attest SLSA build provenance for release artifacts
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            release-assets/mimikyu-*.tar.gz
+            release-assets/SHA256SUMS
+
+      - name: Extract release notes from CHANGELOG.md
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+          REPO_SLUG: ${{ github.repository }}
+        run: |
+          REL_VER="${TAG_NAME#v}"
+          awk -v ver="$REL_VER" '
+            $0 ~ "^## \\[" ver "\\] - " { in_sec = 1; next }
+            in_sec && $0 ~ "^## \\[" { exit 0 }
+            in_sec { print }
+          ' CHANGELOG.md > "$RUNNER_TEMP/RELEASE_NOTES.md"
+
+          cat >> "$RUNNER_TEMP/RELEASE_NOTES.md" <<EOF
+
+          ---
+
+          ### Install or Update (\`${TAG_NAME}\`)
+
+          \`\`\`sh
+          # Fresh install
+          curl -fsSL https://raw.githubusercontent.com/${REPO_SLUG}/${TAG_NAME}/install.sh | MIMIKYU_REPO=${REPO_SLUG} sh -s -- --version ${TAG_NAME}
+
+          # Upgrade an existing installation
+          curl -fsSL https://raw.githubusercontent.com/${REPO_SLUG}/main/install.sh | MIMIKYU_REPO=${REPO_SLUG} sh -s -- --update
+
+          # Verify GitHub SLSA Artifact Attestation (optional, requires gh >= 2.49)
+          gh attestation verify mimikyu-<target>.tar.gz --repo ${REPO_SLUG}
+          \`\`\`
+          EOF
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: mimikyu ${{ github.ref_name }}
+          body_path: ${{ runner.temp }}/RELEASE_NOTES.md
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/mimikyu-aarch64-apple-darwin.tar.gz
+            release-assets/mimikyu-x86_64-apple-darwin.tar.gz
+            release-assets/mimikyu-x86_64-unknown-linux-gnu.tar.gz
+            release-assets/mimikyu-aarch64-unknown-linux-gnu.tar.gz
+            release-assets/SHA256SUMS
+            release-assets/mimikyu.rb

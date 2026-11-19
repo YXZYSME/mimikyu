@@ -1,0 +1,188 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  MOZ_CRASHREPORTER_DISABLE: "1"
+  MOZ_CRASHREPORTER: "0"
+  MOZ_CRASHREPORTER_NO_REPORT: "1"
+
+jobs:
+  hygiene:
+    name: Hygiene, Shell Syntax & Version Sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify version synchronization
+        run: ./scripts/check-version-sync.sh
+
+      - name: Check POSIX /bin/sh & Bash syntax on shell scripts
+        run: |
+          for script in install.sh scripts/*.sh; do
+            echo "Checking syntax of $script..."
+            sh -n "$script"
+            bash -n "$script"
+            test -x "$script"
+          done
+
+      - name: Ensure shell scripts avoid Bash 4+ extensions
+        run: |
+          if grep -nE '(declare[[:space:]]+-A|\$\{!|\|&|(^|[^[:alnum:]_])coproc([^[:alnum:]_]|$))' install.sh scripts/*.sh; then
+            echo "error: forbidden Bash 4+ syntax found in POSIX shell scripts" >&2
+            exit 1
+          fi
+
+      - name: Scan tracked files for local path or credential leaks
+        run: |
+          USERS_PREFIX="/Use""rs/"
+          if git grep -nE "(${USERS_PREFIX}[A-Za-z0-9._-]+|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{40,}|AKIA[0-9A-Z]{16})" -- ':!.github/workflows/ci.yml'; then
+            echo "error: potential path or credential leak detected in tracked files" >&2
+            exit 1
+          fi
+
+  rust-lint-test:
+    name: Rust Clippy & Tests (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting on changed Rust files (PRs)
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+          changed_rs=$(git diff --name-only --diff-filter=ACMR "origin/${{ github.base_ref }}...HEAD" -- '*.rs' || true)
+          if [ -n "$changed_rs" ]; then
+            echo "$changed_rs" | xargs rustfmt --edition 2024 --check
+          fi
+
+      - name: Run Clippy (--all-targets -D warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Install local Chromium & Firefox for integration tests (Linux)
+        if: runner.os == 'Linux'
+        run: npx --yes playwright install --with-deps chromium firefox
+
+      - name: Install local Chromium & Firefox for integration tests (macOS)
+        if: runner.os == 'macOS'
+        run: npx --yes playwright install chromium firefox
+
+      - name: Run workspace unit & integration tests
+        run: cargo test --workspace --locked
+
+  e2e:
+    name: Python E2E (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: self-test
+            mode: self-test
+            engine: chromium
+            tier: self-test
+          - label: chromium-tiers-1-4
+            mode: browser
+            engine: chromium
+            tier: all
+          - label: firefox-tier-4
+            mode: browser
+            engine: firefox
+            tier: "4"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run E2E harness self-test
+        if: matrix.mode == 'self-test'
+        run: python3 e2e/run_e2e.py --self-test
+
+      - name: Install Rust toolchain
+        if: matrix.mode == 'browser'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry & build artifacts
+        if: matrix.mode == 'browser'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install target browser (${{ matrix.engine }})
+        if: matrix.mode == 'browser'
+        run: npx --yes playwright install --with-deps "${{ matrix.engine }}"
+
+      - name: Build release mimikyu binary
+        if: matrix.mode == 'browser'
+        run: cargo build --release --locked -p mimikyu-cli
+
+      - name: Execute opaque-box E2E suite (${{ matrix.engine }}, tier ${{ matrix.tier }})
+        if: matrix.mode == 'browser'
+        run: |
+          python3 e2e/run_e2e.py \
+            --tier "${{ matrix.tier }}" \
+            --engine "${{ matrix.engine }}" \
+            --bin ./target/release/mimikyu
+
+  installer-smoke:
+    name: Installer Smoke Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Smoke test install.sh (--help, --dry-run, --from-source, --uninstall)
+        run: |
+          sh -n ./install.sh
+          bash -n ./install.sh
+          ./install.sh --help >/dev/null
+          ./install.sh --repo "${{ github.repository }}" --dry-run
+
+          SMOKE_BIN_DIR="$RUNNER_TEMP/mimikyu-install-smoke"
+          ./install.sh --from-source --bin-dir "$SMOKE_BIN_DIR"
+          "$SMOKE_BIN_DIR/mimikyu" --version
+          "$SMOKE_BIN_DIR/mimikyu" doctor --help >/dev/null
+          ./install.sh --bin-dir "$SMOKE_BIN_DIR" --uninstall
+          test ! -e "$SMOKE_BIN_DIR/mimikyu"

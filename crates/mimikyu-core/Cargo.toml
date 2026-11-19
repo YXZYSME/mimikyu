@@ -4,6 +4,16 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+description = "Core dual-engine (CDP & WebDriver BiDi) browser runtime, isolation layer, environment profiles, and MCP server for mimikyu"
+documentation = "https://docs.rs/mimikyu-core"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/mimikyu-{ target }{ archive-suffix }"
+bin-dir = "{ bin }{ binary-ext }"
+pkg-fmt = "tgz"
 
 [dependencies]
 async-trait.workspace = true
