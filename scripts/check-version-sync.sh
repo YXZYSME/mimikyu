@@ -88,6 +88,23 @@ if ! printf '%s\n' "$WORKSPACE_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-
 fi
 printf '[ok] Cargo.toml [workspace.package] version = %s\n' "$WORKSPACE_VERSION"
 
+WS_CORE_DEP_VERSION=$(awk '
+  /^\[workspace\.dependencies\][[:space:]]*$/ { in_ws_deps = 1; next }
+  /^\[/ { in_ws_deps = 0 }
+  in_ws_deps && $0 ~ /^[[:space:]]*mimikyu-core[[:space:]]*=.*version[[:space:]]*=[[:space:]]*"/ {
+    line = $0
+    sub(/^.*version[[:space:]]*=[[:space:]]*"/, "", line)
+    sub(/".*$/, "", line)
+    print line
+    exit 0
+  }
+' "$ROOT_CARGO")
+
+if [ -n "$WS_CORE_DEP_VERSION" ]; then
+  [ "$WS_CORE_DEP_VERSION" = "$WORKSPACE_VERSION" ] || die "[workspace.dependencies] mimikyu-core version '$WS_CORE_DEP_VERSION' does not match workspace version '$WORKSPACE_VERSION'"
+  printf '[ok] Cargo.toml [workspace.dependencies] mimikyu-core = %s\n' "$WS_CORE_DEP_VERSION"
+fi
+
 # 2. Verify member crates inherit workspace version (or match explicitly)
 check_member_manifest() {
   manifest_path="$1"

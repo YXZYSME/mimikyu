@@ -29,6 +29,7 @@ dirs = "6.0"
 fs2 = "0.4"
 futures-util = { version = "0.3", features = ["sink", "std"] }
 libc = "0.2"
+mimikyu-core = { version = "0.1.0", path = "crates/mimikyu-core" }
 parking_lot = "0.12"
 rand = "0.9"
 regex = "1.13"

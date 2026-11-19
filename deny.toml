@@ -1,5 +1,6 @@
 # cargo-deny supply-chain and license policy for mimikyu
-# Run locally with: `cargo deny check`
+# Compatible with cargo-deny 0.16+ / 0.19+ / 0.22+ (v2 config schema).
+# Run locally with: `cargo deny --config deny.toml check`
 
 [graph]
 targets = [
@@ -12,13 +13,16 @@ all-features = false
 no-default-features = false
 
 [advisories]
+version = 2
 db-path = "~/.cargo/advisory-dbs"
 db-urls = ["https://github.com/rustsec/advisory-db"]
 yanked = "deny"
 ignore = []
 
 [licenses]
+version = 2
 confidence-threshold = 0.8
+unused-allowed-license = "allow"
 allow = [
   "MIT",
   "Apache-2.0",

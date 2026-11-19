@@ -4166,9 +4166,9 @@ impl CdpSession {
                             .and_then(|arr| arr.get(ni))
                             .and_then(|v| v.as_array())
                             .is_some_and(|pairs| {
-                                pairs.chunks_exact(2).any(|kv| {
-                                    str_at(&kv[0]).is_some_and(|k| k.eq_ignore_ascii_case("type"))
-                                        && str_at(&kv[1])
+                                pairs.as_chunks::<2>().0.iter().any(|[k, v]| {
+                                    str_at(k).is_some_and(|key| key.eq_ignore_ascii_case("type"))
+                                        && str_at(v)
                                             .is_some_and(|val| val.eq_ignore_ascii_case("file"))
                                 })
                             });

@@ -184,11 +184,18 @@ rewrite_cargo_toml() {
   out_file="$2"
   new_ver="$3"
   awk -v ver="$new_ver" '
-    /^\[workspace\.package\][[:space:]]*$/ { in_ws = 1; print; next }
-    /^\[/ { in_ws = 0 }
+    /^\[workspace\.package\][[:space:]]*$/ { in_ws = 1; in_deps = 0; print; next }
+    /^\[workspace\.dependencies\][[:space:]]*$/ { in_ws = 0; in_deps = 1; print; next }
+    /^\[/ { in_ws = 0; in_deps = 0 }
     in_ws && !replaced && $0 ~ /^[[:space:]]*version[[:space:]]*=[[:space:]]*"/ {
       print "version = \"" ver "\""
       replaced = 1
+      next
+    }
+    in_deps && $0 ~ /^[[:space:]]*mimikyu-core[[:space:]]*=.*version[[:space:]]*=[[:space:]]*"/ {
+      line = $0
+      sub(/version[[:space:]]*=[[:space:]]*"[^"]*"/, "version = \"" ver "\"", line)
+      print line
       next
     }
     { print }
