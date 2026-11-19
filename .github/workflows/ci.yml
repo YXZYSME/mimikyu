@@ -91,7 +91,9 @@ jobs:
 
       - name: Install local Chromium & Firefox for integration tests (Linux)
         if: runner.os == 'Linux'
-        run: npx --yes playwright install --with-deps chromium firefox
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          npx --yes playwright install --with-deps chromium firefox
 
       - name: Install local Chromium & Firefox for integration tests (macOS)
         if: runner.os == 'macOS'
@@ -142,7 +144,9 @@ jobs:
 
       - name: Install target browser (${{ matrix.engine }})
         if: matrix.mode == 'browser'
-        run: npx --yes playwright install --with-deps "${{ matrix.engine }}"
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          npx --yes playwright install --with-deps "${{ matrix.engine }}"
 
       - name: Build release mimikyu binary
         if: matrix.mode == 'browser'

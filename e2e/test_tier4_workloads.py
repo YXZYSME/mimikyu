@@ -77,6 +77,62 @@ def _parse_json_eval(res: CommandResult) -> Any:
     raise AssertionError(f"Expected JSON eval result, got {val!r} (stdout={res.stdout!r})")
 
 
+def _has_active_temp_download(dl_dir: Path) -> bool:
+    try:
+        for entry in dl_dir.iterdir():
+            if entry.name.endswith((".part", ".crdownload", ".tmp")):
+                return True
+    except OSError:
+        return True
+    return False
+
+
+def _wait_for_saved_download(
+    root_dir: Path,
+    filename: str,
+    expected_size: int,
+    timeout_s: float = 5.0,
+) -> Optional[Path]:
+    """Wait for browser download finalization (e.g. Firefox `.part` -> target rename
+    over its pre-created 0-byte placeholder, or Chromium `.crdownload` rename)."""
+    deadline = time.monotonic() + timeout_s
+    last_candidate: Optional[Path] = None
+    prev_sig: Optional[tuple[Path, int, int]] = None
+    stable_polls = 0
+
+    while time.monotonic() < deadline:
+        candidates = [p for p in root_dir.rglob(filename) if p.is_file()]
+        if candidates:
+            target = candidates[0]
+            last_candidate = target
+            if not _has_active_temp_download(target.parent):
+                try:
+                    st = target.stat()
+                except OSError:
+                    st = None
+                if st is not None and (
+                    (expected_size > 0 and st.st_size >= expected_size)
+                    or (expected_size == 0 and st.st_size == 0)
+                ):
+                    sig = (target, st.st_ino, st.st_size)
+                    if sig == prev_sig:
+                        stable_polls += 1
+                    else:
+                        prev_sig = sig
+                        stable_polls = 1
+                    if stable_polls >= 2:
+                        return target
+                else:
+                    prev_sig = None
+                    stable_polls = 0
+            else:
+                prev_sig = None
+                stable_polls = 0
+        time.sleep(0.03)
+
+    return last_candidate
+
+
 def _result_text(res: CommandResult) -> str:
     parts: list[str] = []
     if res.data is not None:
@@ -705,9 +761,14 @@ class TestTier4Workloads(_Tier4Base):
             "Expected /download/sample.bin request after clicking sample.bin download link",
         )
 
-        saved_bins = list(client.state_dir.rglob("sample.bin"))
-        if saved_bins:
-            raw_dl = saved_bins[0].read_bytes()
+        saved_bin = _wait_for_saved_download(
+            client.state_dir,
+            "sample.bin",
+            expected_size=expected_size,
+            timeout_s=5.0,
+        )
+        if saved_bin is not None:
+            raw_dl = saved_bin.read_bytes()
             self.assertEqual(len(raw_dl), expected_size)
             self.assertEqual(hashlib.sha256(raw_dl).hexdigest(), expected_sha)
 

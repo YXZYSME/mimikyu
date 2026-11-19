@@ -502,7 +502,91 @@ pub fn build_chromium_args(
         args.push("--no-proxy-server".to_string());
     }
 
+    append_linux_chromium_sandbox_args(
+        &mut args,
+        &opts.extra_args,
+        linux_chromium_requires_no_sandbox(),
+    );
+
     args
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct LinuxSandboxProbe<'a> {
+    pub env_no_sandbox: Option<&'a str>,
+    pub euid: u32,
+    pub dockerenv_exists: bool,
+    pub containerenv_exists: bool,
+    pub apparmor_restrict_unprivileged_userns: Option<&'a str>,
+    pub unprivileged_userns_clone: Option<&'a str>,
+}
+
+pub(crate) fn linux_chromium_needs_no_sandbox_from_probe(probe: &LinuxSandboxProbe<'_>) -> bool {
+    if let Some(raw) = probe.env_no_sandbox {
+        let trimmed = raw.trim();
+        if trimmed == "1" || trimmed.eq_ignore_ascii_case("true") {
+            return true;
+        }
+    }
+    if probe.euid == 0 {
+        return true;
+    }
+    if probe.dockerenv_exists || probe.containerenv_exists {
+        return true;
+    }
+    if probe
+        .apparmor_restrict_unprivileged_userns
+        .is_some_and(|v| v.trim() == "1")
+    {
+        return true;
+    }
+    if probe
+        .unprivileged_userns_clone
+        .is_some_and(|v| v.trim() == "0")
+    {
+        return true;
+    }
+    false
+}
+
+pub(crate) fn linux_chromium_requires_no_sandbox() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    let env_val = std::env::var("MIMIKYU_CHROMIUM_NO_SANDBOX").ok();
+    let euid = unsafe { libc::geteuid() };
+    let apparmor =
+        fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns").ok();
+    let userns_clone = fs::read_to_string("/proc/sys/kernel/unprivileged_userns_clone").ok();
+    let probe = LinuxSandboxProbe {
+        env_no_sandbox: env_val.as_deref(),
+        euid,
+        dockerenv_exists: Path::new("/.dockerenv").exists(),
+        containerenv_exists: Path::new("/run/.containerenv").exists(),
+        apparmor_restrict_unprivileged_userns: apparmor.as_deref(),
+        unprivileged_userns_clone: userns_clone.as_deref(),
+    };
+    linux_chromium_needs_no_sandbox_from_probe(&probe)
+}
+
+pub(crate) fn append_linux_chromium_sandbox_args(
+    args: &mut Vec<String>,
+    extra_args: &[String],
+    needs_no_sandbox: bool,
+) {
+    if !needs_no_sandbox {
+        return;
+    }
+    if !args.iter().any(|a| a == "--no-sandbox")
+        && !extra_args.iter().any(|a| a == "--no-sandbox")
+    {
+        args.push("--no-sandbox".to_string());
+    }
+    if !args.iter().any(|a| a == "--disable-dev-shm-usage")
+        && !extra_args.iter().any(|a| a == "--disable-dev-shm-usage")
+    {
+        args.push("--disable-dev-shm-usage".to_string());
+    }
 }
 
 fn effective_webrtc_policy(opts: &LaunchOptions) -> WebRtcPolicy {
@@ -1449,6 +1533,114 @@ mod tests {
         assert!(socks_prefs.contains("user_pref(\"network.proxy.socks_version\", 5);"));
         assert!(socks_prefs.contains("user_pref(\"network.proxy.socks_remote_dns\", true);"));
         assert!(!socks_prefs.contains("\"[::1]\""));
+    }
+
+    #[test]
+    fn linux_chromium_sandbox_probe_and_arg_builder_cover_all_triggers() {
+        let baseline = LinuxSandboxProbe {
+            env_no_sandbox: None,
+            euid: 1000,
+            dockerenv_exists: false,
+            containerenv_exists: false,
+            apparmor_restrict_unprivileged_userns: Some("0\n"),
+            unprivileged_userns_clone: Some("1\n"),
+        };
+        assert!(!linux_chromium_needs_no_sandbox_from_probe(&baseline));
+        assert!(!linux_chromium_needs_no_sandbox_from_probe(
+            &LinuxSandboxProbe {
+                env_no_sandbox: Some("0"),
+                ..baseline
+            }
+        ));
+        assert!(!linux_chromium_needs_no_sandbox_from_probe(
+            &LinuxSandboxProbe {
+                env_no_sandbox: Some("false"),
+                ..baseline
+            }
+        ));
+
+        // 1. MIMIKYU_CHROMIUM_NO_SANDBOX="1" / "true"
+        for truthy in ["1", "true", "TRUE", " true \n"] {
+            assert!(
+                linux_chromium_needs_no_sandbox_from_probe(&LinuxSandboxProbe {
+                    env_no_sandbox: Some(truthy),
+                    ..baseline
+                }),
+                "expected env_no_sandbox={truthy:?} to require --no-sandbox"
+            );
+        }
+
+        // 2. Root user (euid == 0)
+        assert!(linux_chromium_needs_no_sandbox_from_probe(
+            &LinuxSandboxProbe {
+                euid: 0,
+                ..baseline
+            }
+        ));
+
+        // 3. Container markers (/.dockerenv, /run/.containerenv)
+        assert!(linux_chromium_needs_no_sandbox_from_probe(
+            &LinuxSandboxProbe {
+                dockerenv_exists: true,
+                ..baseline
+            }
+        ));
+        assert!(linux_chromium_needs_no_sandbox_from_probe(
+            &LinuxSandboxProbe {
+                containerenv_exists: true,
+                ..baseline
+            }
+        ));
+
+        // 4. Ubuntu 23.10/24.04+ AppArmor unprivileged userns restriction & Debian/RHEL userns sysctl
+        assert!(linux_chromium_needs_no_sandbox_from_probe(
+            &LinuxSandboxProbe {
+                apparmor_restrict_unprivileged_userns: Some("1\n"),
+                ..baseline
+            }
+        ));
+        assert!(linux_chromium_needs_no_sandbox_from_probe(
+            &LinuxSandboxProbe {
+                unprivileged_userns_clone: Some("0\n"),
+                ..baseline
+            }
+        ));
+
+        // 5. Arg builder appends --no-sandbox and --disable-dev-shm-usage without duplicates
+        let mut empty_args = Vec::new();
+        append_linux_chromium_sandbox_args(&mut empty_args, &[], false);
+        assert!(empty_args.is_empty());
+
+        append_linux_chromium_sandbox_args(&mut empty_args, &[], true);
+        assert_eq!(
+            empty_args,
+            vec![
+                "--no-sandbox".to_string(),
+                "--disable-dev-shm-usage".to_string()
+            ]
+        );
+
+        let mut existing = vec!["--disable-dev-shm-usage".to_string()];
+        append_linux_chromium_sandbox_args(&mut existing, &[], true);
+        assert_eq!(
+            existing
+                .iter()
+                .filter(|a| a.as_str() == "--disable-dev-shm-usage")
+                .count(),
+            1
+        );
+        assert_eq!(
+            existing
+                .iter()
+                .filter(|a| a.as_str() == "--no-sandbox")
+                .count(),
+            1
+        );
+
+        let mut via_extra = vec!["--disable-dev-shm-usage".to_string()];
+        let extra = vec!["--no-sandbox".to_string()];
+        append_linux_chromium_sandbox_args(&mut via_extra, &extra, true);
+        assert!(!via_extra.iter().any(|a| a == "--no-sandbox"));
     }
 }
 

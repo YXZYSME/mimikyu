@@ -61,7 +61,9 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Install local Chromium & Firefox for release verification
-        run: npx --yes playwright install --with-deps chromium firefox
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          npx --yes playwright install --with-deps chromium firefox
 
       - name: Run workspace tests & E2E harness self-test
         run: |

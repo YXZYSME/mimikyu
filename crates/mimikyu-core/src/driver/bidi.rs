@@ -151,12 +151,16 @@ impl BrowserDriver for BidiDriver {
         // Best-effort subscription for W3C BiDi download completion events (Firefox 145+);
         // kept separate so older Firefox builds that do not support `downloadEnd` still
         // receive `network.fetchError` and `network.responseStarted`.
-        let _ = conn
+        if conn
             .send(
                 "session.subscribe",
                 json!({ "events": ["browsingContext.downloadEnd"] }),
             )
-            .await;
+            .await
+            .is_ok()
+        {
+            conn.download_end_supported.store(true, Ordering::SeqCst);
+        }
 
         let (user_context, owns_user_context, target_id) = match opts.profile_mode {
             ProfileMode::VirtualContext => {
@@ -369,6 +373,7 @@ struct BidiConnection {
     download_transfers_by_req_id: Mutex<HashMap<String, DownloadTransferState>>,
     pending_download_req_ids: Mutex<HashMap<(String, String), VecDeque<PendingDownloadReq>>>,
     download_ends_by_nav: Mutex<HashMap<String, (DownloadEndStatus, std::time::Instant)>>,
+    download_end_supported: AtomicBool,
     process: AsyncMutex<Option<ProcessGuard>>,
     _root_proxy_relay: Mutex<Option<ProxyRelay>>,
     closed: AtomicBool,
@@ -392,6 +397,7 @@ enum DownloadTransferStatus {
 struct DownloadTransferState {
     status: DownloadTransferStatus,
     content_length: Option<u64>,
+    body_non_empty: bool,
     is_attachment: bool,
     cd_filename: Option<String>,
     response_seen: bool,
@@ -518,6 +524,7 @@ impl BidiConnection {
             download_transfers_by_req_id: Mutex::new(HashMap::new()),
             pending_download_req_ids: Mutex::new(HashMap::new()),
             download_ends_by_nav: Mutex::new(HashMap::new()),
+            download_end_supported: AtomicBool::new(false),
             process: AsyncMutex::new(Some(process)),
             _root_proxy_relay: Mutex::new(root_proxy_relay),
             closed: AtomicBool::new(false),
@@ -1126,6 +1133,7 @@ impl BidiConnection {
                     DownloadTransferState {
                         status: DownloadTransferStatus::InProgress,
                         content_length: None,
+                        body_non_empty: false,
                         is_attachment: false,
                         cd_filename: None,
                         response_seen: false,
@@ -1137,12 +1145,14 @@ impl BidiConnection {
             "network.responseStarted" => {
                 let hdrs = bidi_headers_to_btree(params["response"].get("headers"));
                 let cl = extract_content_length(&hdrs);
+                let non_empty = extract_response_body_non_empty(&params["response"], cl);
                 let cd_fn = extract_content_disposition_filename(&hdrs);
                 let is_att = is_content_disposition_attachment(&hdrs) || cd_fn.is_some();
                 let mut transfers = self.download_transfers_by_req_id.lock();
                 if let Some(entry) = transfers.get_mut(rid) {
                     entry.status = DownloadTransferStatus::InProgress;
                     entry.content_length = cl;
+                    entry.body_non_empty |= non_empty;
                     entry.is_attachment |= is_att;
                     if cd_fn.is_some() {
                         entry.cd_filename = cd_fn;
@@ -1154,12 +1164,14 @@ impl BidiConnection {
             "network.responseCompleted" => {
                 let hdrs = bidi_headers_to_btree(params["response"].get("headers"));
                 let cl = extract_content_length(&hdrs);
+                let non_empty = extract_response_body_non_empty(&params["response"], cl);
                 let cd_fn = extract_content_disposition_filename(&hdrs);
                 let is_att = is_content_disposition_attachment(&hdrs) || cd_fn.is_some();
                 let mut transfers = self.download_transfers_by_req_id.lock();
                 if let Some(entry) = transfers.get_mut(rid) {
                     entry.status = DownloadTransferStatus::Completed;
                     entry.content_length = cl.or(entry.content_length);
+                    entry.body_non_empty |= non_empty;
                     entry.is_attachment |= is_att;
                     if cd_fn.is_some() {
                         entry.cd_filename = cd_fn;
@@ -1367,6 +1379,11 @@ impl BidiConnection {
                         Some(DownloadTransferStatus::Completed)
                     );
                     let expected_len = transfer_state.as_ref().and_then(|s| s.content_length);
+                    let known_non_empty = expected_len.is_some_and(|cl| cl > 0)
+                        || transfer_state.as_ref().is_some_and(|s| s.body_non_empty);
+                    let download_end_supported = conn_opt
+                        .as_ref()
+                        .is_some_and(|conn| conn.download_end_supported.load(Ordering::Relaxed));
 
                     let ready = if len > 0 {
                         zero_settle_since = None;
@@ -1399,7 +1416,12 @@ impl BidiConnection {
                             || saw_ino_replaced
                             || (saw_own_part && !own_part_exists);
 
-                        if download_end_complete {
+                        if known_non_empty {
+                            // Response has a non-empty body (Content-Length > 0 or BiDi bodySize/content.size > 0);
+                            // a 0-byte file on disk is strictly Firefox's pre-created placeholder.
+                            zero_settle_since = None;
+                            false
+                        } else if download_end_complete {
                             !part_blocking
                         } else if bound_req_id.is_some()
                             && is_completed
@@ -1424,10 +1446,20 @@ impl BidiConnection {
                         {
                             if zero_finalized {
                                 stable_ticks >= 1
+                            } else if is_http_url && download_end_supported && nav_id.is_some() {
+                                // When Content-Length is absent on Firefox 145+ (`downloadEnd` supported),
+                                // wait for `downloadEnd` or `.part` inode swap rather than timer-guessing.
+                                zero_settle_since = None;
+                                false
                             } else {
+                                let settle = if is_http_url && expected_len.is_none() {
+                                    Duration::from_millis(1000)
+                                } else {
+                                    ZERO_BYTE_FALLBACK_SETTLE
+                                };
                                 let since =
                                     zero_settle_since.get_or_insert_with(tokio::time::Instant::now);
-                                stable_ticks >= 5 && since.elapsed() >= ZERO_BYTE_FALLBACK_SETTLE
+                                stable_ticks >= 5 && since.elapsed() >= settle
                             }
                         } else {
                             zero_settle_since = None;
@@ -1436,6 +1468,19 @@ impl BidiConnection {
                     };
 
                     if ready {
+                        if len == 0 {
+                            let latest_own_part =
+                                pool_dir.join(format!("{safe_suggested}.part")).exists();
+                            let latest_active = active_set.lock().len();
+                            let latest_part_blocking = latest_own_part
+                                || (has_any_part_file(&pool_dir) && latest_active <= 1);
+                            let grew_non_zero =
+                                std::fs::metadata(&src).is_ok_and(|m| m.len() > 0);
+                            if latest_part_blocking || grew_non_zero {
+                                tokio::time::sleep(Duration::from_millis(15)).await;
+                                continue;
+                            }
+                        }
                         if std::fs::create_dir_all(&dest_dir).is_ok() {
                             let dest = unique_dest_file(&dest_dir, &desired_name);
                             if std::fs::rename(&src, &dest).is_err()
@@ -6566,6 +6611,28 @@ fn extract_content_length(headers: &BTreeMap<String, String>) -> Option<u64> {
         .and_then(|(_, v)| v.trim().parse::<u64>().ok())
 }
 
+fn extract_response_body_non_empty(resp: &Value, cl: Option<u64>) -> bool {
+    if cl.is_some_and(|n| n > 0) {
+        return true;
+    }
+    if resp
+        .get("bodySize")
+        .and_then(|v| v.as_u64())
+        .is_some_and(|n| n > 0)
+    {
+        return true;
+    }
+    if resp
+        .get("content")
+        .and_then(|c| c.get("size"))
+        .and_then(|v| v.as_u64())
+        .is_some_and(|n| n > 0)
+    {
+        return true;
+    }
+    false
+}
+
 fn has_any_part_file(dir: &std::path::Path) -> bool {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return false;
@@ -7127,6 +7194,7 @@ mod tests {
             download_transfers_by_req_id: Mutex::new(HashMap::new()),
             pending_download_req_ids: Mutex::new(HashMap::new()),
             download_ends_by_nav: Mutex::new(HashMap::new()),
+            download_end_supported: AtomicBool::new(false),
             process: AsyncMutex::new(None),
             _root_proxy_relay: Mutex::new(None),
             closed: AtomicBool::new(false),
@@ -7476,5 +7544,93 @@ mod tests {
         }
         assert!(!target2.exists(), "canceled placeholder must be cleaned up");
         assert!(!dest_dir.join("zero2.bin").exists(), "canceled download must not be relocated");
+    }
+
+    #[tokio::test]
+    async fn nonzero_or_chunked_download_never_relocates_zero_byte_placeholder() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool_dir = tmp.path().join("pool");
+        let dest_dir = tmp.path().join("dest");
+        std::fs::create_dir_all(&pool_dir).unwrap();
+
+        let conn = make_test_conn(pool_dir.clone());
+        conn.download_end_supported.store(true, Ordering::SeqCst);
+        let st = make_test_ctx_state(Some("uc-chunk"), Some(dest_dir.clone()));
+        conn.contexts.write().insert("cid-chunk".into(), Arc::clone(&st));
+        conn.user_contexts
+            .write()
+            .insert("uc-chunk".into(), Arc::clone(&st));
+
+        // Chunked 4096-byte HTTP download (no Content-Length header, bodySize = 4096)
+        // where Firefox pre-creates a 0-byte placeholder before opening/renaming `.part`.
+        let url = "http://127.0.0.1:9999/chunked4k.bin";
+        conn.record_download_network_event(
+            "network.beforeRequestSent",
+            Some("cid-chunk"),
+            &json!({ "request": { "request": "r-chunk", "url": url }, "navigation": "nav-chunk" }),
+        );
+        conn.record_download_network_event(
+            "network.responseCompleted",
+            Some("cid-chunk"),
+            &json!({
+                "request": { "request": "r-chunk", "url": url },
+                "response": {
+                    "headers": [],
+                    "bodySize": 4096,
+                    "content": { "size": 4096 }
+                }
+            }),
+        );
+
+        let placeholder = pool_dir.join("chunked4k.bin");
+        std::fs::write(&placeholder, b"").unwrap();
+
+        conn.handle_incoming(
+            &json!({
+                "type": "event",
+                "method": "browsingContext.downloadWillBegin",
+                "params": {
+                    "context": "cid-chunk",
+                    "navigation": "nav-chunk",
+                    "url": url,
+                    "suggestedFilename": "chunked4k.bin"
+                }
+            })
+            .to_string(),
+        );
+
+        // Even past the 250ms zero-byte fallback window (and even if downloadEnd arrives
+        // slightly before IOUtils.move completes on disk), 0-byte placeholder must NOT relocate.
+        conn.handle_incoming(
+            &json!({
+                "type": "event",
+                "method": "browsingContext.downloadEnd",
+                "params": {
+                    "context": "cid-chunk",
+                    "navigation": "nav-chunk",
+                    "status": "complete"
+                }
+            })
+            .to_string(),
+        );
+        tokio::time::sleep(Duration::from_millis(320)).await;
+        assert!(
+            !dest_dir.join("chunked4k.bin").exists(),
+            "must never relocate 0-byte placeholder when response body is non-empty"
+        );
+
+        // Finalize `.part` -> target with 4096 bytes
+        let part_file = pool_dir.join("rnd8slug.bin.part");
+        let payload = vec![0xABu8; 4096];
+        std::fs::write(&part_file, &payload).unwrap();
+        std::fs::rename(&part_file, &placeholder).unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !dest_dir.join("chunked4k.bin").exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        let relocated = std::fs::read(dest_dir.join("chunked4k.bin")).expect("read chunked4k.bin");
+        assert_eq!(relocated.len(), 4096);
+        assert_eq!(relocated, payload);
     }
 }
