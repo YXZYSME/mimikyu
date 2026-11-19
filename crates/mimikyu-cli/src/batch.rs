@@ -28,8 +28,26 @@ pub fn load_normalized_batch_actions(args: &BatchArgs) -> Result<Vec<Value>> {
     })?;
 
     // Validate full deserializability into Vec<BatchAction> up front on CLI side too
-    let normalized = normalize_batch_ops_value(raw_val.clone())?;
+    let mut normalized = normalize_batch_ops_value(raw_val.clone())?;
     let _ = parse_batch_actions(raw_val)?;
+    if let Ok(cwd) = std::env::current_dir() {
+        for item in &mut normalized {
+            if item.get("action").and_then(Value::as_str) == Some("upload")
+                && let Some(files) = item.get_mut("files").and_then(Value::as_array_mut)
+            {
+                for f in files {
+                    if let Some(s) = f.as_str()
+                        && !s.is_empty()
+                    {
+                        let p = Path::new(s);
+                        if p.is_relative() {
+                            *f = Value::String(cwd.join(p).to_string_lossy().into_owned());
+                        }
+                    }
+                }
+            }
+        }
+    }
     Ok(normalized)
 }
 

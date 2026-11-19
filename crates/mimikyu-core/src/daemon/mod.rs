@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use fs2::FileExt;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::Mutex;
@@ -62,6 +62,15 @@ pub struct DaemonPaths {
 }
 
 pub fn resolve_socket_paths(state_dir: &Path) -> Result<DaemonPaths> {
+    let paths = resolve_socket_paths_inner(state_dir, true)?;
+    Ok(paths)
+}
+
+fn resolve_socket_paths_readonly(state_dir: &Path) -> Result<DaemonPaths> {
+    resolve_socket_paths_inner(state_dir, false)
+}
+
+fn resolve_socket_paths_inner(state_dir: &Path, create_dir: bool) -> Result<DaemonPaths> {
     if state_dir.as_os_str().is_empty() {
         return Err(MimikyuError::InvalidConfig(
             "state_dir cannot be empty".to_string(),
@@ -73,7 +82,9 @@ pub fn resolve_socket_paths(state_dir: &Path) -> Result<DaemonPaths> {
             state_dir.display()
         )));
     }
-    fs::create_dir_all(state_dir)?;
+    if create_dir {
+        fs::create_dir_all(state_dir)?;
+    }
 
     let canon_state_dir = fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
     let sock_link = state_dir.join("daemon.sock");
@@ -169,39 +180,99 @@ fn read_pid_file(pid_file: &Path) -> Option<i32> {
     raw.trim().parse::<i32>().ok().filter(|&p| p > 0)
 }
 
-async fn read_line_bounded<R: AsyncBufReadExt + Unpin>(
+pub(crate) enum BoundedLine {
+    Eof,
+    Ok(Vec<u8>),
+    TooLong,
+}
+
+pub(crate) async fn read_bounded_line_bytes<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> std::io::Result<BoundedLine> {
+    let mut buf = Vec::new();
+    {
+        let mut limited = reader.take((max_bytes + 1) as u64);
+        let n = limited.read_until(b'\n', &mut buf).await?;
+        if n == 0 {
+            return Ok(BoundedLine::Eof);
+        }
+    }
+    if buf.len() > max_bytes {
+        if !buf.ends_with(b"\n") {
+            loop {
+                let avail = reader.fill_buf().await?;
+                if avail.is_empty() {
+                    break;
+                }
+                if let Some(pos) = avail.iter().position(|&b| b == b'\n') {
+                    reader.consume(pos + 1);
+                    break;
+                }
+                let len = avail.len();
+                reader.consume(len);
+            }
+        }
+        return Ok(BoundedLine::TooLong);
+    }
+    Ok(BoundedLine::Ok(buf))
+}
+
+async fn read_line_bounded<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     buf: &mut String,
 ) -> Result<usize> {
     buf.clear();
-    let n = reader.read_line(buf).await?;
-    if buf.len() > MAX_LINE_BYTES {
-        return Err(MimikyuError::Transport(format!(
+    match read_bounded_line_bytes(reader, MAX_LINE_BYTES).await? {
+        BoundedLine::Eof => Ok(0),
+        BoundedLine::TooLong => Err(MimikyuError::Transport(format!(
             "daemon RPC frame exceeded {MAX_LINE_BYTES} bytes"
-        )));
+        ))),
+        BoundedLine::Ok(bytes) => {
+            let s = std::str::from_utf8(&bytes).map_err(|e| {
+                MimikyuError::Transport(format!("invalid UTF-8 in daemon RPC frame: {e}"))
+            })?;
+            let len = s.len();
+            buf.push_str(s);
+            Ok(len)
+        }
     }
-    Ok(n)
 }
 
-async fn send_rpc_on_stream(stream: &mut UnixStream, req: &DaemonRequest) -> Result<DaemonResponse> {
-    let mut payload = serde_json::to_string(req)?;
+enum RpcSendOutcome {
+    PreSendIo(std::io::Error),
+    PostSend(MimikyuError),
+}
+
+async fn send_rpc_on_stream(
+    stream: &mut UnixStream,
+    req: &DaemonRequest,
+) -> std::result::Result<DaemonResponse, RpcSendOutcome> {
+    let mut payload = serde_json::to_string(req).map_err(|e| RpcSendOutcome::PostSend(e.into()))?;
     payload.push('\n');
-    stream.write_all(payload.as_bytes()).await?;
-    stream.flush().await?;
+    if let Err(e) = stream.write_all(payload.as_bytes()).await {
+        return Err(RpcSendOutcome::PreSendIo(e));
+    }
+    if let Err(e) = stream.flush().await {
+        return Err(RpcSendOutcome::PreSendIo(e));
+    }
 
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
-    let n = read_line_bounded(&mut reader, &mut line).await?;
+    let n = read_line_bounded(&mut reader, &mut line)
+        .await
+        .map_err(RpcSendOutcome::PostSend)?;
     if n == 0 {
-        return Err(MimikyuError::Transport(
+        return Err(RpcSendOutcome::PostSend(MimikyuError::Transport(
             "daemon closed connection before responding".to_string(),
-        ));
+        )));
     }
-    let resp: DaemonResponse = serde_json::from_str(line.trim_end_matches(['\r', '\n']))?;
+    let resp: DaemonResponse = serde_json::from_str(line.trim_end_matches(['\r', '\n']))
+        .map_err(|e| RpcSendOutcome::PostSend(e.into()))?;
     Ok(resp)
 }
 
-async fn try_connect_and_ping(paths: &DaemonPaths) -> Option<UnixStream> {
+async fn try_connect_and_ping_with_pid(paths: &DaemonPaths) -> Option<(UnixStream, u64)> {
     let target = resolve_connect_target(&paths.sock_link).ok()??;
     if target.as_os_str().as_encoded_bytes().len() >= 104 {
         return None;
@@ -222,13 +293,45 @@ async fn try_connect_and_ping(paths: &DaemonPaths) -> Option<UnixStream> {
     .ok()?
     .ok()?;
     if resp.ok {
-        Some(stream)
+        let pid = resp
+            .data
+            .as_ref()
+            .and_then(|d| d.get("pid"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        Some((stream, pid))
     } else {
         None
     }
 }
 
-async fn probe_live_or_cleanup_stale(paths: &DaemonPaths) -> Option<UnixStream> {
+async fn try_connect_and_ping(paths: &DaemonPaths) -> Option<UnixStream> {
+    try_connect_and_ping_with_pid(paths)
+        .await
+        .map(|(stream, _)| stream)
+}
+
+fn is_active_lock_held(state_dir: &Path) -> bool {
+    let lock_path = state_dir.join("daemon-active.lock");
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) else {
+        return false;
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = FileExt::unlock(&file);
+            false
+        }
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.raw_os_error() == fs2::lock_contended_error().raw_os_error() =>
+        {
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+async fn probe_live_socket_or_cleanup_stale(paths: &DaemonPaths) -> Option<UnixStream> {
     if let Some(stream) = try_connect_and_ping(paths).await {
         return Some(stream);
     }
@@ -246,6 +349,45 @@ async fn probe_live_or_cleanup_stale(paths: &DaemonPaths) -> Option<UnixStream> 
 
     cleanup_stale_files(paths);
     None
+}
+
+async fn wait_for_live_or_exiting_daemon(
+    paths: &DaemonPaths,
+) -> Result<Option<(UnixStream, u64)>> {
+    if let Some(res) = try_connect_and_ping_with_pid(paths).await {
+        return Ok(Some(res));
+    }
+
+    if is_active_lock_held(&paths.state_dir) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(res) = try_connect_and_ping_with_pid(paths).await {
+                return Ok(Some(res));
+            }
+            if !is_active_lock_held(&paths.state_dir) {
+                break;
+            }
+            if Instant::now() >= deadline {
+                return Err(MimikyuError::Timeout {
+                    timeout_ms: 20_000,
+                    operation: "waiting for existing daemon startup or shutdown".to_string(),
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    } else if let Some(pid) = read_pid_file(&paths.pid_file)
+        && is_pid_alive(pid)
+    {
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            if let Some(res) = try_connect_and_ping_with_pid(paths).await {
+                return Ok(Some(res));
+            }
+        }
+    }
+
+    cleanup_stale_files(paths);
+    Ok(None)
 }
 
 async fn acquire_daemon_lock(lock_path: &Path) -> Result<fs::File> {
@@ -272,48 +414,85 @@ pub struct DaemonServer {
     paths: DaemonPaths,
     listener: Option<UnixListener>,
     pool: Arc<DaemonPool>,
+    _active_lock: Option<fs::File>,
     owns_files: bool,
 }
 
 impl DaemonServer {
     pub async fn bind(config: DaemonConfig) -> Result<Self> {
         let paths = resolve_socket_paths(&config.state_dir)?;
+        let bind_lock_path = paths.state_dir.join("daemon-bind.lock");
+        let active_lock_path = paths.state_dir.join("daemon-active.lock");
+        let bind_lock = acquire_daemon_lock(&bind_lock_path).await?;
 
-        if probe_live_or_cleanup_stale(&paths).await.is_some() {
-            return Err(MimikyuError::InvalidConfig(format!(
-                "daemon already running for state_dir '{}'",
-                paths.state_dir.display()
-            )));
+        let bind_res = async {
+            let active_lock = {
+                let path = active_lock_path.clone();
+                tokio::task::spawn_blocking(move || -> Result<fs::File> {
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .create(true)
+                        .truncate(false)
+                        .open(&path)?;
+                    file.try_lock_exclusive()?;
+                    Ok(file)
+                })
+                .await
+                .map_err(|e| MimikyuError::Transport(format!("daemon active lock task failed: {e}")))?
+            };
+            let active_lock = match active_lock {
+                Ok(f) => f,
+                Err(_) => {
+                    return Err(MimikyuError::InvalidConfig(format!(
+                        "daemon already running for state_dir '{}'",
+                        paths.state_dir.display()
+                    )));
+                }
+            };
+
+            if probe_live_socket_or_cleanup_stale(&paths).await.is_some() {
+                release_daemon_lock(active_lock);
+                return Err(MimikyuError::InvalidConfig(format!(
+                    "daemon already running for state_dir '{}'",
+                    paths.state_dir.display()
+                )));
+            }
+
+            if paths.bound_sock.exists() {
+                let _ = fs::remove_file(&paths.bound_sock);
+            }
+
+            let listener = UnixListener::bind(&paths.bound_sock)?;
+
+            if paths.bound_sock != paths.sock_link {
+                let _ = fs::remove_file(&paths.sock_link);
+                symlink(&paths.bound_sock, &paths.sock_link)?;
+            }
+
+            write_pid_file(&paths.pid_file, std::process::id())?;
+
+            let manager = Arc::new(SessionManager::with_config(SessionManagerConfig {
+                state_dir: paths.state_dir.clone(),
+                default_engine: config.default_engine,
+                default_headless: config.default_headless,
+                ..Default::default()
+            })?);
+
+            let pool = DaemonPool::new(manager, paths.clone(), config.idle_timeout);
+
+            Ok(Self {
+                paths: paths.clone(),
+                listener: Some(listener),
+                pool,
+                _active_lock: Some(active_lock),
+                owns_files: true,
+            })
         }
+        .await;
 
-        if paths.bound_sock.exists() {
-            let _ = fs::remove_file(&paths.bound_sock);
-        }
-
-        let listener = UnixListener::bind(&paths.bound_sock)?;
-
-        if paths.bound_sock != paths.sock_link {
-            let _ = fs::remove_file(&paths.sock_link);
-            symlink(&paths.bound_sock, &paths.sock_link)?;
-        }
-
-        write_pid_file(&paths.pid_file, std::process::id())?;
-
-        let manager = Arc::new(SessionManager::with_config(SessionManagerConfig {
-            state_dir: paths.state_dir.clone(),
-            default_engine: config.default_engine,
-            default_headless: config.default_headless,
-            ..Default::default()
-        })?);
-
-        let pool = DaemonPool::new(manager, paths.clone(), config.idle_timeout);
-
-        Ok(Self {
-            paths,
-            listener: Some(listener),
-            pool,
-            owns_files: true,
-        })
+        release_daemon_lock(bind_lock);
+        bind_res
     }
 
     pub fn pool(&self) -> &Arc<DaemonPool> {
@@ -330,6 +509,7 @@ impl DaemonServer {
         let mut shutdown_rx = pool.subscribe_shutdown();
 
         let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sigint = signal(SignalKind::interrupt())?;
         let mut idle_tick = tokio::time::interval(Duration::from_millis(200));
         idle_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -357,20 +537,19 @@ impl DaemonServer {
                     pool.request_shutdown();
                     break;
                 }
-                ctrl = tokio::signal::ctrl_c() => {
-                    if ctrl.is_ok() {
-                        tracing::info!("daemon received SIGINT");
+                _ = sigint.recv() => {
+                    tracing::info!("daemon received SIGINT");
+                    pool.request_shutdown();
+                    break;
+                }
+                changed = shutdown_rx.changed() => {
+                    if changed.is_ok() && *shutdown_rx.borrow() {
                         pool.request_shutdown();
                         break;
                     }
                 }
-                changed = shutdown_rx.changed() => {
-                    if changed.is_ok() && *shutdown_rx.borrow() {
-                        break;
-                    }
-                }
                 _ = idle_tick.tick() => {
-                    if pool.is_idle_expired()
+                    if pool.try_expire_idle()
                         || !self.paths.state_dir.exists()
                         || fs::symlink_metadata(&self.paths.bound_sock).is_err()
                         || fs::symlink_metadata(&self.paths.sock_link).is_err()
@@ -383,11 +562,94 @@ impl DaemonServer {
             }
         }
 
-        drop(listener);
-        connections.abort_all();
-        while connections.join_next().await.is_some() {}
+        // Accept any already-queued backlog connections after setting shutting_down=true
+        // so clients receive a clean Disposed RPC response rather than a mid-frame EOF/reset.
+        for _ in 0..64 {
+            let accepted = std::future::poll_fn(|cx| match listener.poll_accept(cx) {
+                std::task::Poll::Ready(res) => std::task::Poll::Ready(Some(res)),
+                std::task::Poll::Pending => std::task::Poll::Ready(None),
+            })
+            .await;
+            match accepted {
+                Some(Ok((stream, _addr))) => {
+                    let conn_pool = Arc::clone(&pool);
+                    connections.spawn(async move {
+                        handle_connection(stream, conn_pool).await;
+                    });
+                }
+                _ => break,
+            }
+        }
 
-        let shutdown_res = pool.shutdown().await;
+        drop(listener);
+        let mut interrupted = false;
+        let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while !connections.is_empty() {
+            let remaining = drain_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::select! {
+                res = tokio::time::timeout(remaining, connections.join_next()) => {
+                    match res {
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                _ = sigterm.recv() => {
+                    tracing::warn!("daemon received SIGTERM during connection drain");
+                    interrupted = true;
+                    break;
+                }
+                _ = sigint.recv() => {
+                    tracing::warn!("daemon received SIGINT during connection drain");
+                    interrupted = true;
+                    break;
+                }
+            }
+        }
+        connections.abort_all();
+        let abort_deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        while !connections.is_empty() {
+            let remaining = abort_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::select! {
+                res = tokio::time::timeout(remaining, connections.join_next()) => {
+                    match res {
+                        Ok(Some(_)) => {}
+                        Ok(None) | Err(_) => break,
+                    }
+                }
+                _ = sigterm.recv() => {
+                    tracing::warn!("daemon received SIGTERM while aborting connections");
+                    interrupted = true;
+                    break;
+                }
+                _ = sigint.recv() => {
+                    tracing::warn!("daemon received SIGINT while aborting connections");
+                    interrupted = true;
+                    break;
+                }
+            }
+        }
+
+        let shutdown_res = if interrupted {
+            Ok(())
+        } else {
+            tokio::select! {
+                res = pool.shutdown() => res,
+                _ = sigterm.recv() => {
+                    tracing::warn!("daemon received SIGTERM during pool shutdown; aborting graceful teardown");
+                    Ok(())
+                }
+                _ = sigint.recv() => {
+                    tracing::warn!("daemon received SIGINT during pool shutdown; aborting graceful teardown");
+                    Ok(())
+                }
+            }
+        };
         cleanup_stale_files(&self.paths);
         self.owns_files = false;
         shutdown_res
@@ -420,25 +682,36 @@ fn write_pid_file(path: &Path, pid: u32) -> Result<()> {
 async fn handle_connection(stream: UnixStream, pool: Arc<DaemonPool>) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
-    let mut line = String::new();
 
     loop {
-        line.clear();
-        let read_res = reader.read_line(&mut line).await;
-        match read_res {
-            Ok(0) => break,
-            Ok(_) => {
-                if line.len() > MAX_LINE_BYTES {
-                    let resp = DaemonResponse::err_message(
-                        0,
-                        DaemonErrorKind::InvalidConfig,
-                        format!("request exceeded {MAX_LINE_BYTES} bytes"),
-                    );
-                    if write_response(&mut write_half, &resp).await.is_err() {
-                        break;
-                    }
-                    continue;
+        match read_bounded_line_bytes(&mut reader, MAX_LINE_BYTES).await {
+            Ok(BoundedLine::Eof) => break,
+            Ok(BoundedLine::TooLong) => {
+                let resp = DaemonResponse::err_message(
+                    0,
+                    DaemonErrorKind::InvalidConfig,
+                    format!("request exceeded {MAX_LINE_BYTES} bytes"),
+                );
+                if write_response(&mut write_half, &resp).await.is_err() {
+                    break;
                 }
+                continue;
+            }
+            Ok(BoundedLine::Ok(bytes)) => {
+                let line = match std::str::from_utf8(&bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let resp = DaemonResponse::err_message(
+                            0,
+                            DaemonErrorKind::InvalidConfig,
+                            format!("invalid UTF-8 in daemon RPC request: {e}"),
+                        );
+                        if write_response(&mut write_half, &resp).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;
@@ -474,6 +747,9 @@ async fn handle_connection(stream: UnixStream, pool: Arc<DaemonPool>) {
                     pool.request_shutdown();
                     break;
                 }
+                if pool.is_shutting_down() {
+                    break;
+                }
             }
             Err(e) => {
                 tracing::debug!(error = %e, "daemon client read error");
@@ -496,10 +772,19 @@ async fn write_response<W: AsyncWriteExt + Unpin>(
     writer.flush().await
 }
 
+fn is_idempotent_read_op(op: &DaemonOp) -> bool {
+    matches!(
+        op,
+        DaemonOp::Ping | DaemonOp::DaemonStatus | DaemonOp::SessionList | DaemonOp::ProfileList
+    )
+}
+
 pub struct DaemonClient {
     paths: DaemonPaths,
     stream: Mutex<UnixStream>,
     next_id: std::sync::atomic::AtomicU64,
+    daemon_pid: std::sync::atomic::AtomicU64,
+    auto_spawn_config: Option<DaemonConfig>,
 }
 
 impl DaemonClient {
@@ -516,6 +801,8 @@ impl DaemonClient {
             paths,
             stream: Mutex::new(stream),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            daemon_pid: std::sync::atomic::AtomicU64::new(0),
+            auto_spawn_config: None,
         })
     }
 
@@ -524,6 +811,23 @@ impl DaemonClient {
             paths,
             stream: Mutex::new(stream),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            daemon_pid: std::sync::atomic::AtomicU64::new(0),
+            auto_spawn_config: None,
+        }
+    }
+
+    fn from_managed_stream(
+        paths: DaemonPaths,
+        stream: UnixStream,
+        daemon_pid: u64,
+        config: DaemonConfig,
+    ) -> Self {
+        Self {
+            paths,
+            stream: Mutex::new(stream),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+            daemon_pid: std::sync::atomic::AtomicU64::new(daemon_pid),
+            auto_spawn_config: Some(config),
         }
     }
 
@@ -537,24 +841,119 @@ impl DaemonClient {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let req = DaemonRequest { id, op };
         let mut guard = self.stream.lock().await;
+        let max_attempts =
+            if self.auto_spawn_config.is_some() && !matches!(req.op, DaemonOp::DaemonStop) {
+                3
+            } else {
+                1
+            };
 
-        let resp = match send_rpc_on_stream(&mut guard, &req).await {
-            Ok(r) => r,
-            Err(_) => {
-                let target = resolve_connect_target(&self.paths.sock_link)?.ok_or_else(|| {
-                    MimikyuError::Transport("daemon socket disappeared".to_string())
-                })?;
-                *guard = UnixStream::connect(&target).await?;
-                send_rpc_on_stream(&mut guard, &req).await?
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            match send_rpc_on_stream(&mut guard, &req).await {
+                Ok(resp) => {
+                    if resp.ok {
+                        return Ok(resp.data.unwrap_or(Value::Null));
+                    }
+                    let is_disposed = resp
+                        .error
+                        .as_ref()
+                        .is_some_and(|e| e.kind == DaemonErrorKind::Disposed);
+                    let is_explicit_shutdown_disposed = resp.error.as_ref().is_some_and(|e| {
+                        e.kind == DaemonErrorKind::Disposed
+                            && e.message == "daemon is shutting down"
+                    });
+                    let err = resp
+                        .error
+                        .map(DaemonError::into_mimikyu)
+                        .unwrap_or_else(|| {
+                            MimikyuError::Transport("unknown daemon error".to_string())
+                        });
+                    if attempt < max_attempts
+                        && is_disposed
+                        && let Some(ref cfg) = self.auto_spawn_config
+                    {
+                        let should_respawn = if is_explicit_shutdown_disposed {
+                            true
+                        } else {
+                            let prev_pid = self
+                                .daemon_pid
+                                .load(std::sync::atomic::Ordering::Relaxed);
+                            match try_connect_and_ping_with_pid(&self.paths).await {
+                                None => true,
+                                Some((_, live_pid)) => prev_pid != 0 && live_pid != prev_pid,
+                            }
+                        };
+                        if should_respawn {
+                            let fresh = ensure_daemon(cfg.clone()).await?;
+                            self.daemon_pid.store(
+                                fresh
+                                    .daemon_pid
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            *guard = fresh.stream.into_inner();
+                            continue;
+                        }
+                    }
+                    return Err(err);
+                }
+                Err(RpcSendOutcome::PreSendIo(e)) => {
+                    if matches!(req.op, DaemonOp::DaemonStop) {
+                        return Err(e.into());
+                    }
+                    if let Some(ref cfg) = self.auto_spawn_config {
+                        if attempt < max_attempts {
+                            let fresh = ensure_daemon(cfg.clone()).await?;
+                            self.daemon_pid.store(
+                                fresh
+                                    .daemon_pid
+                                    .load(std::sync::atomic::Ordering::Relaxed),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            *guard = fresh.stream.into_inner();
+                            continue;
+                        }
+                        return Err(e.into());
+                    }
+                    let target = resolve_connect_target(&self.paths.sock_link)?.ok_or_else(|| {
+                        MimikyuError::Transport("daemon socket disappeared".to_string())
+                    })?;
+                    *guard = UnixStream::connect(&target).await?;
+                    match send_rpc_on_stream(&mut guard, &req).await {
+                        Ok(resp) => {
+                            return if resp.ok {
+                                Ok(resp.data.unwrap_or(Value::Null))
+                            } else if let Some(err) = resp.error {
+                                Err(err.into_mimikyu())
+                            } else {
+                                Err(MimikyuError::Transport("unknown daemon error".to_string()))
+                            };
+                        }
+                        Err(RpcSendOutcome::PreSendIo(e2)) => return Err(e2.into()),
+                        Err(RpcSendOutcome::PostSend(e2)) => return Err(e2),
+                    }
+                }
+                Err(RpcSendOutcome::PostSend(e)) => {
+                    if attempt < max_attempts
+                        && let Some(ref cfg) = self.auto_spawn_config
+                        && is_idempotent_read_op(&req.op)
+                        && matches!(e, MimikyuError::Transport(_) | MimikyuError::Io(_))
+                    {
+                        let fresh = ensure_daemon(cfg.clone()).await?;
+                        self.daemon_pid.store(
+                            fresh
+                                .daemon_pid
+                                .load(std::sync::atomic::Ordering::Relaxed),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        *guard = fresh.stream.into_inner();
+                        continue;
+                    }
+                    return Err(e);
+                }
             }
-        };
-
-        if resp.ok {
-            Ok(resp.data.unwrap_or(Value::Null))
-        } else if let Some(err) = resp.error {
-            Err(err.into_mimikyu())
-        } else {
-            Err(MimikyuError::Transport("unknown daemon error".to_string()))
         }
     }
 }
@@ -563,15 +962,22 @@ pub fn spawn_daemon_background(config: &DaemonConfig) -> Result<std::process::Ch
     let paths = resolve_socket_paths(&config.state_dir)?;
     let exe = std::env::current_exe()?;
 
+    let mut state_arg = std::ffi::OsString::from("--state-dir=");
+    state_arg.push(&paths.state_dir);
+
     let mut cmd = Command::new(exe);
-    cmd.arg("--state-dir")
-        .arg(&paths.state_dir)
+    cmd.arg(state_arg)
         .arg("--engine")
         .arg(config.default_engine.to_string())
         .arg("daemon")
         .arg("--foreground");
-    if let Some(timeout) = config.idle_timeout {
-        cmd.arg("--idle-timeout").arg(timeout.as_secs().to_string());
+    match config.idle_timeout {
+        Some(timeout) => {
+            cmd.arg("--idle-timeout").arg(timeout.as_secs().to_string());
+        }
+        None => {
+            cmd.arg("--idle-timeout").arg("0");
+        }
     }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -581,6 +987,18 @@ pub fn spawn_daemon_background(config: &DaemonConfig) -> Result<std::process::Ch
         cmd.pre_exec(|| {
             if libc::setsid() == -1 && libc::setpgid(0, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
+            }
+            let max_fd = libc::sysconf(libc::_SC_OPEN_MAX);
+            let limit = if max_fd > 3 {
+                (max_fd as libc::c_int).min(4096)
+            } else {
+                1024
+            };
+            for fd in 3..limit {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags != -1 && (flags & libc::FD_CLOEXEC) == 0 {
+                    let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                }
             }
             Ok(())
         });
@@ -592,27 +1010,48 @@ pub fn spawn_daemon_background(config: &DaemonConfig) -> Result<std::process::Ch
 pub async fn ensure_daemon(config: DaemonConfig) -> Result<DaemonClient> {
     let paths = resolve_socket_paths(&config.state_dir)?;
 
-    if let Some(stream) = try_connect_and_ping(&paths).await {
-        return Ok(DaemonClient::from_stream(paths, stream));
+    if let Some((stream, pid)) = try_connect_and_ping_with_pid(&paths).await {
+        return Ok(DaemonClient::from_managed_stream(paths, stream, pid, config));
     }
 
     let lock_file = acquire_daemon_lock(&paths.lock_file).await?;
 
     let result = async {
-        if let Some(stream) = probe_live_or_cleanup_stale(&paths).await {
-            return Ok(DaemonClient::from_stream(paths.clone(), stream));
+        if let Some((stream, pid)) = wait_for_live_or_exiting_daemon(&paths).await? {
+            return Ok(DaemonClient::from_managed_stream(
+                paths.clone(),
+                stream,
+                pid,
+                config.clone(),
+            ));
         }
 
         let mut child = spawn_daemon_background(&config)?;
         let deadline = Instant::now() + Duration::from_secs(10);
 
         loop {
-            if let Some(stream) = try_connect_and_ping(&paths).await {
-                return Ok(DaemonClient::from_stream(paths.clone(), stream));
+            if let Some((stream, pid)) = try_connect_and_ping_with_pid(&paths).await {
+                return Ok(DaemonClient::from_managed_stream(
+                    paths.clone(),
+                    stream,
+                    pid,
+                    config.clone(),
+                ));
             }
             if let Some(status) = child.try_wait()? {
-                if let Some(stream) = try_connect_and_ping(&paths).await {
-                    return Ok(DaemonClient::from_stream(paths.clone(), stream));
+                for _ in 0..10 {
+                    if let Some((stream, pid)) = try_connect_and_ping_with_pid(&paths).await {
+                        return Ok(DaemonClient::from_managed_stream(
+                            paths.clone(),
+                            stream,
+                            pid,
+                            config.clone(),
+                        ));
+                    }
+                    if !is_active_lock_held(&paths.state_dir) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
                 }
                 return Err(MimikyuError::LaunchFailed(format!(
                     "daemon exited prematurely with status {status}"
@@ -636,12 +1075,42 @@ pub async fn ensure_daemon(config: DaemonConfig) -> Result<DaemonClient> {
 }
 
 pub async fn daemon_status(state_dir: &Path) -> Result<DaemonStatusInfo> {
-    let paths = resolve_socket_paths(state_dir)?;
+    let paths = resolve_socket_paths_readonly(state_dir)?;
+    if !paths.state_dir.exists() {
+        return Ok(DaemonStatusInfo {
+            running: false,
+            pid: 0,
+            state_dir: paths.state_dir,
+            socket_path: paths.sock_link,
+            bound_socket_path: paths.bound_sock,
+            uptime_ms: 0,
+            idle_timeout_secs: None,
+            active_sessions: 0,
+            last_activity_ms: 0,
+        });
+    }
     if let Some(stream) = try_connect_and_ping(&paths).await {
-        let client = DaemonClient::from_stream(paths, stream);
-        let data = client.call(DaemonOp::DaemonStatus).await?;
-        let info: DaemonStatusInfo = serde_json::from_value(data)?;
-        Ok(info)
+        let client = DaemonClient::from_stream(paths.clone(), stream);
+        match client.call(DaemonOp::DaemonStatus).await {
+            Ok(data) => {
+                let info: DaemonStatusInfo = serde_json::from_value(data)?;
+                Ok(info)
+            }
+            Err(MimikyuError::Disposed | MimikyuError::Transport(_) | MimikyuError::Io(_)) => {
+                Ok(DaemonStatusInfo {
+                    running: false,
+                    pid: 0,
+                    state_dir: paths.state_dir,
+                    socket_path: paths.sock_link,
+                    bound_socket_path: paths.bound_sock,
+                    uptime_ms: 0,
+                    idle_timeout_secs: None,
+                    active_sessions: 0,
+                    last_activity_ms: 0,
+                })
+            }
+            Err(e) => Err(e),
+        }
     } else {
         Ok(DaemonStatusInfo {
             running: false,
@@ -657,42 +1126,135 @@ pub async fn daemon_status(state_dir: &Path) -> Result<DaemonStatusInfo> {
     }
 }
 
-pub async fn daemon_stop(state_dir: &Path) -> Result<bool> {
-    let paths = resolve_socket_paths(state_dir)?;
-    let Some(stream) = try_connect_and_ping(&paths).await else {
-        cleanup_stale_files(&paths);
-        return Ok(false);
-    };
-
-    let pid = read_pid_file(&paths.pid_file);
-    let client = DaemonClient::from_stream(paths.clone(), stream);
-    let _ = client.call(DaemonOp::DaemonStop).await?;
-    drop(client);
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let sock_gone = resolve_connect_target(&paths.sock_link)?.is_none();
-        let pid_gone = pid.is_none_or(|p| !is_pid_alive(p));
-        if sock_gone && pid_gone {
-            return Ok(true);
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-
-    if let Some(p) = pid
-        && is_pid_alive(p)
-    {
+async fn terminate_pid_with_escalation(paths: &DaemonPaths, p: i32) -> Result<()> {
+    if is_pid_alive(p) {
         unsafe {
             libc::kill(p as libc::pid_t, libc::SIGTERM);
         }
-        for _ in 0..25 {
+        for _ in 0..100 {
             if !is_pid_alive(p) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
-    cleanup_stale_files(&paths);
+    if is_pid_alive(p) {
+        tracing::warn!(pid = p, "daemon survived SIGTERM; escalating to SIGKILL");
+        unsafe {
+            libc::kill(p as libc::pid_t, libc::SIGKILL);
+        }
+        for _ in 0..50 {
+            if !is_pid_alive(p) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+    if is_pid_alive(p) {
+        return Err(MimikyuError::Timeout {
+            timeout_ms: 8_000,
+            operation: format!(
+                "stopping daemon pid {p}: process remained alive after SIGTERM and SIGKILL"
+            ),
+        });
+    }
+    if !is_active_lock_held(&paths.state_dir) {
+        let current_pid = read_pid_file(&paths.pid_file);
+        if current_pid.is_none() || current_pid == Some(p) {
+            cleanup_stale_files(paths);
+        }
+    }
+    Ok(())
+}
+
+pub async fn daemon_stop(state_dir: &Path) -> Result<bool> {
+    let paths = resolve_socket_paths_readonly(state_dir)?;
+    if !paths.state_dir.exists() {
+        return Ok(false);
+    }
+    let Some((stream, ping_pid)) = try_connect_and_ping_with_pid(&paths).await else {
+        if is_active_lock_held(&paths.state_dir) {
+            if let Some(p) = read_pid_file(&paths.pid_file)
+                && p != std::process::id() as i32
+                && is_pid_alive(p)
+            {
+                for _ in 0..25 {
+                    if !is_pid_alive(p) && !is_active_lock_held(&paths.state_dir) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                if is_pid_alive(p) {
+                    terminate_pid_with_escalation(&paths, p).await?;
+                    return Ok(true);
+                }
+                if !is_active_lock_held(&paths.state_dir) {
+                    cleanup_stale_files(&paths);
+                }
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        cleanup_stale_files(&paths);
+        return Ok(false);
+    };
+
+    let pid = read_pid_file(&paths.pid_file)
+        .or_else(|| (ping_pid > 0 && ping_pid <= i32::MAX as u64).then_some(ping_pid as i32));
+    let client = DaemonClient::from_stream(paths.clone(), stream);
+    let _ = client.call(DaemonOp::DaemonStop).await?;
+    drop(client);
+
+    let self_pid = std::process::id() as i32;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let current_pid = read_pid_file(&paths.pid_file);
+        let sock_gone = resolve_connect_target(&paths.sock_link)?.is_none();
+        let lock_free = !is_active_lock_held(&paths.state_dir);
+        if let Some(p) = pid {
+            if p == self_pid {
+                if current_pid.is_none() && sock_gone && lock_free {
+                    return Ok(true);
+                }
+            } else if !is_pid_alive(p)
+                && (current_pid != Some(p) || (sock_gone && lock_free))
+            {
+                if lock_free {
+                    cleanup_stale_files(&paths);
+                }
+                return Ok(true);
+            }
+        } else if sock_gone && lock_free {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    if let Some(p) = pid {
+        if p == self_pid {
+            if is_active_lock_held(&paths.state_dir) {
+                return Err(MimikyuError::Timeout {
+                    timeout_ms: 5_000,
+                    operation: "waiting for in-process daemon shutdown".to_string(),
+                });
+            }
+        } else {
+            terminate_pid_with_escalation(&paths, p).await?;
+            return Ok(true);
+        }
+    } else if is_active_lock_held(&paths.state_dir) {
+        return Err(MimikyuError::Timeout {
+            timeout_ms: 5_000,
+            operation: "waiting for daemon shutdown (active lock still held)".to_string(),
+        });
+    }
+
+    if !is_active_lock_held(&paths.state_dir) {
+        let current_pid = read_pid_file(&paths.pid_file);
+        if current_pid.is_none() || current_pid == pid {
+            cleanup_stale_files(&paths);
+        }
+    }
     Ok(true)
 }
 

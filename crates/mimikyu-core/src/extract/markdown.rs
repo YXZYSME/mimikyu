@@ -517,10 +517,7 @@ async fn extract_blocks_in_frame(
         .filter_map(JsRawBlock::into_doc_block)
         .collect();
 
-    if opts.include_shadow_dom
-        && session.capabilities().supports_closed_shadow_dom
-        && opts.selector.is_none()
-    {
+    if opts.include_shadow_dom && session.capabilities().supports_closed_shadow_dom {
         let owned_main_fid;
         let shadow_fid = match frame_id {
             Some(f) => Some(f),
@@ -538,8 +535,43 @@ async fn extract_blocks_in_frame(
             .await
             .unwrap_or_default();
         let closed_fn = format!(
-            r#"function(forMd) {{
+            r#"function(forMd, sel, mainOnly) {{
                 {JS_DOC_WALKER_HELPERS}
+                const isSubtreeVisible = (startEl) => {{
+                    let cur = startEl;
+                    while (cur) {{
+                        if (cur.nodeType === 1) {{
+                            if (!isVisible(cur)) return false;
+                            cur = cur.parentElement || (cur.getRootNode ? cur.getRootNode().host : null);
+                        }} else if (cur.nodeType === 11) {{
+                            cur = cur.host || null;
+                        }} else {{
+                            cur = null;
+                        }}
+                    }}
+                    return true;
+                }};
+                const isInsideScope = (startEl, scopeRoot) => {{
+                    if (!scopeRoot) return false;
+                    let cur = startEl;
+                    while (cur) {{
+                        if (cur === scopeRoot) return true;
+                        if (cur.nodeType === 1) {{
+                            cur = cur.parentElement || (cur.getRootNode ? cur.getRootNode().host : null);
+                        }} else if (cur.nodeType === 11) {{
+                            cur = cur.host || null;
+                        }} else {{
+                            cur = null;
+                        }}
+                    }}
+                    return false;
+                }};
+                if (!this || !this.host || !isSubtreeVisible(this.host)) return {{ blocks: [] }};
+                let scopeRoot = sel ? document.querySelector(sel) : null;
+                if (!sel) {{
+                    scopeRoot = (mainOnly ? (document.querySelector('main, [role="main"], article') || document.body) : document.body) || document.documentElement;
+                }}
+                if (!isInsideScope(this.host, scopeRoot)) return {{ blocks: [] }};
                 const blocks = [];
                 collectBlocks(this, true, forMd, blocks);
                 return {{ blocks }};
@@ -547,7 +579,16 @@ async fn extract_blocks_in_frame(
         );
         for sr_bid in closed_hosts {
             if let Ok(sr_val) = session
-                .call_function_on_node(sr_bid, frame_id, &closed_fn, vec![serde_json::json!(for_markdown)])
+                .call_function_on_node(
+                    sr_bid,
+                    frame_id,
+                    &closed_fn,
+                    vec![
+                        serde_json::json!(for_markdown),
+                        serde_json::json!(opts.selector),
+                        serde_json::json!(opts.main_only),
+                    ],
+                )
                 .await
                 && let Ok(sr_payload) = serde_json::from_value::<JsExtractPayload>(sr_val)
             {

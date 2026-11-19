@@ -745,6 +745,9 @@ pub trait DriverSession: Send + Sync {
     async fn clear_cookies(&self) -> Result<()>;
     async fn storage_state(&self) -> Result<StorageState>;
     async fn set_storage_state(&self, state: StorageState) -> Result<()>;
+    fn pending_storage_origins(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     // Telemetry & Wait Helpers (M2/M3)
     async fn console_logs(&self) -> Result<Vec<ConsoleEntry>>;
@@ -783,6 +786,172 @@ pub(crate) fn url_matches_pattern(pattern: &str, url: &str) -> bool {
     crate::network::UrlPattern::parse(pattern)
         .map(|p| p.matches(url))
         .unwrap_or(false)
+}
+
+fn parse_hex4(bytes: &[u8]) -> Option<u16> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    let mut val = 0u16;
+    for &b in &bytes[..4] {
+        let nibble = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            b'A'..=b'F' => b - b'A' + 10,
+            _ => return None,
+        };
+        val = (val << 4) | u16::from(nibble);
+    }
+    Some(val)
+}
+
+/// Replaces unpaired UTF-16 surrogate `\uXXXX` escapes inside JSON string literals
+/// with `\uFFFD`, while preserving valid high+low surrogate pairs and escaped backslashes.
+pub(crate) fn sanitize_json_lone_surrogates(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
+    let mut out = String::with_capacity(len);
+    let mut in_string = false;
+    let mut i = 0;
+    let mut last_copy = 0;
+
+    while i < len {
+        let b = bytes[i];
+        if !in_string {
+            if b == b'"' {
+                in_string = true;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'"' {
+            in_string = false;
+            i += 1;
+            continue;
+        }
+
+        if b == b'\\' {
+            if i + 6 <= len
+                && bytes[i + 1] == b'u'
+                && let Some(u1) = parse_hex4(&bytes[i + 2..i + 6])
+            {
+                if (0xD800..=0xDBFF).contains(&u1) {
+                    if i + 12 <= len
+                        && bytes[i + 6] == b'\\'
+                        && bytes[i + 7] == b'u'
+                        && let Some(u2) = parse_hex4(&bytes[i + 8..i + 12])
+                        && (0xDC00..=0xDFFF).contains(&u2)
+                    {
+                        i += 12;
+                        continue;
+                    }
+                    out.push_str(&raw[last_copy..i]);
+                    out.push_str("\\uFFFD");
+                    i += 6;
+                    last_copy = i;
+                    continue;
+                }
+                if (0xDC00..=0xDFFF).contains(&u1) {
+                    out.push_str(&raw[last_copy..i]);
+                    out.push_str("\\uFFFD");
+                    i += 6;
+                    last_copy = i;
+                    continue;
+                }
+                i += 6;
+                continue;
+            }
+            i = (i + 2).min(len);
+            continue;
+        }
+
+        i += 1;
+    }
+
+    if last_copy == 0 {
+        return raw.to_string();
+    }
+    out.push_str(&raw[last_copy..]);
+    out
+}
+
+/// Best-effort extraction of top-level `"id": <u64>` from malformed JSON-RPC / BiDi frames
+/// so pending callers fail fast instead of stalling until RPC_TIMEOUT.
+fn extract_top_level_json_id(raw: &str) -> Option<u64> {
+    let bytes = raw.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut depth = 0usize;
+    let mut in_string = false;
+
+    while i < len {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\\' {
+                i = (i + 2).min(len);
+                continue;
+            }
+            if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match b {
+            b'"' => {
+                if depth == 1 && i + 4 <= len && &bytes[i..i + 4] == b"\"id\"" {
+                    let mut j = i + 4;
+                    while j < len && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if j < len && bytes[j] == b':' {
+                        j += 1;
+                        while j < len && bytes[j].is_ascii_whitespace() {
+                            j += 1;
+                        }
+                        let num_start = j;
+                        while j < len && bytes[j].is_ascii_digit() {
+                            j += 1;
+                        }
+                        if j > num_start
+                            && (j == len
+                                || bytes[j] == b','
+                                || bytes[j] == b'}'
+                                || bytes[j].is_ascii_whitespace())
+                            && let Ok(id) = raw[num_start..j].parse::<u64>()
+                        {
+                            return Some(id);
+                        }
+                    }
+                }
+                in_string = true;
+                i += 1;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Parse an incoming CDP/BiDi JSON frame, sanitizing unpaired UTF-16 surrogates when needed.
+pub(crate) fn parse_protocol_json(
+    raw: &str,
+) -> std::result::Result<Value, (Option<u64>, serde_json::Error)> {
+    if let Ok(val) = serde_json::from_str::<Value>(raw) {
+        return Ok(val);
+    }
+    let sanitized = sanitize_json_lone_surrogates(raw);
+    serde_json::from_str::<Value>(&sanitized).map_err(|err| (extract_top_level_json_id(raw), err))
 }
 
 #[cfg(test)]
@@ -886,6 +1055,41 @@ mod tests {
                 "expected error for invalid proxy {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn parse_protocol_json_sanitizes_lone_surrogates_and_preserves_valid_pairs_and_escapes() {
+        // 1. Lone high surrogate -> U+FFFD
+        let v1 = parse_protocol_json(r#"{"id":1,"result":{"value":"a\ud800b"}}"#).unwrap();
+        assert_eq!(v1["result"]["value"], "a\u{FFFD}b");
+
+        // 2. Lone low surrogate -> U+FFFD
+        let v2 = parse_protocol_json(r#"{"id":2,"result":{"value":"\uDC00"}}"#).unwrap();
+        assert_eq!(v2["result"]["value"], "\u{FFFD}");
+
+        // 3. Reversed pair (low then high) -> two U+FFFD
+        let v3 = parse_protocol_json(r#"{"id":3,"result":{"value":"\udc00\ud800"}}"#).unwrap();
+        assert_eq!(v3["result"]["value"], "\u{FFFD}\u{FFFD}");
+
+        // 4. Valid surrogate pair -> preserved as emoji
+        let v4 = parse_protocol_json(r#"{"id":4,"result":{"value":"\ud83d\ude00"}}"#).unwrap();
+        assert_eq!(v4["result"]["value"], "😀");
+
+        // 5. High + valid surrogate pair -> first replaced, pair preserved
+        let v5 = parse_protocol_json(r#"{"id":5,"result":{"value":"\ud800\uD83D\uDE00"}}"#).unwrap();
+        assert_eq!(v5["result"]["value"], "\u{FFFD}😀");
+
+        // 6. Escaped backslash before ud800 -> literal "\ud800" preserved
+        let v6 = parse_protocol_json(r#"{"id":6,"result":{"value":"\\ud800"}}"#).unwrap();
+        assert_eq!(v6["result"]["value"], "\\ud800");
+
+        // 7. Triple backslash before ud800 -> literal "\" + U+FFFD
+        let v7 = parse_protocol_json(r#"{"id":7,"result":{"value":"\\\ud800"}}"#).unwrap();
+        assert_eq!(v7["result"]["value"], "\\\u{FFFD}");
+
+        // 8. Unrecoverable malformed JSON extracts top-level id (ignoring nested "id")
+        let err = parse_protocol_json(r#"{"nested":{"id":999},"id":42,"broken":tru}"#).unwrap_err();
+        assert_eq!(err.0, Some(42));
     }
 }
 

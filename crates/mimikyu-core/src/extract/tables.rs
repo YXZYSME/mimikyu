@@ -7,16 +7,61 @@ use crate::extract::ExtractOptions;
 
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct RawCell {
+    #[serde(default)]
     pub text: String,
+    #[serde(default)]
     pub is_th: bool,
-    #[serde(default = "default_span")]
+    #[serde(default = "default_span", deserialize_with = "deserialize_span")]
     pub colspan: usize,
-    #[serde(default = "default_span")]
+    #[serde(default = "default_span", deserialize_with = "deserialize_span")]
     pub rowspan: usize,
 }
 
 fn default_span() -> usize {
     1
+}
+
+fn deserialize_span<'de, D>(deserializer: D) -> std::result::Result<usize, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v = serde_json::Value::deserialize(deserializer)?;
+    let n = match v {
+        serde_json::Value::Number(num) => {
+            if let Some(u) = num.as_u64() {
+                u.clamp(1, 256) as usize
+            } else if let Some(i) = num.as_i64() {
+                i.clamp(1, 256) as usize
+            } else if let Some(f) = num.as_f64() {
+                if f.is_finite() {
+                    f.trunc().clamp(1.0, 256.0) as usize
+                } else {
+                    1
+                }
+            } else {
+                1
+            }
+        }
+        serde_json::Value::String(s) => s
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
+            .map(|f| f.trunc().clamp(1.0, 256.0) as usize)
+            .unwrap_or(1),
+        _ => 1,
+    };
+    Ok(n)
+}
+
+fn deserialize_raw_tables(val: serde_json::Value) -> Vec<RawTable> {
+    let serde_json::Value::Array(items) = val else {
+        return Vec::new();
+    };
+    items
+        .into_iter()
+        .filter_map(|item| serde_json::from_value::<RawTable>(item).ok())
+        .collect()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -160,6 +205,37 @@ const isVisible = (el) => {
     return true;
 };
 
+const isSubtreeVisible = (startEl) => {
+    let cur = startEl;
+    while (cur) {
+        if (cur.nodeType === 1) {
+            if (!isVisible(cur)) return false;
+            cur = cur.parentElement || (cur.getRootNode ? cur.getRootNode().host : null);
+        } else if (cur.nodeType === 11) {
+            cur = cur.host || null;
+        } else {
+            cur = null;
+        }
+    }
+    return true;
+};
+
+const isInsideScope = (startEl, scopeRoot) => {
+    if (!scopeRoot) return false;
+    let cur = startEl;
+    while (cur) {
+        if (cur === scopeRoot) return true;
+        if (cur.nodeType === 1) {
+            cur = cur.parentElement || (cur.getRootNode ? cur.getRootNode().host : null);
+        } else if (cur.nodeType === 11) {
+            cur = cur.host || null;
+        } else {
+            cur = null;
+        }
+    }
+    return false;
+};
+
 const extractTablesFromRoot = (root, includeShadow) => {
     const tables = [];
     const seen = new Set();
@@ -172,15 +248,22 @@ const extractTablesFromRoot = (root, includeShadow) => {
                 const capEl = node.querySelector(':scope > caption');
                 const thead_rows = [];
                 const body_rows = [];
-                const trs = Array.from(node.querySelectorAll('tr')).filter(tr => tr.closest('table') === node);
+                const trs = Array.from(node.querySelectorAll('tr'))
+                    .filter(tr => tr.closest('table,[role="table"],[role="grid"]') === node);
                 for (const tr of trs) {
                     if (!isVisible(tr)) continue;
                     const cells = Array.from(tr.children).filter(c => (c.tagName === 'TH' || c.tagName === 'TD') && isVisible(c));
+                    const parseSpan = (c, attr, prop, max) => {
+                        const raw = c.getAttribute(attr);
+                        const n = raw !== null ? parseInt(raw, 10) : c[prop];
+                        const v = Number.isFinite(n) ? n : (Number.isFinite(c[prop]) ? Math.trunc(c[prop]) : 1);
+                        return Math.min(max, Math.max(1, v || 1));
+                    };
                     const mapped = cells.map(c => ({
                         text: (c.innerText || c.textContent || '').trim(),
                         is_th: c.tagName === 'TH',
-                        colspan: Math.max(1, Number(c.getAttribute('colspan')) || 1),
-                        rowspan: Math.max(1, Number(c.getAttribute('rowspan')) || 1),
+                        colspan: parseSpan(c, 'colspan', 'colSpan', 64),
+                        rowspan: parseSpan(c, 'rowspan', 'rowSpan', 256),
                     }));
                     if (!mapped.length) continue;
                     if (tr.parentElement && tr.parentElement.tagName === 'THEAD') thead_rows.push(mapped);
@@ -196,10 +279,12 @@ const extractTablesFromRoot = (root, includeShadow) => {
                 seen.add(node);
                 const thead_rows = [];
                 const body_rows = [];
-                const rows = Array.from(node.querySelectorAll('[role="row"]'));
+                const rows = Array.from(node.querySelectorAll('[role="row"]'))
+                    .filter(r => r.closest('[role="table"],[role="grid"],table') === node);
                 for (const r of rows) {
                     if (!isVisible(r)) continue;
-                    const cells = Array.from(r.querySelectorAll('[role="columnheader"],[role="rowheader"],[role="cell"],[role="gridcell"]'));
+                    const cells = Array.from(r.querySelectorAll('[role="columnheader"],[role="rowheader"],[role="cell"],[role="gridcell"]'))
+                        .filter(c => c.closest('[role="row"]') === r && isVisible(c));
                     const mapped = cells.map(c => ({
                         text: (c.innerText || c.textContent || '').trim(),
                         is_th: c.getAttribute('role') === 'columnheader',
@@ -246,7 +331,7 @@ async fn extract_tables_in_frame(
         }})()"#
     );
     let val = session.eval_isolated_in_frame(&js, frame_id).await?;
-    let raws: Vec<RawTable> = serde_json::from_value(val).unwrap_or_default();
+    let raws = deserialize_raw_tables(val);
     let mut out = Vec::new();
     for raw in raws {
         let t = normalize_table_grid(&raw, start_idx + out.len(), frame_id.map(ToString::to_string));
@@ -255,10 +340,7 @@ async fn extract_tables_in_frame(
         }
     }
 
-    if opts.include_shadow_dom
-        && session.capabilities().supports_closed_shadow_dom
-        && opts.selector.is_none()
-    {
+    if opts.include_shadow_dom && session.capabilities().supports_closed_shadow_dom {
         let owned_main_fid;
         let shadow_fid = match frame_id {
             Some(f) => Some(f),
@@ -276,17 +358,25 @@ async fn extract_tables_in_frame(
             .await
             .unwrap_or_default();
         let fn_decl = format!(
-            r#"function() {{
+            r#"function(sel) {{
                 {JS_COLLECT_TABLES}
+                if (!this || !this.host || !isSubtreeVisible(this.host)) return [];
+                const scopeRoot = sel ? document.querySelector(sel) : (document.body || document.documentElement);
+                if (!isInsideScope(this.host, scopeRoot)) return [];
                 return extractTablesFromRoot(this, true);
             }}"#
         );
         for bid in hosts {
             if let Ok(sr_val) = session
-                .call_function_on_node(bid, frame_id, &fn_decl, vec![])
+                .call_function_on_node(
+                    bid,
+                    frame_id,
+                    &fn_decl,
+                    vec![serde_json::json!(opts.selector)],
+                )
                 .await
-                && let Ok(sr_raws) = serde_json::from_value::<Vec<RawTable>>(sr_val)
             {
+                let sr_raws = deserialize_raw_tables(sr_val);
                 for raw in sr_raws {
                     let t = normalize_table_grid(
                         &raw,
@@ -400,5 +490,38 @@ mod tests {
         );
         assert_eq!(table.row_count, 2);
         assert_eq!(table.caption.as_deref(), Some("Pricing"));
+    }
+
+    #[test]
+    fn deserialize_raw_tables_tolerates_non_integer_null_and_oversized_spans() {
+        let payload = serde_json::json!([
+            {
+                "id": "t1",
+                "caption": null,
+                "thead_rows": [[{"text": "ColA", "is_th": true, "colspan": 1, "rowspan": 1}]],
+                "body_rows": [[{"text": "A1", "is_th": false, "colspan": 1, "rowspan": 1}]]
+            },
+            {
+                "id": "t2",
+                "caption": null,
+                "thead_rows": [],
+                "body_rows": [[
+                    {"text": "X1", "is_th": false, "colspan": 1.5, "rowspan": null},
+                    {"text": "X2", "is_th": false, "colspan": -2, "rowspan": "1e400"},
+                    {"text": "X3", "is_th": false, "colspan": 1e20, "rowspan": 300}
+                ]]
+            },
+            "not-a-table"
+        ]);
+        let raws = deserialize_raw_tables(payload);
+        assert_eq!(raws.len(), 2);
+        assert_eq!(raws[0].id.as_deref(), Some("t1"));
+        assert_eq!(raws[1].id.as_deref(), Some("t2"));
+        assert_eq!(raws[1].body_rows[0][0].colspan, 1);
+        assert_eq!(raws[1].body_rows[0][0].rowspan, 1);
+        assert_eq!(raws[1].body_rows[0][1].colspan, 1);
+        assert_eq!(raws[1].body_rows[0][1].rowspan, 1);
+        assert_eq!(raws[1].body_rows[0][2].colspan, 256);
+        assert_eq!(raws[1].body_rows[0][2].rowspan, 256);
     }
 }

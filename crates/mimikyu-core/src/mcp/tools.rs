@@ -708,31 +708,6 @@ fn build_session_opts(
     })
 }
 
-fn has_session_create_flags(args: &Map<String, Value>) -> bool {
-    const CREATE_KEYS: &[&str] = &[
-        "profile",
-        "ephemeral",
-        "virtual",
-        "engine",
-        "preset",
-        "locale",
-        "timezone",
-        "proxy",
-        "geoip",
-        "viewport",
-        "block_images",
-        "block_media",
-        "block_fonts",
-        "instant_animations",
-        "humanize",
-        "headless",
-        "main_world_eval",
-    ];
-    CREATE_KEYS
-        .iter()
-        .any(|k| args.get(*k).is_some_and(|v| !v.is_null()))
-}
-
 fn parse_snapshot_opts(args: &Map<String, Value>) -> std::result::Result<SnapshotOptions, (i64, String)> {
     let max_depth = opt_u64(args, "max_depth")?
         .map(|v| {
@@ -923,11 +898,21 @@ pub async fn call_tool(manager: &SessionManager, name: &str, arguments: Value) -
         "browser_open" => {
             let session_id = resolve_session_id(&args)?;
             let url = opt_str(&args, "url")?;
+            if let Some(target_url) = url {
+                crate::session::validate_nav_url(target_url)
+                    .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
+            }
             let exists = manager
                 .list_sessions()
                 .iter()
                 .any(|s| s.session_id == session_id);
-            let created_summary = if !exists || has_session_create_flags(&args) {
+            if exists && url.is_none() {
+                return Err((
+                    INVALID_PARAMS,
+                    "missing required argument 'url' for existing session".to_string(),
+                ));
+            }
+            let created_summary = if !exists {
                 let opts = build_session_opts(&args, session_id.clone())?;
                 match manager.create_session(opts).await {
                     Ok(s) => Some(SessionListEntry::from(s)),

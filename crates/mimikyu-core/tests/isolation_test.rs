@@ -559,3 +559,220 @@ async fn virtual_context_full_isolation_chromium() {
 async fn virtual_context_full_isolation_firefox() {
     assert_virtual_context_full_isolation(EngineKind::Firefox).await;
 }
+
+async fn assert_new_tab_inherits_env_network_and_animations(engine: EngineKind) {
+    use mimikyu_core::driver::{RouteAction, RouteMock};
+    use mimikyu_core::env_profile::{EnvProfileBuilder, PresetKind};
+
+    let server = TestServer::start().await;
+    let profile = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("DE")
+        .expect("geoip DE")
+        .viewport(1024, 768)
+        .extra_header("X-Tab-Tenant", "tenant-tab-1")
+        .build()
+        .expect("valid profile");
+
+    let mut mock_hdrs = BTreeMap::new();
+    mock_hdrs.insert("content-type".to_string(), "application/json".to_string());
+    let tab_mock = RouteMock {
+        id: "tab-inherit-mock".to_string(),
+        url_pattern: "*/api/mock*".to_string(),
+        action: RouteAction::Fulfill {
+            status: 200,
+            headers: mock_hdrs,
+            body: br#"{"mocked":true}"#.to_vec(),
+        },
+    };
+
+    async fn assert_tab_invariants(
+        engine: EngineKind,
+        server: &TestServer,
+        profile: &mimikyu_core::driver::EnvProfile,
+        tab: &dyn mimikyu_core::driver::DriverSession,
+        req_path: &str,
+        label: &str,
+    ) {
+        let hdrs = server
+            .request_headers()
+            .into_iter()
+            .rev()
+            .find(|(req, _)| req == &format!("GET {req_path}"))
+            .unwrap_or_else(|| panic!("{engine} ({label}): missing {req_path} request"))
+            .1;
+        assert_eq!(
+            hdrs.get("user-agent").map(String::as_str),
+            Some(profile.user_agent.as_str()),
+            "{engine} ({label}) UA header mismatch: {hdrs:?}"
+        );
+        assert_eq!(
+            hdrs.get("x-tab-tenant").map(String::as_str),
+            Some("tenant-tab-1"),
+            "{engine} ({label}) extra header missing: {hdrs:?}"
+        );
+        let al = hdrs
+            .get("accept-language")
+            .map(String::as_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        assert!(
+            al.starts_with("de-de"),
+            "{engine} ({label}) Accept-Language mismatch: {al}"
+        );
+
+        tab.navigate(&server.url("/target"))
+            .await
+            .expect("tab navigate /target");
+        let probe = tab
+            .eval_isolated(
+                r#"(async () => {
+                    const st = document.createElement('style');
+                    st.textContent = '.animProbe{animation:ap 10s linear infinite;}@keyframes ap{from{opacity:0}to{opacity:1}}';
+                    document.head.appendChild(st);
+                    const box = document.createElement('div');
+                    box.className = 'animProbe';
+                    document.body.appendChild(box);
+                    const animDur = getComputedStyle(box).animationDuration;
+
+                    const mocked = await fetch('/api/mock').then(r => r.json()).catch(e => ({ err: String(e) }));
+                    let blockedOk = true;
+                    try {
+                        const br = await fetch('/api/abort-me');
+                        blockedOk = !br.ok;
+                    } catch {
+                        blockedOk = true;
+                    }
+                    const imgOk = await new Promise((resolve) => {
+                        const im = new Image();
+                        im.onload = () => resolve(true);
+                        im.onerror = () => resolve(false);
+                        im.src = '/assets/pic.png?t=' + Date.now();
+                    });
+                    return {
+                        ua: navigator.userAgent,
+                        platform: navigator.platform,
+                        language: navigator.language,
+                        tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+                        innerWidth: window.innerWidth,
+                        innerHeight: window.innerHeight,
+                        animDur,
+                        mocked,
+                        blockedOk,
+                        imgOk,
+                    };
+                })()"#,
+            )
+            .await
+            .expect("probe tab2");
+        assert_eq!(probe["ua"], profile.user_agent, "{engine} ({label}): {probe:?}");
+        assert_eq!(probe["platform"], profile.platform, "{engine} ({label}): {probe:?}");
+        assert_eq!(probe["language"], "de-DE", "{engine} ({label}): {probe:?}");
+        assert_eq!(probe["tz"], "Europe/Berlin", "{engine} ({label}): {probe:?}");
+        assert_eq!(probe["innerWidth"], 1024, "{engine} ({label}): {probe:?}");
+        assert_eq!(probe["innerHeight"], 768, "{engine} ({label}): {probe:?}");
+        assert_eq!(probe["animDur"], "0s", "{engine} ({label}): {probe:?}");
+        assert_eq!(probe["mocked"]["mocked"], true, "{engine} ({label}): {probe:?}");
+        assert_eq!(probe["blockedOk"], true, "{engine} ({label}): {probe:?}");
+        assert_eq!(probe["imgOk"], false, "{engine} ({label}): {probe:?}");
+    }
+
+    // 1. VirtualContext::new_tab()
+    let pool = VirtualContextPool::launch(LaunchOptions {
+        engine,
+        headless: true,
+        ..Default::default()
+    })
+    .await
+    .expect("launch pool");
+    let pool_pid = pool.root_session().info().pid.expect("pool pid");
+    let vc = pool
+        .create_context(ContextOptions {
+            env_profile: Some(profile.clone()),
+            block_images: true,
+            instant_animations: true,
+            ..Default::default()
+        })
+        .await
+        .expect("create vc");
+    vc.session()
+        .set_blocked_urls(vec!["*abort-me*".to_string()])
+        .await
+        .expect("vc set_blocked_urls");
+    vc.session()
+        .set_route_mock(tab_mock.clone())
+        .await
+        .expect("vc set_route_mock");
+
+    let vc_tab2 = vc
+        .new_tab(Some(&server.url("/echo-env?who=vc_tab2")))
+        .await
+        .expect("vc new_tab");
+    assert_tab_invariants(
+        engine,
+        &server,
+        &profile,
+        vc_tab2.as_ref(),
+        "/echo-env?who=vc_tab2",
+        "vc_tab2",
+    )
+    .await;
+
+    // Dispose VirtualContext directly without disposing vc_tab2 first to verify cleanup
+    vc.dispose().await.expect("dispose vc");
+    pool.shutdown().await.expect("shutdown pool");
+    assert_pgid_gone(pool_pid as libc::pid_t);
+
+    // 2. EphemeralDir DriverSession::new_tab()
+    let eph = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            env_profile: Some(profile.clone()),
+            block_images: true,
+            instant_animations: true,
+            ..Default::default()
+        })
+        .await
+        .expect("launch ephemeral");
+    let eph_pid = eph.info().pid.expect("eph pid");
+    eph.set_blocked_urls(vec!["*abort-me*".to_string()])
+        .await
+        .expect("eph set_blocked_urls");
+    eph.set_route_mock(tab_mock)
+        .await
+        .expect("eph set_route_mock");
+
+    let eph_tab2 = eph
+        .new_tab(Some(&server.url("/echo-env?who=eph_tab2")))
+        .await
+        .expect("eph new_tab");
+    assert_tab_invariants(
+        engine,
+        &server,
+        &profile,
+        eph_tab2.as_ref(),
+        "/echo-env?who=eph_tab2",
+        "eph_tab2",
+    )
+    .await;
+    eph_tab2.dispose().await.expect("dispose eph_tab2");
+    assert_eq!(eph.eval_isolated("1 + 2").await.unwrap(), 3);
+    eph.dispose().await.expect("dispose eph");
+    assert_pgid_gone(eph_pid as libc::pid_t);
+
+    let hits = server.hits();
+    assert!(!hits.iter().any(|h| h.contains("/api/mock")));
+    assert!(!hits.iter().any(|h| h.contains("/api/abort-me")));
+    assert!(!hits.iter().any(|h| h.contains("/assets/pic.png")));
+}
+
+#[tokio::test]
+async fn new_tab_inherits_env_network_and_animations_chromium() {
+    assert_new_tab_inherits_env_network_and_animations(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn new_tab_inherits_env_network_and_animations_firefox() {
+    assert_new_tab_inherits_env_network_and_animations(EngineKind::Firefox).await;
+}

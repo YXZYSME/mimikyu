@@ -191,3 +191,18 @@ async fn bench_teardown_leaves_no_temp_dirs_in_explicit_parent() {
     .expect("bench with custom state dir");
     assert_valid_report(&report, 0);
 }
+
+#[tokio::test]
+async fn bench_rejects_warmup_plus_iterations_u32_overflow() {
+    let err = run_benchmark(BenchOptions {
+        iterations: 1,
+        warmup: u32::MAX,
+        engine: EngineKind::Chromium,
+        suite: BenchSuite::Speed,
+        headless: true,
+        state_dir: None,
+    })
+    .await
+    .expect_err("warmup + iterations overflow must return InvalidConfig");
+    assert!(matches!(err, MimikyuError::InvalidConfig(_)));
+}

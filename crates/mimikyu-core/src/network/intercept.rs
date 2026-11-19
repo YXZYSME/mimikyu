@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -194,6 +196,69 @@ impl NetworkInterceptor {
         }
 
         InterceptDecision::Continue
+    }
+
+    pub fn to_shared_worker_policy_json(&self) -> Value {
+        let pol = self.blocker.policy();
+        let rules_json: Vec<Value> = self
+            .rules
+            .iter()
+            .map(|cr| {
+                let rtypes: Vec<&str> = cr
+                    .rule
+                    .resource_types
+                    .iter()
+                    .map(|rt| match rt {
+                        ResourceType::Document => "document",
+                        ResourceType::Stylesheet => "stylesheet",
+                        ResourceType::Image => "image",
+                        ResourceType::Media => "media",
+                        ResourceType::Font => "font",
+                        ResourceType::Script => "script",
+                        ResourceType::TextTrack => "texttrack",
+                        ResourceType::Xhr => "xhr",
+                        ResourceType::Fetch => "fetch",
+                        ResourceType::EventSource => "eventsource",
+                        ResourceType::WebSocket => "websocket",
+                        ResourceType::Manifest => "manifest",
+                        ResourceType::Other => "other",
+                    })
+                    .collect();
+                let action = match &cr.rule.action {
+                    RouteAction::Abort => json!({ "kind": "abort" }),
+                    RouteAction::Fulfill {
+                        status,
+                        headers,
+                        body,
+                    } => json!({
+                        "kind": "fulfill",
+                        "status": status,
+                        "statusText": http_reason_phrase(*status),
+                        "headers": headers,
+                        "bodyB64": BASE64.encode(body),
+                    }),
+                    RouteAction::ContinueWithHeaders { headers } => json!({
+                        "kind": "modify_headers",
+                        "headers": headers,
+                    }),
+                    RouteAction::Continue => json!({ "kind": "continue" }),
+                };
+                json!({
+                    "id": cr.rule.id,
+                    "matcher": cr.matcher.to_js_matcher(),
+                    "resourceTypes": rtypes,
+                    "action": action,
+                })
+            })
+            .collect();
+        json!({
+            "active": self.needs_bidi_intercept(),
+            "blockImages": pol.block_images,
+            "blockMedia": pol.block_media,
+            "blockFonts": pol.block_fonts,
+            "blockedUrls": self.blocker.compiled_url_matchers_json(),
+            "rules": rules_json,
+        })
     }
 }
 

@@ -81,6 +81,12 @@ impl BenchOptions {
                 self.iterations
             )));
         }
+        if self.warmup.checked_add(self.iterations).is_none() {
+            return Err(MimikyuError::InvalidConfig(format!(
+                "bench warmup ({}) + iterations ({}) overflows u32",
+                self.warmup, self.iterations
+            )));
+        }
         Ok(())
     }
 
@@ -463,7 +469,15 @@ async fn run_benchmark_inner(
     let total_start = Instant::now();
 
     let (rounds, warmup_for_speed) = match opts.suite {
-        BenchSuite::All | BenchSuite::Speed => (opts.warmup + opts.iterations, opts.warmup),
+        BenchSuite::All | BenchSuite::Speed => {
+            let total = opts.warmup.checked_add(opts.iterations).ok_or_else(|| {
+                MimikyuError::InvalidConfig(format!(
+                    "bench warmup ({}) + iterations ({}) overflows u32",
+                    opts.warmup, opts.iterations
+                ))
+            })?;
+            (total, opts.warmup)
+        }
         BenchSuite::Agentic => (1, 0),
     };
 

@@ -50,8 +50,16 @@ pub struct TrajectoryPoint {
 }
 
 pub fn clamp_point_to_viewport(x: f64, y: f64, vp_w: f64, vp_h: f64) -> (f64, f64) {
-    let max_x = (vp_w - 1.0).max(0.0);
-    let max_y = (vp_h - 1.0).max(0.0);
+    let max_x = if vp_w.is_finite() {
+        (vp_w - 1.0).max(0.0)
+    } else {
+        0.0
+    };
+    let max_y = if vp_h.is_finite() {
+        (vp_h - 1.0).max(0.0)
+    } else {
+        0.0
+    };
     let cx = if x.is_finite() {
         x.clamp(0.0, max_x)
     } else {
@@ -81,35 +89,45 @@ pub fn generate_trajectory(
     cfg: &HumanizeConfig,
 ) -> Vec<TrajectoryPoint> {
     let mut rng = make_rng(cfg.seed);
-    let (tx, ty) = clamp_point_to_viewport(target.0, target.1, vp_w, vp_h);
+    let safe_vp_w = if vp_w.is_finite() && vp_w > 0.0 {
+        vp_w
+    } else {
+        1.0
+    };
+    let safe_vp_h = if vp_h.is_finite() && vp_h > 0.0 {
+        vp_h
+    } else {
+        1.0
+    };
+    let (tx, ty) = clamp_point_to_viewport(target.0, target.1, safe_vp_w, safe_vp_h);
 
     let (sx, sy) = match start {
         Some((x, y)) => {
-            let clamped = clamp_point_to_viewport(x, y, vp_w, vp_h);
+            let clamped = clamp_point_to_viewport(x, y, safe_vp_w, safe_vp_h);
             if ((clamped.0 - tx).powi(2) + (clamped.1 - ty).powi(2)).sqrt() < 8.0 {
-                let alt_x = if tx > vp_w * 0.5 {
+                let alt_x = if tx > safe_vp_w * 0.5 {
                     tx - 140.0
                 } else {
                     tx + 140.0
                 };
-                let alt_y = if ty > vp_h * 0.5 {
+                let alt_y = if ty > safe_vp_h * 0.5 {
                     ty - 90.0
                 } else {
                     ty + 90.0
                 };
-                clamp_point_to_viewport(alt_x, alt_y, vp_w, vp_h)
+                clamp_point_to_viewport(alt_x, alt_y, safe_vp_w, safe_vp_h)
             } else {
                 clamped
             }
         }
         None => {
-            let def_x = vp_w * 0.15;
-            let def_y = vp_h * 0.15;
+            let def_x = safe_vp_w * 0.15;
+            let def_y = safe_vp_h * 0.15;
             let d = ((def_x - tx).powi(2) + (def_y - ty).powi(2)).sqrt();
             if d < 40.0 {
-                clamp_point_to_viewport(tx - 120.0, ty - 80.0, vp_w, vp_h)
+                clamp_point_to_viewport(tx - 120.0, ty - 80.0, safe_vp_w, safe_vp_h)
             } else {
-                clamp_point_to_viewport(def_x, def_y, vp_w, vp_h)
+                clamp_point_to_viewport(def_x, def_y, safe_vp_w, safe_vp_h)
             }
         }
     };
@@ -119,7 +137,13 @@ pub fn generate_trajectory(
     let dist = (dx * dx + dy * dy).sqrt().max(1.0);
 
     let w_eff = target_size
-        .map(|(w, h)| w.min(h).max(12.0))
+        .and_then(|(w, h)| {
+            if w.is_finite() && h.is_finite() {
+                Some(w.min(h).max(12.0))
+            } else {
+                None
+            }
+        })
         .unwrap_or(40.0);
     let fitts_id = (dist / w_eff + 1.0).log2();
     let total_ms = cfg
@@ -146,7 +170,12 @@ pub fn generate_trajectory(
     let c2x = sx + dx * rng.random_range(0.65..0.82) + nx * arc2;
     let c2y = sy + dy * rng.random_range(0.65..0.82) + ny * arc2;
 
-    let do_overshoot = dist > 40.0 && rng.random_bool(cfg.overshoot_prob.clamp(0.0, 1.0));
+    let overshoot_prob = if cfg.overshoot_prob.is_finite() {
+        cfg.overshoot_prob.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let do_overshoot = dist > 40.0 && rng.random_bool(overshoot_prob);
     let over_px = if do_overshoot {
         rng.random_range(4.0..14.0)
     } else {
@@ -201,7 +230,7 @@ pub fn generate_trajectory(
         bx += rng.random_range(-micro_jitter..=micro_jitter);
         by += rng.random_range(-micro_jitter..=micro_jitter);
 
-        let (cx, cy) = clamp_point_to_viewport(bx, by, vp_w, vp_h);
+        let (cx, cy) = clamp_point_to_viewport(bx, by, safe_vp_w, safe_vp_h);
         pts.push(TrajectoryPoint {
             x: cx,
             y: cy,
@@ -220,7 +249,17 @@ pub fn sample_key_delay_ms(
     let u1: f64 = rng.random_range(1e-6..1.0);
     let u2: f64 = rng.random_range(0.0..1.0);
     let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
-    let mut ms = cfg.key_delay_mean_ms + z0 * cfg.key_delay_std_ms;
+    let mean = if cfg.key_delay_mean_ms.is_finite() {
+        cfg.key_delay_mean_ms.max(0.0)
+    } else {
+        default_key_delay_mean()
+    };
+    let std_dev = if cfg.key_delay_std_ms.is_finite() {
+        cfg.key_delay_std_ms.max(0.0)
+    } else {
+        default_key_delay_std()
+    };
+    let mut ms = mean + z0 * std_dev;
     if let Some(ch) = prev_char
         && (ch == ' ' || ch == '.' || ch == ',' || ch == '\n')
     {
@@ -230,10 +269,17 @@ pub fn sample_key_delay_ms(
         let scale = (dur as f64 / 200.0).clamp(0.3, 2.5);
         ms *= scale;
     }
-    ms.round().clamp(12.0, 220.0) as u64
+    let safe_ms = if ms.is_finite() {
+        ms
+    } else {
+        default_key_delay_mean()
+    };
+    safe_ms.round().clamp(12.0, 220.0) as u64
 }
 
 pub fn split_wheel_notches(dx: f64, dy: f64, rng: &mut impl Rng) -> Vec<(f64, f64, u64)> {
+    let dx = if dx.is_finite() { dx } else { 0.0 };
+    let dy = if dy.is_finite() { dy } else { 0.0 };
     let total_mag = dx.abs().max(dy.abs());
     if total_mag < 1e-3 {
         return vec![(dx, dy, 0)];
@@ -251,10 +297,23 @@ pub fn split_wheel_notches(dx: f64, dy: f64, rng: &mut impl Rng) -> Vec<(f64, f6
     for (idx, w) in weights.into_iter().enumerate() {
         let delay = rng.random_range(15..=45);
         if idx + 1 == steps {
-            out.push((dx - acc_x, dy - acc_y, delay));
+            let rx = dx - acc_x;
+            let ry = dy - acc_y;
+            out.push((
+                if rx.is_finite() { rx } else { 0.0 },
+                if ry.is_finite() { ry } else { 0.0 },
+                delay,
+            ));
         } else {
-            let sx = (dx * w / sum).round();
-            let sy = (dy * w / sum).round();
+            let frac = w / sum;
+            let mut sx = (dx * frac).round();
+            let mut sy = (dy * frac).round();
+            if !sx.is_finite() || !(acc_x + sx).is_finite() {
+                sx = 0.0;
+            }
+            if !sy.is_finite() || !(acc_y + sy).is_finite() {
+                sy = 0.0;
+            }
             acc_x += sx;
             acc_y += sy;
             out.push((sx, sy, delay));
@@ -325,5 +384,89 @@ mod tests {
         let sum_y: f64 = notches.iter().map(|n| n.1).sum();
         assert!((sum_x - 37.5).abs() < 1e-6);
         assert!((sum_y - (-420.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn generate_trajectory_sanitizes_non_finite_overshoot_prob_and_inputs() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let cfg = HumanizeConfig {
+                enabled: true,
+                overshoot_prob: bad,
+                seed: Some(11),
+                ..Default::default()
+            };
+            let pts = generate_trajectory(
+                Some((10.0, 10.0)),
+                (300.0, 300.0),
+                Some((f64::NAN, 24.0)),
+                1280.0,
+                800.0,
+                &cfg,
+            );
+            assert!(!pts.is_empty());
+            for p in &pts {
+                assert!(p.x.is_finite() && p.x >= 0.0 && p.x <= 1279.0);
+                assert!(p.y.is_finite() && p.y >= 0.0 && p.y <= 799.0);
+                assert!(p.delay_ms >= 3);
+            }
+            assert_eq!((pts.last().unwrap().x, pts.last().unwrap().y), (300.0, 300.0));
+        }
+
+        let nan_vp_pts = generate_trajectory(
+            Some((f64::NAN, f64::INFINITY)),
+            (f64::NAN, f64::NEG_INFINITY),
+            None,
+            f64::NAN,
+            f64::INFINITY,
+            &HumanizeConfig {
+                enabled: true,
+                overshoot_prob: f64::NAN,
+                seed: Some(13),
+                ..Default::default()
+            },
+        );
+        assert!(!nan_vp_pts.is_empty());
+        for p in &nan_vp_pts {
+            assert!(p.x.is_finite() && p.y.is_finite());
+        }
+    }
+
+    #[test]
+    fn key_delay_and_wheel_notches_sanitize_non_finite_inputs() {
+        let mut rng = make_rng(Some(19));
+        let cfg = HumanizeConfig {
+            enabled: true,
+            key_delay_mean_ms: f64::NAN,
+            key_delay_std_ms: f64::INFINITY,
+            ..Default::default()
+        };
+        let d = sample_key_delay_ms(Some(' '), &cfg, &mut rng);
+        assert!((12..=220).contains(&d), "unexpected delay {d}");
+
+        let notches = split_wheel_notches(f64::NAN, f64::INFINITY, &mut rng);
+        assert_eq!(notches.len(), 1);
+        assert_eq!(notches[0], (0.0, 0.0, 0));
+    }
+
+    #[test]
+    fn wheel_notches_remain_finite_for_extreme_finite_deltas() {
+        for seed in 0..16u64 {
+            let mut rng = make_rng(Some(seed));
+            for (dx, dy) in [
+                (f64::MAX, -f64::MAX),
+                (-f64::MAX, f64::MAX),
+                (1.5e308, 0.0),
+                (0.0, -1.5e308),
+            ] {
+                let notches = split_wheel_notches(dx, dy, &mut rng);
+                assert!(notches.len() >= 2);
+                for (nx, ny, _) in &notches {
+                    assert!(
+                        nx.is_finite() && ny.is_finite(),
+                        "non-finite notch ({nx}, {ny}) for ({dx}, {dy})"
+                    );
+                }
+            }
+        }
     }
 }

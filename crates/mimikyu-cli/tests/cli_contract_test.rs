@@ -522,3 +522,766 @@ fn cli_mcp_stdio_roundtrip_and_eof_cleanup() {
     assert_eq!(tools_list["id"], 2);
     assert_eq!(tools_list["result"]["tools"].as_array().unwrap().len(), 31);
 }
+
+#[test]
+fn cli_daemon_idle_timeout_zero_and_status_no_dir_create() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing_dir = tmp.path().join("missing_state_dir");
+    assert!(!missing_dir.exists());
+
+    let st_missing = run_cli(&missing_dir, &["daemon", "status", "--json"]);
+    assert!(st_missing.status.success());
+    let st_missing_val: Value = serde_json::from_slice(&st_missing.stdout).unwrap();
+    assert_eq!(st_missing_val["ok"], true);
+    assert_eq!(st_missing_val["data"]["running"], false);
+    assert!(!missing_dir.exists(), "daemon status must not create state_dir");
+
+    let state_dir = tmp.path().join("idle_zero_state");
+    let _guard = DaemonCleanupGuard {
+        state_dir: state_dir.clone(),
+    };
+
+    let start_out = run_cli(&state_dir, &["daemon", "--idle-timeout", "0", "--json"]);
+    assert!(
+        start_out.status.success(),
+        "daemon --idle-timeout 0 failed: {}",
+        String::from_utf8_lossy(&start_out.stdout)
+    );
+    thread::sleep(Duration::from_millis(600));
+    let st = run_cli(&state_dir, &["daemon", "status", "--json"]);
+    assert!(st.status.success());
+    let st_val: Value = serde_json::from_slice(&st.stdout).unwrap();
+    assert_eq!(st_val["data"]["running"], true);
+    assert!(st_val["data"]["idle_timeout_secs"].is_null());
+
+    let stop_out = run_cli(&state_dir, &["daemon", "stop", "--json"]);
+    assert!(stop_out.status.success());
+}
+
+#[test]
+fn cli_daemon_resolves_relative_screenshot_and_export_paths_against_client_cwd() {
+    let srv = LocalMiniServer::start();
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("cwd_state");
+    let dir_a = tmp.path().join("dir_a");
+    let dir_b = tmp.path().join("dir_b");
+    fs::create_dir_all(&dir_a).unwrap();
+    fs::create_dir_all(&dir_b).unwrap();
+    let _guard = DaemonCleanupGuard {
+        state_dir: state_dir.clone(),
+    };
+
+    // Start daemon with CWD = dir_a
+    let start = Command::new(bin())
+        .current_dir(&dir_a)
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["session", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(start.status.success());
+
+    // Run client commands from CWD = dir_b using relative paths
+    let run_in_b = |args: &[&str]| {
+        Command::new(bin())
+            .current_dir(&dir_b)
+            .args(["--state-dir"])
+            .arg(&state_dir)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+
+    assert!(run_in_b(&["--session", "cwd_s", "session", "new", "--ephemeral", "--json"]).status.success());
+    assert!(run_in_b(&["--session", "cwd_s", "open", &srv.url("/"), "--json"]).status.success());
+
+    let shot_out = run_in_b(&["--session", "cwd_s", "screenshot", "./shot.png", "--json"]);
+    assert!(shot_out.status.success(), "{}", String::from_utf8_lossy(&shot_out.stdout));
+    assert!(dir_b.join("shot.png").is_file());
+    assert!(!dir_a.join("shot.png").exists());
+
+    let exp_out = run_in_b(&["--session", "cwd_s", "session", "export", "./state.json", "--json"]);
+    assert!(exp_out.status.success(), "{}", String::from_utf8_lossy(&exp_out.stdout));
+    assert!(dir_b.join("state.json").is_file());
+    assert!(!dir_a.join("state.json").exists());
+
+    let imp_out = run_in_b(&["--session", "cwd_s", "session", "import", "./state.json", "--json"]);
+    assert!(imp_out.status.success(), "{}", String::from_utf8_lossy(&imp_out.stdout));
+
+    assert!(run_in_b(&["close", "cwd_s", "--json"]).status.success());
+    let _ = run_cli(&state_dir, &["daemon", "stop", "--json"]);
+}
+
+#[test]
+fn cli_daemon_resolves_relative_profile_path_against_client_cwd() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("prof_cwd_state");
+    let dir_a = tmp.path().join("prof_dir_a");
+    let dir_b = tmp.path().join("prof_dir_b");
+    fs::create_dir_all(&dir_a).unwrap();
+    fs::create_dir_all(&dir_b).unwrap();
+    let _guard = DaemonCleanupGuard {
+        state_dir: state_dir.clone(),
+    };
+
+    let start = Command::new(bin())
+        .current_dir(&dir_a)
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["session", "list", "--json"])
+        .output()
+        .unwrap();
+    assert!(start.status.success());
+
+    let snew = Command::new(bin())
+        .current_dir(&dir_b)
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["--session", "rp", "session", "new", "--profile", "./rel_prof", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        snew.status.success(),
+        "session new --profile ./rel_prof failed: {}",
+        String::from_utf8_lossy(&snew.stdout)
+    );
+    assert!(dir_b.join("rel_prof").is_dir());
+    assert!(!dir_a.join("rel_prof").exists());
+
+    assert!(run_cli(&state_dir, &["close", "rp", "--json"]).status.success());
+    let _ = run_cli(&state_dir, &["daemon", "stop", "--json"]);
+}
+
+#[test]
+fn cli_profile_export_nonexistent_fails_without_creating_profile_and_timeout_is_clean() {
+    let srv = LocalMiniServer::start();
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("prof_exp_state");
+    let _guard = DaemonCleanupGuard {
+        state_dir: state_dir.clone(),
+    };
+
+    let out_file = tmp.path().join("missing_export.json");
+    let out_str = out_file.to_string_lossy().to_string();
+    let exp = run_cli(
+        &state_dir,
+        &["profile", "export", "nonexistent_prof", &out_str, "--json"],
+    );
+    assert!(!exp.status.success(), "export of nonexistent profile must fail");
+    let exp_val: Value = serde_json::from_slice(&exp.stdout).unwrap();
+    assert_eq!(exp_val["ok"], false);
+    assert!(!state_dir.join("profiles").join("nonexistent_prof").exists());
+    assert!(!out_file.exists());
+
+    assert!(
+        run_cli(&state_dir, &["--session", "tmo", "session", "new", "--ephemeral", "--json"])
+            .status
+            .success()
+    );
+    assert!(
+        run_cli(&state_dir, &["--session", "tmo", "open", &srv.url("/"), "--json"])
+            .status
+            .success()
+    );
+    let wait_out = run_cli(
+        &state_dir,
+        &["--session", "tmo", "wait", "--text", "NEVER_THERE", "--timeout-ms", "150", "--json"],
+    );
+    assert!(!wait_out.status.success());
+    let wait_val: Value = serde_json::from_slice(&wait_out.stdout).unwrap();
+    assert_eq!(wait_val["ok"], false);
+    let err_msg = wait_val["error"].as_str().unwrap_or("");
+    assert!(err_msg.contains("150ms"), "unexpected error: {err_msg}");
+    assert!(!err_msg.contains("after 0ms:"), "double-prefixed timeout: {err_msg}");
+
+    assert!(run_cli(&state_dir, &["close", "tmo", "--json"]).status.success());
+    let _ = run_cli(&state_dir, &["daemon", "stop", "--json"]);
+}
+
+#[test]
+fn cli_profile_import_prevalidates_and_batch_wait_idle_honors_stable_target() {
+    let srv = LocalMiniServer::start();
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("imp_batch_state");
+    let _guard = DaemonCleanupGuard {
+        state_dir: state_dir.clone(),
+    };
+
+    let missing_file = tmp.path().join("does_not_exist.json");
+    let imp_missing = run_cli(
+        &state_dir,
+        &["profile", "import", "bad_missing", missing_file.to_str().unwrap(), "--json"],
+    );
+    assert!(!imp_missing.status.success());
+    assert!(!state_dir.join("profiles").join("bad_missing").exists());
+
+    let bad_json = tmp.path().join("bad.json");
+    fs::write(&bad_json, b"{not valid json").unwrap();
+    let imp_bad = run_cli(
+        &state_dir,
+        &["profile", "import", "bad_json", bad_json.to_str().unwrap(), "--json"],
+    );
+    assert!(!imp_bad.status.success());
+    assert!(!state_dir.join("profiles").join("bad_json").exists());
+
+    assert!(
+        run_cli(&state_dir, &["--session", "bw", "session", "new", "--ephemeral", "--json"])
+            .status
+            .success()
+    );
+    let ok_ops = format!(
+        r##"[{{"op":"open","url":{}}},{{"op":"wait","idle":true,"stable_target":"#out"}}]"##,
+        serde_json::to_string(&srv.url("/")).unwrap()
+    );
+    let batch_ok = run_cli(
+        &state_dir,
+        &["--session", "bw", "batch", "--ops", &ok_ops, "--json"],
+    );
+    assert!(
+        batch_ok.status.success(),
+        "batch wait_idle with stable_target failed: {}",
+        String::from_utf8_lossy(&batch_ok.stdout)
+    );
+
+    let bad_ops = r##"[{"op":"wait","idle":true,"stable_target":"#nonexistent-xyz","timeout_ms":100}]"##;
+    let batch_bad = run_cli(
+        &state_dir,
+        &["--session", "bw", "batch", "--ops", bad_ops, "--json"],
+    );
+    assert!(!batch_bad.status.success());
+
+    assert!(run_cli(&state_dir, &["close", "bw", "--json"]).status.success());
+    let _ = run_cli(&state_dir, &["daemon", "stop", "--json"]);
+}
+
+#[test]
+fn cli_daemon_concurrent_commands_during_stop_and_idle_timeout_firefox() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    for iter in 0..3 {
+        let state_dir = tmp.path().join(format!("ff_conc_stop_{iter}"));
+        let _guard = DaemonCleanupGuard {
+            state_dir: state_dir.clone(),
+        };
+
+        for sid in ["ff1", "ff2"] {
+            let snew = run_cli(
+                &state_dir,
+                &["--engine", "firefox", "--session", sid, "session", "new", "--ephemeral", "--json"],
+            );
+            assert!(
+                snew.status.success(),
+                "iter {iter} {sid} session new failed: {}",
+                String::from_utf8_lossy(&snew.stdout)
+            );
+        }
+
+        let sd_stop = state_dir.clone();
+        let stop_handle = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(iter * 2));
+            run_cli(&sd_stop, &["daemon", "stop", "--json"])
+        });
+
+        let mut list_handles = Vec::new();
+        for idx in 0..6 {
+            let sd_list = state_dir.clone();
+            list_handles.push(thread::spawn(move || {
+                thread::sleep(Duration::from_millis(idx * 5));
+                run_cli(&sd_list, &["session", "list", "--json"])
+            }));
+        }
+
+        let stop_out = stop_handle.join().unwrap();
+        assert!(
+            stop_out.status.success(),
+            "iter {iter} daemon stop failed: {}",
+            String::from_utf8_lossy(&stop_out.stdout)
+        );
+        for (idx, h) in list_handles.into_iter().enumerate() {
+            let out = h.join().unwrap();
+            assert!(
+                out.status.success(),
+                "iter {iter} list {idx} failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(v["ok"], true);
+        }
+        let _ = run_cli(&state_dir, &["daemon", "stop", "--json"]);
+    }
+
+    // Idle timeout = 1s with 3 active Firefox ephemeral sessions + concurrent session list storm
+    let idle_state = tmp.path().join("ff_idle_storm");
+    let _idle_guard = DaemonCleanupGuard {
+        state_dir: idle_state.clone(),
+    };
+    let dstart = run_cli(&idle_state, &["--engine", "firefox", "daemon", "--idle-timeout", "1", "--json"]);
+    assert!(dstart.status.success(), "{}", String::from_utf8_lossy(&dstart.stdout));
+
+    for sid in ["ffi1", "ffi2", "ffi3"] {
+        let snew = run_cli(
+            &idle_state,
+            &["--engine", "firefox", "--session", sid, "session", "new", "--ephemeral", "--json"],
+        );
+        assert!(snew.status.success(), "{}", String::from_utf8_lossy(&snew.stdout));
+    }
+
+    thread::sleep(Duration::from_millis(1150));
+    let mut storm = Vec::new();
+    for idx in 0..6 {
+        let sd = idle_state.clone();
+        storm.push(thread::spawn(move || {
+            thread::sleep(Duration::from_millis(idx * 40));
+            run_cli(&sd, &["session", "list", "--json"])
+        }));
+    }
+    for (idx, h) in storm.into_iter().enumerate() {
+        let out = h.join().unwrap();
+        assert!(
+            out.status.success(),
+            "idle storm list {idx} failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(v["ok"], true);
+    }
+    let _ = run_cli(&idle_state, &["daemon", "stop", "--json"]);
+}
+
+#[test]
+fn cli_profile_import_persists_origins_chromium_and_firefox_and_rejects_empty_cookie_domain() {
+    let srv = LocalMiniServer::start();
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("imp_origins_state");
+    let _guard = DaemonCleanupGuard {
+        state_dir: state_dir.clone(),
+    };
+
+    let target_url = srv.url("/");
+    let origin = target_url.trim_end_matches('/').to_string();
+
+    let bad_cookie_state = tmp.path().join("empty_domain_state.json");
+    fs::write(
+        &bad_cookie_state,
+        serde_json::to_vec(&serde_json::json!({
+            "cookies": [{
+                "name": "bad",
+                "value": "v",
+                "domain": "",
+                "path": "/",
+                "expires": null,
+                "http_only": false,
+                "secure": false,
+                "same_site": null
+            }],
+            "origins": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let bad_imp = run_cli(
+        &state_dir,
+        &[
+            "profile",
+            "import",
+            "bad_cookie_prof",
+            bad_cookie_state.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert!(!bad_imp.status.success(), "empty cookie domain must fail");
+    assert!(
+        !state_dir.join("profiles").join("bad_cookie_prof").exists(),
+        "empty profile dir must be rolled back on cookie import failure"
+    );
+
+    let good_state = tmp.path().join("good_storage_state.json");
+    fs::write(
+        &good_state,
+        serde_json::to_vec(&serde_json::json!({
+            "cookies": [{
+                "name": "cli_ck",
+                "value": "cli_cv",
+                "domain": "127.0.0.1",
+                "path": "/",
+                "expires": null,
+                "http_only": false,
+                "secure": false,
+                "same_site": null
+            }],
+            "origins": [{
+                "origin": origin,
+                "local_storage": {"ls_key": "ls_cli_val"},
+                "session_storage": {"ss_key": "ss_cli_val"}
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let state_str = good_state.to_string_lossy().to_string();
+
+    for engine in ["chromium", "firefox"] {
+        let prof_name = format!("imp_prof_{engine}");
+        let sid = format!("imp_sid_{engine}");
+
+        let imp = run_cli(
+            &state_dir,
+            &["--engine", engine, "profile", "import", &prof_name, &state_str, "--json"],
+        );
+        assert!(
+            imp.status.success(),
+            "{engine} profile import failed: {}",
+            String::from_utf8_lossy(&imp.stdout)
+        );
+
+        let snew = run_cli(
+            &state_dir,
+            &[
+                "--engine",
+                engine,
+                "--session",
+                &sid,
+                "session",
+                "new",
+                "--profile",
+                &prof_name,
+                "--json",
+            ],
+        );
+        assert!(
+            snew.status.success(),
+            "{engine} session new --profile failed: {}",
+            String::from_utf8_lossy(&snew.stdout)
+        );
+
+        let open_out = run_cli(
+            &state_dir,
+            &["--session", &sid, "open", &target_url, "--json"],
+        );
+        assert!(
+            open_out.status.success(),
+            "{engine} open failed: {}",
+            String::from_utf8_lossy(&open_out.stdout)
+        );
+
+        let ls_out = run_cli(
+            &state_dir,
+            &["--session", &sid, "eval", "localStorage.getItem('ls_key')", "--json"],
+        );
+        assert!(ls_out.status.success());
+        let ls_val: Value = serde_json::from_slice(&ls_out.stdout).unwrap();
+        assert_eq!(
+            ls_val["data"]["value"], "ls_cli_val",
+            "{engine} localStorage mismatch: {ls_val}"
+        );
+
+        let ss_out = run_cli(
+            &state_dir,
+            &["--session", &sid, "eval", "sessionStorage.getItem('ss_key')", "--json"],
+        );
+        assert!(ss_out.status.success());
+        let ss_val: Value = serde_json::from_slice(&ss_out.stdout).unwrap();
+        assert_eq!(
+            ss_val["data"]["value"], "ss_cli_val",
+            "{engine} sessionStorage mismatch: {ss_val}"
+        );
+
+        let ck_out = run_cli(
+            &state_dir,
+            &["--session", &sid, "eval", "document.cookie", "--json"],
+        );
+        assert!(ck_out.status.success());
+        let ck_val: Value = serde_json::from_slice(&ck_out.stdout).unwrap();
+        assert!(
+            ck_val["data"]["value"]
+                .as_str()
+                .unwrap_or("")
+                .contains("cli_ck=cli_cv"),
+            "{engine} cookie mismatch: {ck_val}"
+        );
+
+        assert!(
+            run_cli(&state_dir, &["close", &sid, "--json"])
+                .status
+                .success()
+        );
+    }
+
+    let _ = run_cli(&state_dir, &["daemon", "stop", "--json"]);
+}
+
+#[test]
+fn cli_daemon_stop_terminates_daemon_with_sigstop_wedged_browser_child() {
+    struct WedgedCleanupGuard {
+        state_dir: PathBuf,
+        browser_pid: Option<i32>,
+        daemon_pid: Option<i32>,
+    }
+    impl Drop for WedgedCleanupGuard {
+        fn drop(&mut self) {
+            if let Some(bpid) = self.browser_pid {
+                let pgid_arg = format!("-{bpid}");
+                let _ = Command::new("kill").args(["-CONT", &pgid_arg]).output();
+                let _ = Command::new("kill").args(["-KILL", &pgid_arg]).output();
+            }
+            if let Some(dpid) = self.daemon_pid {
+                let _ = Command::new("kill").args(["-KILL", &dpid.to_string()]).output();
+            }
+            let _ = Command::new(bin())
+                .args(["--state-dir"])
+                .arg(&self.state_dir)
+                .args(["daemon", "stop"])
+                .output();
+        }
+    }
+
+    fn pgid_alive(pgid: i32) -> bool {
+        if pgid <= 0 {
+            return false;
+        }
+        Command::new("kill")
+            .args(["-0", &format!("-{pgid}")])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    for engine in ["chromium", "firefox"] {
+        let state_dir = tmp.path().join(format!("wedged_daemon_state_{engine}"));
+        let mut guard = WedgedCleanupGuard {
+            state_dir: state_dir.clone(),
+            browser_pid: None,
+            daemon_pid: None,
+        };
+
+        let snew = run_cli(
+            &state_dir,
+            &["--engine", engine, "--session", "w1", "session", "new", "--ephemeral", "--json"],
+        );
+        assert!(
+            snew.status.success(),
+            "{engine} session new failed: {}",
+            String::from_utf8_lossy(&snew.stdout)
+        );
+        let snew_val: Value = serde_json::from_slice(&snew.stdout).unwrap();
+        let browser_pid = snew_val["data"]["pid"].as_i64().expect("browser pid") as i32;
+        guard.browser_pid = Some(browser_pid);
+
+        let st_before = run_cli(&state_dir, &["daemon", "status", "--json"]);
+        assert!(st_before.status.success());
+        let st_before_val: Value = serde_json::from_slice(&st_before.stdout).unwrap();
+        assert_eq!(st_before_val["data"]["running"], true);
+        let daemon_pid = st_before_val["data"]["pid"].as_i64().expect("daemon pid") as i32;
+        guard.daemon_pid = Some(daemon_pid);
+
+        // Freeze the browser process group with SIGSTOP so graceful cookies/dispose hangs.
+        let stop_sig = Command::new("kill")
+            .args(["-STOP", &format!("-{browser_pid}")])
+            .output()
+            .expect("send SIGSTOP to browser pgid");
+        assert!(
+            stop_sig.status.success(),
+            "{engine} SIGSTOP on browser pgid failed: {}",
+            String::from_utf8_lossy(&stop_sig.stderr)
+        );
+
+        let stop_out = run_cli(&state_dir, &["daemon", "stop", "--json"]);
+        assert!(
+            stop_out.status.success(),
+            "{engine} daemon stop must succeed: stdout={} stderr={}",
+            String::from_utf8_lossy(&stop_out.stdout),
+            String::from_utf8_lossy(&stop_out.stderr)
+        );
+        let stop_val: Value = serde_json::from_slice(&stop_out.stdout).unwrap();
+        assert_eq!(stop_val["ok"], true);
+        assert_eq!(stop_val["data"]["stopped"], true);
+
+        // Daemon and wedged browser PGID must both be dead (SIGTERM caught during shutdown -> Drop kills -pgid).
+        assert!(
+            !mimikyu_core::daemon::is_pid_alive(daemon_pid),
+            "{engine} daemon pid {daemon_pid} must not remain alive"
+        );
+        assert!(
+            !pgid_alive(browser_pid),
+            "{engine} browser pgid {browser_pid} must not remain orphaned"
+        );
+
+        let st_after = run_cli(&state_dir, &["daemon", "status", "--json"]);
+        assert!(st_after.status.success());
+        let st_after_val: Value = serde_json::from_slice(&st_after.stdout).unwrap();
+        assert_eq!(st_after_val["data"]["running"], false);
+
+        guard.browser_pid = None;
+        guard.daemon_pid = None;
+    }
+}
+
+#[test]
+fn cli_accepts_hyphen_values_and_hyphen_state_dir_daemon_roundtrip() {
+    let srv = LocalMiniServer::start();
+    let tmp = tempfile::tempdir().unwrap();
+
+    struct RelativeDashCleanup {
+        cwd: PathBuf,
+        rel_dir: String,
+    }
+    impl Drop for RelativeDashCleanup {
+        fn drop(&mut self) {
+            let _ = Command::new(bin())
+                .current_dir(&self.cwd)
+                .args(["--state-dir", &self.rel_dir, "daemon", "stop"])
+                .output();
+        }
+    }
+
+    let run_rel = |rel_dir: &str, use_equals: bool, args: &[&str]| -> std::process::Output {
+        let mut cmd = Command::new(bin());
+        cmd.current_dir(tmp.path());
+        if use_equals {
+            cmd.arg(format!("--state-dir={rel_dir}"));
+        } else {
+            cmd.arg("--state-dir").arg(rel_dir);
+        }
+        cmd.args(args).output().expect("spawn mimikyu")
+    };
+
+    // 1. Both `--state-dir -dash` and `--state-dir=-dash` spawn background daemon & stop cleanly
+    for (rel_dir, use_eq) in [("-dash-space", false), ("-dash-eq", true)] {
+        let _cleanup = RelativeDashCleanup {
+            cwd: tmp.path().to_path_buf(),
+            rel_dir: rel_dir.to_string(),
+        };
+        let d_out = run_rel(rel_dir, use_eq, &["daemon", "--json"]);
+        assert!(
+            d_out.status.success(),
+            "daemon start ({rel_dir}) failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&d_out.stdout),
+            String::from_utf8_lossy(&d_out.stderr)
+        );
+        let d_val: Value = serde_json::from_slice(&d_out.stdout).expect("daemon JSON");
+        assert_eq!(d_val["ok"], true);
+
+        let s_out = run_rel(rel_dir, use_eq, &["daemon", "status", "--json"]);
+        assert!(s_out.status.success());
+        let s_val: Value = serde_json::from_slice(&s_out.stdout).expect("status JSON");
+        assert_eq!(s_val["data"]["running"], true);
+
+        let stop_out = run_rel(rel_dir, use_eq, &["daemon", "stop", "--json"]);
+        assert!(stop_out.status.success());
+        let stop_val: Value = serde_json::from_slice(&stop_out.stdout).expect("stop JSON");
+        assert_eq!(stop_val["data"]["stopped"], true);
+    }
+
+    // 2. Hyphen-prefixed values on fill, type, eval, wait --text, wait --url, wait --selector
+    let rel_work = "-dash-work";
+    let _cleanup = RelativeDashCleanup {
+        cwd: tmp.path().to_path_buf(),
+        rel_dir: rel_work.to_string(),
+    };
+    let snew = run_rel(
+        rel_work,
+        false,
+        &["--engine", "chromium", "session", "new", "--virtual", "--json"],
+    );
+    assert!(
+        snew.status.success(),
+        "session new failed: {}",
+        String::from_utf8_lossy(&snew.stdout)
+    );
+    assert!(run_rel(rel_work, false, &["open", &srv.url("/page-50pct"), "--json"])
+        .status
+        .success());
+
+    let fill_out = run_rel(rel_work, false, &["fill", "#name", "-100", "--json"]);
+    assert!(
+        fill_out.status.success(),
+        "fill -100 failed: {}",
+        String::from_utf8_lossy(&fill_out.stdout)
+    );
+    let fill_check = run_rel(
+        rel_work,
+        false,
+        &["eval", "document.getElementById('name').value", "--json"],
+    );
+    let fill_val: Value = serde_json::from_slice(&fill_check.stdout).unwrap();
+    assert_eq!(fill_val["data"]["value"], "-100");
+
+    let type_out = run_rel(rel_work, false, &["type", "#name", "-abc", "--json"]);
+    assert!(
+        type_out.status.success(),
+        "type -abc failed: {}",
+        String::from_utf8_lossy(&type_out.stdout)
+    );
+    let type_check = run_rel(
+        rel_work,
+        false,
+        &["eval", "document.getElementById('name').value", "--json"],
+    );
+    let type_val: Value = serde_json::from_slice(&type_check.stdout).unwrap();
+    assert_eq!(type_val["data"]["value"], "-100-abc");
+
+    let eval_out = run_rel(rel_work, false, &["eval", "-1 + 2", "--json"]);
+    assert!(
+        eval_out.status.success(),
+        "eval -1 + 2 failed: {}",
+        String::from_utf8_lossy(&eval_out.stdout)
+    );
+    let eval_val: Value = serde_json::from_slice(&eval_out.stdout).unwrap();
+    assert_eq!(eval_val["data"]["value"], 1);
+
+    let set_text = run_rel(
+        rel_work,
+        false,
+        &[
+            "eval",
+            "document.getElementById('out').textContent = 'discount -50%'; 'ok'",
+            "--json",
+        ],
+    );
+    assert!(set_text.status.success());
+
+    let wait_text_out = run_rel(
+        rel_work,
+        false,
+        &["wait", "--text", "-50%", "--timeout-ms", "1500", "--json"],
+    );
+    assert!(
+        wait_text_out.status.success(),
+        "wait --text -50% failed: {}",
+        String::from_utf8_lossy(&wait_text_out.stdout)
+    );
+
+    let wait_url_out = run_rel(
+        rel_work,
+        false,
+        &["wait", "--url", "-50pct", "--timeout-ms", "1500", "--json"],
+    );
+    assert!(
+        wait_url_out.status.success(),
+        "wait --url -50pct failed: {}",
+        String::from_utf8_lossy(&wait_url_out.stdout)
+    );
+
+    let wait_sel_out = run_rel(
+        rel_work,
+        false,
+        &["wait", "--selector", "-nonexistent", "--timeout-ms", "100", "--json"],
+    );
+    // Invalid CSS selector or missing selector returns JSON error envelope, NOT clap argument rejection
+    let wait_sel_s = String::from_utf8_lossy(&wait_sel_out.stdout);
+    let wait_sel_v: Value = serde_json::from_str(wait_sel_s.trim()).expect("JSON envelope");
+    assert_eq!(wait_sel_v["ok"], false);
+    assert!(
+        !wait_sel_v["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("unexpected argument"),
+        "wait --selector -nonexistent should reach wait engine, not clap: {wait_sel_v:?}"
+    );
+
+    assert!(run_rel(rel_work, false, &["daemon", "stop", "--json"])
+        .status
+        .success());
+}

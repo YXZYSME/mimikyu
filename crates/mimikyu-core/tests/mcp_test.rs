@@ -647,3 +647,217 @@ async fn mcp_stdin_eof_shuts_down_all_sessions_and_reaps_children() {
     assert!(mgr.list_sessions().is_empty());
     assert_pgid_gone(pid);
 }
+
+#[tokio::test]
+async fn mcp_invalid_utf8_and_oversized_line_return_jsonrpc_error_and_recover() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(SessionManager::new(tmp.path().join("state")).unwrap());
+
+    let (mut w, server_in) = tokio::io::duplex(64 * 1024);
+    let (server_out, client_out) = tokio::io::duplex(64 * 1024);
+
+    let srv_mgr = Arc::clone(&mgr);
+    let server_task = tokio::spawn(async move {
+        serve_rw(srv_mgr, BufReader::new(server_in), server_out).await
+    });
+    let mut r = BufReader::new(client_out);
+
+    // 1. Raw invalid UTF-8 bytes
+    w.write_all(b"\xff\xfe\n").await.unwrap();
+    w.flush().await.unwrap();
+    let err_utf8 = read_json_line(&mut r).await;
+    assert_eq!(err_utf8["error"]["code"], -32700);
+
+    // 2. Oversized (>16 MiB) line written concurrently while reading response
+    let writer_task = tokio::spawn(async move {
+        let chunk = vec![b'x'; 1024 * 1024];
+        for _ in 0..17 {
+            w.write_all(&chunk).await.unwrap();
+        }
+        w.write_all(b"\n").await.unwrap();
+        w.flush().await.unwrap();
+        w
+    });
+    let err_big = read_json_line(&mut r).await;
+    assert_eq!(err_big["error"]["code"], -32600);
+    let mut w = writer_task.await.unwrap();
+
+    // 3. Valid ping still works cleanly after both errors
+    send_line(
+        &mut w,
+        &json!({ "jsonrpc": "2.0", "id": 99, "method": "ping" }),
+    )
+    .await;
+    let ok_ping = read_json_line(&mut r).await;
+    assert_eq!(ok_ping["id"], 99);
+    assert!(ok_ping["result"].is_object());
+
+    drop(w);
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn mcp_browser_open_validates_url_before_session_creation_and_skips_recreate() {
+    let srv = TestServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(SessionManager::new(tmp.path().join("state")).unwrap());
+
+    let (mut w, server_in) = tokio::io::duplex(64 * 1024);
+    let (server_out, client_out) = tokio::io::duplex(64 * 1024);
+
+    let srv_mgr = Arc::clone(&mgr);
+    let server_task = tokio::spawn(async move {
+        serve_rw(srv_mgr, BufReader::new(server_in), server_out).await
+    });
+    let mut r = BufReader::new(client_out);
+
+    // 1. Invalid URL must fail with -32602 WITHOUT creating session "leaktest"
+    send_line(
+        &mut w,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "browser_open",
+                "arguments": { "session": "leaktest", "url": "file:///etc/passwd" }
+            }
+        }),
+    )
+    .await;
+    let bad_open = read_json_line(&mut r).await;
+    assert_eq!(bad_open["error"]["code"], -32602);
+    assert!(
+        mgr.list_sessions().is_empty(),
+        "failed browser_open must not leave behind leaked session"
+    );
+
+    // 2. Valid browser_open creates session, and a second browser_open with {"ephemeral": false} navigates instead of re-creating
+    send_line(
+        &mut w,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "browser_open",
+                "arguments": { "session": "reuse", "ephemeral": true, "url": srv.url("/") }
+            }
+        }),
+    )
+    .await;
+    let ok1 = read_json_line(&mut r).await;
+    assert_eq!(ok1["result"]["isError"], false);
+
+    send_line(
+        &mut w,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "browser_open",
+                "arguments": { "session": "reuse", "ephemeral": false, "url": srv.url("/target") }
+            }
+        }),
+    )
+    .await;
+    let ok2 = read_json_line(&mut r).await;
+    assert_eq!(ok2["result"]["isError"], false);
+    assert!(parse_tool_json(&ok2)["url"]
+        .as_str()
+        .unwrap_or("")
+        .contains("/target"));
+
+    // 3. mimikyu_wait and mimikyu_batch fail fast on invalid CSS selector "div[[["
+    let t_wait = std::time::Instant::now();
+    send_line(
+        &mut w,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "mimikyu_wait",
+                "arguments": { "session": "reuse", "selector": "div[[[", "timeout_ms": 5000 }
+            }
+        }),
+    )
+    .await;
+    let bad_wait = read_json_line(&mut r).await;
+    assert_eq!(bad_wait["error"]["code"], -32602);
+    assert!(t_wait.elapsed() < std::time::Duration::from_secs(2));
+
+    let t_batch = std::time::Instant::now();
+    send_line(
+        &mut w,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "mimikyu_batch",
+                "arguments": {
+                    "session": "reuse",
+                    "ops": [{ "op": "wait", "selector": "div[[[", "timeout_ms": 5000 }]
+                }
+            }
+        }),
+    )
+    .await;
+    let bad_batch = read_json_line(&mut r).await;
+    assert!(t_batch.elapsed() < std::time::Duration::from_secs(2));
+    assert_eq!(bad_batch["result"]["isError"], true);
+    let batch_report = parse_tool_json(&bad_batch);
+    assert_eq!(batch_report["ok"], false);
+    assert!(
+        batch_report["error"]["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("invalid CSS selector"),
+        "unexpected mimikyu_batch error: {batch_report}"
+    );
+
+    // 4. mimikyu_wait idle + stable_target prevalidation ("div[[[", "", "@e999")
+    for (req_id, stable_target, expect_invalid_params) in [
+        (6, "div[[[", true),
+        (7, "", true),
+        (8, "@e999", false),
+    ] {
+        let t_st = std::time::Instant::now();
+        send_line(
+            &mut w,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "mimikyu_wait",
+                    "arguments": {
+                        "session": "reuse",
+                        "idle": true,
+                        "stable_target": stable_target,
+                        "timeout_ms": 5000
+                    }
+                }
+            }),
+        )
+        .await;
+        let resp = read_json_line(&mut r).await;
+        assert!(
+            t_st.elapsed() < std::time::Duration::from_secs(2),
+            "mimikyu_wait(stable_target={stable_target:?}) stalled: {:?}",
+            t_st.elapsed()
+        );
+        if expect_invalid_params {
+            assert_eq!(resp["error"]["code"], -32602, "resp={resp}");
+        } else {
+            assert_eq!(resp["result"]["isError"], true, "resp={resp}");
+            let txt = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
+            assert!(txt.contains("unknown ref '@e999'"), "resp={resp}");
+        }
+    }
+
+    drop(w);
+    server_task.await.unwrap().unwrap();
+}

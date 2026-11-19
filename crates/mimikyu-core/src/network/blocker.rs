@@ -150,6 +150,45 @@ impl UrlPattern {
             Self::Exact(_) | Self::Regex(_) => None,
         }
     }
+
+    pub(crate) fn to_js_matcher(&self) -> serde_json::Value {
+        match self {
+            Self::Exact(s) => serde_json::json!({ "kind": "exact", "val": s }),
+            Self::Prefix(s) => serde_json::json!({ "kind": "prefix", "val": s }),
+            Self::Substring(s) => serde_json::json!({ "kind": "substring", "val": s }),
+            Self::Glob(pat) => serde_json::json!({ "kind": "glob", "val": pat }),
+            Self::Regex(re) => {
+                let (pat, flags) = split_rust_regex_flags(re.as_str());
+                serde_json::json!({ "kind": "regex", "pat": pat, "flags": flags })
+            }
+        }
+    }
+}
+
+fn split_rust_regex_flags(raw: &str) -> (String, String) {
+    if let Some(rest) = raw.strip_prefix("(?")
+        && let Some(end) = rest.find(')')
+    {
+        let prefix_flags = &rest[..end];
+        if !prefix_flags.is_empty()
+            && !prefix_flags.contains(':')
+            && prefix_flags
+                .chars()
+                .all(|c| matches!(c, 'i' | 'm' | 's' | 'U' | 'u' | 'x' | '-'))
+        {
+            let mut js_flags = String::new();
+            for c in prefix_flags.chars() {
+                if c == '-' {
+                    break;
+                }
+                if matches!(c, 'i' | 'm' | 's') && !js_flags.contains(c) {
+                    js_flags.push(c);
+                }
+            }
+            return (rest[end + 1..].to_string(), js_flags);
+        }
+    }
+    (raw.to_string(), String::new())
 }
 
 /// Declarative blocking policy for resource categories and URL patterns.
@@ -256,6 +295,13 @@ impl ResourceBlocker {
         self.compiled_urls
             .iter()
             .any(|p| p.to_cdp_blocked_url_glob().is_none())
+    }
+
+    pub(crate) fn compiled_url_matchers_json(&self) -> Vec<serde_json::Value> {
+        self.compiled_urls
+            .iter()
+            .map(UrlPattern::to_js_matcher)
+            .collect()
     }
 }
 

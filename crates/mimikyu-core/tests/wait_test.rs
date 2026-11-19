@@ -620,3 +620,291 @@ async fn live_batch_scroll_immediately_followed_by_click_chromium() {
 async fn live_batch_scroll_immediately_followed_by_click_firefox() {
     assert_batch_scroll_immediately_followed_by_click(EngineKind::Firefox).await;
 }
+
+#[tokio::test]
+async fn wait_rejects_overflow_or_excessive_timeout_ms() {
+    let session = driver_for(EngineKind::Chromium)
+        .launch(LaunchOptions {
+            engine: EngineKind::Chromium,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            ..Default::default()
+        })
+        .await
+        .expect("launch");
+    let pid = session.info().pid.expect("pid") as libc::pid_t;
+    session
+        .navigate("data:text/html,<p>wait</p>")
+        .await
+        .expect("nav");
+
+    let excess = WaitOptions {
+        timeout_ms: u64::MAX,
+        poll_interval_ms: 25,
+    };
+    let e1 = WaitEngine::wait_text(session.as_ref(), "never", excess.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(e1, MimikyuError::InvalidConfig(_)));
+
+    let e2 = WaitEngine::wait_url(session.as_ref(), "never", excess.clone())
+        .await
+        .unwrap_err();
+    assert!(matches!(e2, MimikyuError::InvalidConfig(_)));
+
+    let e3 = WaitEngine::wait_selector(
+        session.as_ref(),
+        "#never",
+        WaitSelectorState::Visible,
+        excess,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(e3, MimikyuError::InvalidConfig(_)));
+
+    let e4 = WaitEngine::wait_idle(
+        session.as_ref(),
+        None,
+        WaitIdleOptions {
+            timeout_ms: u64::MAX,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(e4, MimikyuError::InvalidConfig(_)));
+
+    let t0 = std::time::Instant::now();
+    let bad_sel_err = WaitEngine::wait_selector(
+        session.as_ref(),
+        "div[[[",
+        WaitSelectorState::Visible,
+        WaitOptions {
+            timeout_ms: 10_000,
+            poll_interval_ms: 25,
+        },
+    )
+    .await
+    .expect_err("WaitEngine::wait_selector must fail fast on invalid CSS selector");
+    assert!(
+        matches!(bad_sel_err, MimikyuError::InvalidConfig(_)),
+        "expected InvalidConfig, got {bad_sel_err:?}"
+    );
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(2),
+        "WaitEngine::wait_selector stalled on invalid CSS selector: {:?}",
+        t0.elapsed()
+    );
+
+    let chokepoint = ChokepointInput::new(session.clone());
+    let mut snap_state = SnapshotState::default();
+    let t1 = std::time::Instant::now();
+    let bad_batch = ActionBatcher::execute(
+        session.as_ref(),
+        &chokepoint,
+        &mut snap_state,
+        &[BatchAction::WaitSelector {
+            selector: "div[[[".to_string(),
+            timeout_ms: Some(10_000),
+            state: Some(WaitSelectorState::Visible),
+        }],
+    )
+    .await
+    .expect("ActionBatcher returns BatchReport on invalid CSS selector");
+    assert!(!bad_batch.ok);
+    assert!(
+        t1.elapsed() < std::time::Duration::from_secs(2),
+        "BatchAction::WaitSelector stalled on invalid CSS selector: {:?}",
+        t1.elapsed()
+    );
+    let b_err = bad_batch.error.expect("batch error present");
+    assert_eq!(b_err.action, "wait_selector");
+    assert!(
+        b_err.message.contains("invalid CSS selector"),
+        "expected invalid CSS selector message, got {}",
+        b_err.message
+    );
+
+    // wait_idle stable_target must fail fast on invalid CSS, empty selector, and unknown @eN ref
+    for (label, target, is_ref) in [
+        ("invalid CSS", "div[[[", false),
+        ("empty selector", "", false),
+        ("whitespace selector", "   ", false),
+        ("unknown @eN ref", "@e999", true),
+    ] {
+        let t_idle = std::time::Instant::now();
+        let err = WaitEngine::wait_idle(
+            session.as_ref(),
+            None,
+            WaitIdleOptions {
+                timeout_ms: 10_000,
+                poll_interval_ms: 25,
+                stable_target: Some(target.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("wait_idle stable_target must fail fast");
+        assert!(
+            t_idle.elapsed() < std::time::Duration::from_secs(2),
+            "wait_idle({label}) stalled: {:?}",
+            t_idle.elapsed()
+        );
+        if is_ref {
+            assert!(
+                matches!(err, MimikyuError::ElementNotFound(_)),
+                "wait_idle({label}) expected ElementNotFound, got {err:?}"
+            );
+        } else {
+            assert!(
+                matches!(err, MimikyuError::InvalidConfig(_)),
+                "wait_idle({label}) expected InvalidConfig, got {err:?}"
+            );
+        }
+    }
+
+    let empty_map = mimikyu_core::snapshot::RefMap::default();
+    let t_ref_map = std::time::Instant::now();
+    let err_ref = WaitEngine::wait_idle(
+        session.as_ref(),
+        Some(&empty_map),
+        WaitIdleOptions {
+            timeout_ms: 10_000,
+            poll_interval_ms: 25,
+            stable_target: Some("@e999".to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect_err("wait_idle unknown @e999 with RefMap must fail fast");
+    assert!(t_ref_map.elapsed() < std::time::Duration::from_secs(2));
+    assert!(matches!(err_ref, MimikyuError::ElementNotFound(_)));
+
+    let t_idle_batch = std::time::Instant::now();
+    let bad_idle_batch = ActionBatcher::execute(
+        session.as_ref(),
+        &chokepoint,
+        &mut snap_state,
+        &[BatchAction::WaitIdle {
+            timeout_ms: Some(10_000),
+            network_quiet_ms: None,
+            target: Some("div[[[".to_string()),
+        }],
+    )
+    .await
+    .expect("ActionBatcher returns BatchReport");
+    assert!(!bad_idle_batch.ok);
+    assert!(t_idle_batch.elapsed() < std::time::Duration::from_secs(2));
+    assert!(
+        bad_idle_batch
+            .error
+            .as_ref()
+            .is_some_and(|e| e.message.contains("invalid CSS selector")),
+        "unexpected batch wait_idle error: {:?}",
+        bad_idle_batch.error
+    );
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+async fn assert_wait_text_open_shadow_dom(engine: EngineKind) {
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            ..Default::default()
+        })
+        .await
+        .expect("launch");
+    let pid = session.info().pid.expect("pid");
+
+    let html = r#"<!doctype html><html><body>
+        <div id="open-host"></div>
+        <div id="hidden-host" style="display:none"></div>
+        <script>
+            const sr = document.getElementById('open-host').attachShadow({ mode: 'open' });
+            sr.innerHTML = `
+                <style>/* SHADOW_STYLE_IGNORE */</style>
+                <div style="display:none">SHADOW_HIDDEN_DISP</div>
+                <div hidden>SHADOW_HIDDEN_ATTR</div>
+                <div aria-hidden="true">SHADOW_HIDDEN_ARIA</div>
+                <div style="visibility:hidden">SHADOW_HIDDEN_VIS</div>
+                <p><span>SHADOW_</span><span>WAIT_OK</span></p>
+                <div id="nested-open"></div>
+            `;
+            const nestedSr = sr.getElementById('nested-open').attachShadow({ mode: 'open' });
+            nestedSr.innerHTML = '<p>NESTED_SHADOW_OK</p>';
+
+            const hsr = document.getElementById('hidden-host').attachShadow({ mode: 'open' });
+            hsr.innerHTML = '<p>HIDDEN_HOST_SHADOW</p>';
+        </script>
+    </body></html>"#;
+    let data_url = format!(
+        "data:text/html,{}",
+        url::form_urlencoded::byte_serialize(html.as_bytes())
+            .collect::<String>()
+            .replace('+', "%20")
+    );
+    session.navigate(&data_url).await.expect("navigate data");
+
+    WaitEngine::wait_text(
+        session.as_ref(),
+        "SHADOW_WAIT_OK",
+        WaitOptions {
+            timeout_ms: 2_000,
+            poll_interval_ms: 25,
+        },
+    )
+    .await
+    .expect("wait_text must match visible open shadow DOM text");
+
+    WaitEngine::wait_text(
+        session.as_ref(),
+        "NESTED_SHADOW_OK",
+        WaitOptions {
+            timeout_ms: 2_000,
+            poll_interval_ms: 25,
+        },
+    )
+    .await
+    .expect("wait_text must match nested open shadow DOM text");
+
+    for hidden_txt in [
+        "SHADOW_STYLE_IGNORE",
+        "SHADOW_HIDDEN_DISP",
+        "SHADOW_HIDDEN_ATTR",
+        "SHADOW_HIDDEN_ARIA",
+        "SHADOW_HIDDEN_VIS",
+        "HIDDEN_HOST_SHADOW",
+    ] {
+        let err = WaitEngine::wait_text(
+            session.as_ref(),
+            hidden_txt,
+            WaitOptions {
+                timeout_ms: 150,
+                poll_interval_ms: 25,
+            },
+        )
+        .await
+        .expect_err("hidden shadow text must not match wait_text");
+        assert!(
+            matches!(err, MimikyuError::Timeout { .. }),
+            "{engine} {hidden_txt}: expected Timeout, got {err:?}"
+        );
+    }
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn wait_text_open_shadow_dom_chromium() {
+    assert_wait_text_open_shadow_dom(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn wait_text_open_shadow_dom_firefox() {
+    assert_wait_text_open_shadow_dom(EngineKind::Firefox).await;
+}

@@ -6,12 +6,12 @@ use serde_json::json;
 use tokio::sync::watch;
 
 use crate::driver::now_ms;
-use crate::error::Result;
+use crate::error::{MimikyuError, Result};
 use crate::session::SessionManager;
 
 use super::protocol::{
-    parse_batch_actions, DaemonOp, DaemonRequest, DaemonResponse, DaemonStatusInfo,
-    SessionListEntry,
+    parse_batch_actions, DaemonErrorKind, DaemonOp, DaemonRequest, DaemonResponse,
+    DaemonStatusInfo, SessionListEntry,
 };
 use super::DaemonPaths;
 
@@ -36,6 +36,7 @@ pub struct DaemonPool {
     shutdown_tx: watch::Sender<bool>,
     shutdown_rx: watch::Receiver<bool>,
     shutting_down: AtomicBool,
+    shutdown_gate: std::sync::Mutex<()>,
 }
 
 impl DaemonPool {
@@ -56,6 +57,7 @@ impl DaemonPool {
             shutdown_tx,
             shutdown_rx,
             shutting_down: AtomicBool::new(false),
+            shutdown_gate: std::sync::Mutex::new(()),
         })
     }
 
@@ -77,6 +79,16 @@ impl DaemonPool {
         RequestGuard { pool: self }
     }
 
+    pub fn try_begin_request(&self) -> Option<RequestGuard<'_>> {
+        let _gate = self.shutdown_gate.lock().unwrap_or_else(|e| e.into_inner());
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return None;
+        }
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        self.touch_activity();
+        Some(RequestGuard { pool: self })
+    }
+
     pub fn is_idle_expired(&self) -> bool {
         let Some(timeout) = self.idle_timeout else {
             return false;
@@ -85,10 +97,32 @@ impl DaemonPool {
             return false;
         }
         let elapsed_ms = now_ms().saturating_sub(self.last_activity_ms.load(Ordering::Acquire));
-        elapsed_ms >= timeout.as_millis() as u64
+        u128::from(elapsed_ms) >= timeout.as_millis()
+    }
+
+    pub fn try_expire_idle(&self) -> bool {
+        let Some(timeout) = self.idle_timeout else {
+            return false;
+        };
+        let _gate = self.shutdown_gate.lock().unwrap_or_else(|e| e.into_inner());
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return true;
+        }
+        if self.in_flight.load(Ordering::Acquire) > 0 {
+            return false;
+        }
+        let elapsed_ms = now_ms().saturating_sub(self.last_activity_ms.load(Ordering::Acquire));
+        if u128::from(elapsed_ms) >= timeout.as_millis() {
+            self.shutting_down.store(true, Ordering::SeqCst);
+            let _ = self.shutdown_tx.send(true);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn request_shutdown(&self) {
+        let _gate = self.shutdown_gate.lock().unwrap_or_else(|e| e.into_inner());
         self.shutting_down.store(true, Ordering::SeqCst);
         let _ = self.shutdown_tx.send(true);
     }
@@ -117,13 +151,33 @@ impl DaemonPool {
 
     /// Execute a request and return `(response, should_shutdown_after_flush)`.
     pub async fn dispatch_with_control(&self, req: DaemonRequest) -> (DaemonResponse, bool) {
-        let _guard = self.begin_request();
         let id = req.id;
 
         if matches!(req.op, DaemonOp::DaemonStop) {
+            let _gate = self.shutdown_gate.lock().unwrap_or_else(|e| e.into_inner());
             self.shutting_down.store(true, Ordering::SeqCst);
             return (DaemonResponse::ok(id, json!({ "stopping": true })), true);
         }
+
+        if matches!(req.op, DaemonOp::DaemonStatus) {
+            let _guard = self.begin_request();
+            let resp = match self.dispatch_op(req.op).await {
+                Ok(data) => DaemonResponse::ok(id, data),
+                Err(err) => DaemonResponse::err(id, &err),
+            };
+            return (resp, false);
+        }
+
+        let Some(_guard) = self.try_begin_request() else {
+            return (
+                DaemonResponse::err_message(
+                    id,
+                    DaemonErrorKind::Disposed,
+                    "daemon is shutting down",
+                ),
+                false,
+            );
+        };
 
         let resp = match self.dispatch_op(req.op).await {
             Ok(data) => DaemonResponse::ok(id, data),
@@ -142,7 +196,12 @@ impl DaemonPool {
 
     async fn dispatch_op(&self, op: DaemonOp) -> Result<serde_json::Value> {
         match op {
-            DaemonOp::Ping => Ok(json!({ "pong": true, "pid": std::process::id() })),
+            DaemonOp::Ping => {
+                if self.is_shutting_down() {
+                    return Err(MimikyuError::Disposed);
+                }
+                Ok(json!({ "pong": true, "pid": std::process::id() }))
+            }
             DaemonOp::DaemonStatus => Ok(serde_json::to_value(self.status_info())?),
             DaemonOp::DaemonStop => Ok(json!({ "stopping": true })),
             DaemonOp::SessionNew(opts) => {

@@ -534,3 +534,84 @@ async fn harness_live_workflows_chromium() {
 async fn harness_live_workflows_firefox() {
     run_live_harness_suite(EngineKind::Firefox).await;
 }
+
+#[tokio::test]
+async fn harness_rejects_oversized_head_expect_100_malformed_req_line_and_crlf_redirect() {
+    use mimikyu_core::harness::HarnessConfig;
+
+    let server = HarnessServer::start_with_config(HarnessConfig {
+        enable_cross_origin: false,
+        max_header_bytes: 128,
+        max_body_bytes: 64,
+        keep_alive_timeout_secs: 5,
+    })
+    .await
+    .expect("start harness");
+
+    // 1. Oversized header arriving in a single TCP write -> 431
+    {
+        let mut s = TcpStream::connect(server.addr()).await.unwrap();
+        let big_hdr = "X-Pad: ".to_string() + &"a".repeat(200);
+        let req = format!("GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n{big_hdr}\r\n\r\n");
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        s.read_to_end(&mut resp).await.unwrap();
+        let resp_s = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_s.starts_with("HTTP/1.1 431 "),
+            "expected 431 for oversized single-read head, got: {resp_s}"
+        );
+    }
+
+    // 2. Expect: 100-continue with Content-Length > max_body_bytes -> 413 without 100 Continue
+    {
+        let mut s = TcpStream::connect(server.addr()).await.unwrap();
+        s.write_all(
+            b"POST /submit HTTP/1.1\r\nHost: 127.0.0.1\r\nExpect: 100-continue\r\nContent-Length: 9999\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut resp = Vec::new();
+        s.read_to_end(&mut resp).await.unwrap();
+        let resp_s = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_s.starts_with("HTTP/1.1 413 "),
+            "expected immediate 413 without 100 Continue, got: {resp_s}"
+        );
+        assert!(!resp_s.contains("100 Continue"));
+    }
+
+    // 3. Malformed 2-token and 4-token request lines -> 400 Bad Request
+    for bad_req in [
+        "GET /target\r\nHost: 127.0.0.1\r\n\r\n",
+        "GET /target HTTP/1.1 EXTRA\r\nHost: 127.0.0.1\r\n\r\n",
+    ] {
+        let mut s = TcpStream::connect(server.addr()).await.unwrap();
+        s.write_all(bad_req.as_bytes()).await.unwrap();
+        let mut resp = Vec::new();
+        s.read_to_end(&mut resp).await.unwrap();
+        let resp_s = String::from_utf8_lossy(&resp);
+        assert!(
+            resp_s.starts_with("HTTP/1.1 400 "),
+            "expected 400 for {bad_req:?}, got: {resp_s}"
+        );
+    }
+
+    // 4. CR/LF injection in /redirect?to= must not inject response headers
+    {
+        let mut s = TcpStream::connect(server.addr()).await.unwrap();
+        s.write_all(
+            b"GET /redirect?to=/foo%0d%0aSet-Cookie:%20evil=1 HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let mut resp = Vec::new();
+        s.read_to_end(&mut resp).await.unwrap();
+        let resp_s = String::from_utf8_lossy(&resp);
+        assert!(resp_s.starts_with("HTTP/1.1 302 Found"));
+        assert!(!resp_s.contains("Set-Cookie:"));
+        assert!(resp_s.contains("Location: /target\r\n"));
+    }
+
+    server.shutdown().await;
+}

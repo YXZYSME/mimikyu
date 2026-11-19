@@ -173,6 +173,7 @@ impl DaemonResponse {
                 kind,
                 message: message.into(),
                 code: None,
+                timeout_ms: None,
             }),
         }
     }
@@ -205,99 +206,70 @@ pub struct DaemonError {
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub code: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
 }
 
 impl DaemonError {
+    fn simple(kind: DaemonErrorKind, message: String) -> Self {
+        Self {
+            kind,
+            message,
+            code: None,
+            timeout_ms: None,
+        }
+    }
+
     pub fn from_mimikyu(err: &MimikyuError) -> Self {
         match err {
-            MimikyuError::BrowserNotFound(msg) => Self {
-                kind: DaemonErrorKind::BrowserNotFound,
-                message: msg.clone(),
-                code: None,
-            },
-            MimikyuError::LaunchFailed(msg) => Self {
-                kind: DaemonErrorKind::LaunchFailed,
-                message: msg.clone(),
-                code: None,
-            },
-            MimikyuError::Transport(msg) => Self {
-                kind: DaemonErrorKind::Transport,
-                message: msg.clone(),
-                code: None,
-            },
+            MimikyuError::BrowserNotFound(msg) => {
+                Self::simple(DaemonErrorKind::BrowserNotFound, msg.clone())
+            }
+            MimikyuError::LaunchFailed(msg) => {
+                Self::simple(DaemonErrorKind::LaunchFailed, msg.clone())
+            }
+            MimikyuError::Transport(msg) => Self::simple(DaemonErrorKind::Transport, msg.clone()),
             MimikyuError::Protocol { code, message } => Self {
                 kind: DaemonErrorKind::Protocol,
                 message: message.clone(),
                 code: Some(*code),
+                timeout_ms: None,
             },
             MimikyuError::Timeout {
-                timeout_ms: _,
+                timeout_ms,
                 operation: _,
             } => Self {
                 kind: DaemonErrorKind::Timeout,
                 message: err.to_string(),
                 code: None,
+                timeout_ms: Some(*timeout_ms),
             },
-            MimikyuError::InvalidConfig(msg) => Self {
-                kind: DaemonErrorKind::InvalidConfig,
-                message: msg.clone(),
-                code: None,
-            },
-            MimikyuError::ProfileLocked(msg) => Self {
-                kind: DaemonErrorKind::ProfileLocked,
-                message: msg.clone(),
-                code: None,
-            },
-            MimikyuError::NotFound(msg) => Self {
-                kind: DaemonErrorKind::NotFound,
-                message: msg.clone(),
-                code: None,
-            },
-            MimikyuError::ElementNotFound(msg) => Self {
-                kind: DaemonErrorKind::ElementNotFound,
-                message: msg.clone(),
-                code: None,
-            },
-            MimikyuError::NavigationFailed(msg) => Self {
-                kind: DaemonErrorKind::NavigationFailed,
-                message: msg.clone(),
-                code: None,
-            },
-            MimikyuError::EvalFailed(msg) => Self {
-                kind: DaemonErrorKind::EvalFailed,
-                message: msg.clone(),
-                code: None,
-            },
-            MimikyuError::MainWorldDisabled => Self {
-                kind: DaemonErrorKind::MainWorldDisabled,
-                message: err.to_string(),
-                code: None,
-            },
-            MimikyuError::Unsupported { .. } => Self {
-                kind: DaemonErrorKind::Unsupported,
-                message: err.to_string(),
-                code: None,
-            },
-            MimikyuError::Disposed => Self {
-                kind: DaemonErrorKind::Disposed,
-                message: err.to_string(),
-                code: None,
-            },
-            MimikyuError::Io(e) => Self {
-                kind: DaemonErrorKind::Io,
-                message: e.to_string(),
-                code: None,
-            },
-            MimikyuError::Json(e) => Self {
-                kind: DaemonErrorKind::InvalidConfig,
-                message: e.to_string(),
-                code: None,
-            },
-            MimikyuError::Url(e) => Self {
-                kind: DaemonErrorKind::InvalidConfig,
-                message: e.to_string(),
-                code: None,
-            },
+            MimikyuError::InvalidConfig(msg) => {
+                Self::simple(DaemonErrorKind::InvalidConfig, msg.clone())
+            }
+            MimikyuError::ProfileLocked(msg) => {
+                Self::simple(DaemonErrorKind::ProfileLocked, msg.clone())
+            }
+            MimikyuError::NotFound(msg) => Self::simple(DaemonErrorKind::NotFound, msg.clone()),
+            MimikyuError::ElementNotFound(msg) => {
+                Self::simple(DaemonErrorKind::ElementNotFound, msg.clone())
+            }
+            MimikyuError::NavigationFailed(msg) => {
+                Self::simple(DaemonErrorKind::NavigationFailed, msg.clone())
+            }
+            MimikyuError::EvalFailed(msg) => {
+                Self::simple(DaemonErrorKind::EvalFailed, msg.clone())
+            }
+            MimikyuError::MainWorldDisabled => {
+                Self::simple(DaemonErrorKind::MainWorldDisabled, err.to_string())
+            }
+            MimikyuError::Unsupported { .. } => {
+                Self::simple(DaemonErrorKind::Unsupported, err.to_string())
+            }
+            MimikyuError::Disposed => Self::simple(DaemonErrorKind::Disposed, err.to_string()),
+            MimikyuError::Io(e) => Self::simple(DaemonErrorKind::Io, e.to_string()),
+            MimikyuError::Json(e) => Self::simple(DaemonErrorKind::InvalidConfig, e.to_string()),
+            MimikyuError::Url(e) => Self::simple(DaemonErrorKind::InvalidConfig, e.to_string()),
         }
     }
 
@@ -310,10 +282,33 @@ impl DaemonError {
                 code: self.code.unwrap_or(-1),
                 message: self.message,
             },
-            DaemonErrorKind::Timeout => MimikyuError::Timeout {
-                timeout_ms: 0,
-                operation: self.message,
-            },
+            DaemonErrorKind::Timeout => {
+                if let Some(ms) = self.timeout_ms {
+                    let prefix = format!("operation timed out after {ms}ms: ");
+                    let operation = self
+                        .message
+                        .strip_prefix(&prefix)
+                        .map(ToString::to_string)
+                        .unwrap_or(self.message);
+                    MimikyuError::Timeout {
+                        timeout_ms: ms,
+                        operation,
+                    }
+                } else if let Some(rest) = self.message.strip_prefix("operation timed out after ")
+                    && let Some((num, op)) = rest.split_once("ms: ")
+                    && let Ok(ms) = num.parse::<u64>()
+                {
+                    MimikyuError::Timeout {
+                        timeout_ms: ms,
+                        operation: op.to_string(),
+                    }
+                } else {
+                    MimikyuError::Timeout {
+                        timeout_ms: 0,
+                        operation: self.message,
+                    }
+                }
+            }
             DaemonErrorKind::InvalidConfig => MimikyuError::InvalidConfig(self.message),
             DaemonErrorKind::ProfileLocked => MimikyuError::ProfileLocked(self.message),
             DaemonErrorKind::NotFound => MimikyuError::NotFound(self.message),
@@ -441,6 +436,7 @@ pub fn normalize_batch_ops_value(raw: Value) -> Result<Vec<Value>> {
                         .unwrap_or(false)
                         || map.contains_key("network_quiet_ms")
                         || map.contains_key("target")
+                        || map.contains_key("stable_target")
                     {
                         map.insert("action".to_string(), Value::String("wait_idle".into()));
                     }
@@ -482,4 +478,50 @@ pub fn parse_batch_actions(raw: Value) -> Result<Vec<BatchAction>> {
         actions.push(action);
     }
     Ok(actions)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_error_timeout_round_trips_without_double_prefix() {
+        let orig = MimikyuError::Timeout {
+            timeout_ms: 250,
+            operation: "wait_text('NOPE')".to_string(),
+        };
+        let wire = DaemonError::from_mimikyu(&orig);
+        assert_eq!(wire.kind, DaemonErrorKind::Timeout);
+        assert_eq!(wire.timeout_ms, Some(250));
+        assert_eq!(wire.message, "operation timed out after 250ms: wait_text('NOPE')");
+
+        let json_str = serde_json::to_string(&wire).unwrap();
+        let decoded: DaemonError = serde_json::from_str(&json_str).unwrap();
+        let roundtrip = decoded.into_mimikyu();
+        match roundtrip {
+            MimikyuError::Timeout {
+                timeout_ms,
+                operation,
+            } => {
+                assert_eq!(timeout_ms, 250);
+                assert_eq!(operation, "wait_text('NOPE')");
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        assert_eq!(
+            DaemonError::from_mimikyu(&orig).into_mimikyu().to_string(),
+            "operation timed out after 250ms: wait_text('NOPE')"
+        );
+
+        // Legacy payload without timeout_ms still unwraps cleanly
+        let legacy: DaemonError = serde_json::from_value(serde_json::json!({
+            "kind": "timeout",
+            "message": "operation timed out after 150ms: wait_idle"
+        }))
+        .unwrap();
+        assert_eq!(
+            legacy.into_mimikyu().to_string(),
+            "operation timed out after 150ms: wait_idle"
+        );
+    }
 }

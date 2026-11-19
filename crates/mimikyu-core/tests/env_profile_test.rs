@@ -873,3 +873,2345 @@ async fn module_worker_immediate_postmessage_chromium() {
 async fn module_worker_immediate_postmessage_firefox() {
     assert_module_worker_immediate_postmessage(EngineKind::Firefox).await;
 }
+
+async fn assert_isolated_world_and_webgl_parity(engine: EngineKind) {
+    let server = TestServer::start().await;
+    let server2 = TestServer::start().await;
+    let pool = VirtualContextPool::launch(LaunchOptions {
+        engine,
+        headless: true,
+        extra_args: if engine == EngineKind::Chromium {
+            vec!["--site-per-process".to_string()]
+        } else {
+            Vec::new()
+        },
+        ..Default::default()
+    })
+    .await
+    .expect("launch virtual pool");
+    let pool_pid = pool.root_session().info().pid.expect("pool pid");
+
+    // 1. VirtualContext WITH PresetKind::Win11 + JP GeoIP: isolated world, main world, OOPIF timezone/locale, and gl.VENDOR/RENDERER
+    let profile = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .build()
+        .expect("win11 JP profile");
+    let vc = pool
+        .create_labeled_context(
+            "iso-parity",
+            ContextOptions {
+                env_profile: Some(profile.clone()),
+                main_world_eval: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create vc");
+    let sess = vc.session();
+
+    let xo_url = server2.localhost_url("/env-probe-frame");
+    sess.navigate(&server.url(&format!("/mixed-xo-host?xo={xo_url}")))
+        .await
+        .expect("navigate");
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let probe_expr = r#"(() => {
+        let gl7936 = null;
+        let gl7937 = null;
+        try {
+            const c = document.createElement('canvas');
+            const gl = c.getContext('webgl2') || c.getContext('webgl') || c.getContext('experimental-webgl');
+            if (gl) {
+                gl7936 = gl.getParameter(7936);
+                gl7937 = gl.getParameter(7937);
+            }
+        } catch {}
+        return {
+            platform: navigator.platform,
+            webdriver: navigator.webdriver,
+            screenW: screen.width,
+            languages: Array.from(navigator.languages || []),
+            timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+            tzOffset: new Date().getTimezoneOffset(),
+            gl7936,
+            gl7937
+        };
+    })()"#;
+
+    let main_val = sess.eval_main_world(probe_expr).await.expect("eval_main_world");
+    let iso_val = sess.eval_isolated(probe_expr).await.expect("eval_isolated");
+
+    assert_eq!(main_val["platform"], profile.platform);
+    assert_eq!(iso_val["platform"], profile.platform);
+    assert_eq!(main_val["webdriver"], false);
+    assert_eq!(iso_val["webdriver"], false);
+    assert_eq!(main_val["screenW"], profile.screen_width);
+    assert_eq!(iso_val["screenW"], profile.screen_width);
+    assert_eq!(main_val["languages"], serde_json::json!(profile.languages));
+    assert_eq!(iso_val["languages"], serde_json::json!(profile.languages));
+    assert_eq!(main_val["timeZone"], "Asia/Tokyo");
+    assert_eq!(iso_val["timeZone"], "Asia/Tokyo");
+    if let Some(ref expected_v) = profile.webgl_vendor {
+        assert_eq!(main_val["gl7936"].as_str(), Some(expected_v.as_str()));
+        assert_eq!(iso_val["gl7936"].as_str(), Some(expected_v.as_str()));
+    }
+    if let Some(ref expected_r) = profile.webgl_renderer {
+        assert_eq!(main_val["gl7937"].as_str(), Some(expected_r.as_str()));
+        assert_eq!(iso_val["gl7937"].as_str(), Some(expected_r.as_str()));
+    }
+
+    // Check OOPIF child frame isolated vs main world parity (including timeZone & tzOffset)
+    let mut xo_frame_id = None;
+    let mut last_frames = Vec::new();
+    for _ in 0..40 {
+        let frames = sess.list_frames().await.expect("list_frames");
+        if let Some(f) = frames
+            .iter()
+            .find(|f| !f.is_main && f.url.contains("/env-probe-frame"))
+        {
+            xo_frame_id = Some(f.frame_id.clone());
+            break;
+        }
+        last_frames = frames;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let xo_frame_id = xo_frame_id
+        .unwrap_or_else(|| panic!("must find OOPIF child frame, frames={last_frames:?}"));
+    let frame_probe = "({ platform: navigator.platform, webdriver: navigator.webdriver, screenW: screen.width, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, tzOffset: new Date().getTimezoneOffset() })";
+    let f_main = sess
+        .eval_main_world_in_frame(frame_probe, Some(&xo_frame_id))
+        .await
+        .expect("eval_main_world_in_frame");
+    let f_iso = sess
+        .eval_isolated_in_frame(frame_probe, Some(&xo_frame_id))
+        .await
+        .expect("eval_isolated_in_frame");
+    assert_eq!(f_main["platform"], profile.platform);
+    assert_eq!(f_iso["platform"], profile.platform);
+    assert_eq!(f_main["webdriver"], false);
+    assert_eq!(f_iso["webdriver"], false);
+    assert_eq!(f_main["screenW"], profile.screen_width);
+    assert_eq!(f_iso["screenW"], profile.screen_width);
+    assert_eq!(f_main["timeZone"], "Asia/Tokyo", "{engine}: OOPIF main-world timeZone mismatch");
+    assert_eq!(f_iso["timeZone"], "Asia/Tokyo", "{engine}: OOPIF isolated-world timeZone mismatch");
+    assert_eq!(f_main["tzOffset"], main_val["tzOffset"], "{engine}: OOPIF tzOffset mismatch");
+    assert_eq!(f_iso["tzOffset"], main_val["tzOffset"], "{engine}: OOPIF isolated tzOffset mismatch");
+
+    // Dynamic set_env_overrides while OOPIF is attached must also update OOPIF timezone
+    let de_profile = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("DE")
+        .expect("geoip DE")
+        .build()
+        .expect("win11 DE profile");
+    sess.set_env_overrides(de_profile)
+        .await
+        .expect("update env_overrides to DE");
+    let f_tz_after = sess
+        .eval_isolated_in_frame(
+            "Intl.DateTimeFormat().resolvedOptions().timeZone",
+            Some(&xo_frame_id),
+        )
+        .await
+        .expect("eval OOPIF timeZone after set_env_overrides");
+    assert_eq!(
+        f_tz_after, "Europe/Berlin",
+        "{engine}: OOPIF timeZone must update after set_env_overrides"
+    );
+
+    // 2. VirtualContext WITHOUT env_profile: Chromium must keep navigator.webdriver == false in both worlds
+    if engine == EngineKind::Chromium {
+        let vc_plain = pool
+            .create_labeled_context(
+                "plain-vc",
+                ContextOptions {
+                    main_world_eval: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create plain vc");
+        vc_plain
+            .session()
+            .navigate(&server.url("/isolation"))
+            .await
+            .expect("nav plain");
+        assert_eq!(
+            vc_plain
+                .session()
+                .eval_main_world("navigator.webdriver")
+                .await
+                .unwrap(),
+            false
+        );
+        assert_eq!(
+            vc_plain
+                .session()
+                .eval_isolated("navigator.webdriver")
+                .await
+                .unwrap(),
+            false
+        );
+        vc_plain.dispose().await.expect("dispose plain vc");
+    }
+
+    vc.dispose().await.expect("dispose vc");
+    pool.shutdown().await.expect("shutdown pool");
+    assert_pgid_gone(pool_pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn isolated_world_and_oopif_env_profile_and_webdriver_parity_chromium() {
+    assert_isolated_world_and_webgl_parity(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn isolated_world_and_oopif_env_profile_and_webdriver_parity_firefox() {
+    assert_isolated_world_and_webgl_parity(EngineKind::Firefox).await;
+}
+
+async fn assert_no_auth_ipv6_ephemeral_proxy(engine: EngineKind) {
+    let server = TestServer::start().await;
+    let http_proxy = LocalHttpProxy::start_ipv6(None).await;
+    let socks_proxy = LocalSocks5Proxy::start_ipv6(None).await;
+
+    let http_sess = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            proxy: Some(ProxyConfig {
+                server: http_proxy.proxy_url(),
+                username: None,
+                password: None,
+                bypass: Vec::new(),
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("launch EphemeralDir with unauthenticated IPv6 HTTP proxy");
+    let http_pid = http_sess.info().pid.expect("pid");
+    let nav_http = http_sess
+        .navigate(&server.url("/echo-env"))
+        .await
+        .expect("navigate via IPv6 HTTP proxy in EphemeralDir");
+    assert_eq!(nav_http.status, Some(200));
+    assert!(
+        !http_proxy.hits().is_empty(),
+        "{engine}: expected IPv6 LocalHttpProxy hits in EphemeralDir"
+    );
+    http_sess.dispose().await.expect("dispose http_sess");
+    assert_pgid_gone(http_pid as libc::pid_t);
+
+    let socks_sess = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            proxy: Some(ProxyConfig {
+                server: socks_proxy.socks5h_url(),
+                username: None,
+                password: None,
+                bypass: Vec::new(),
+            }),
+            ..Default::default()
+        })
+        .await
+        .expect("launch EphemeralDir with unauthenticated IPv6 socks5h proxy");
+    let socks_pid = socks_sess.info().pid.expect("pid");
+    let nav_socks = socks_sess
+        .navigate(&server.url("/echo-env"))
+        .await
+        .expect("navigate via IPv6 socks5h proxy in EphemeralDir");
+    assert_eq!(nav_socks.status, Some(200));
+    assert!(
+        !socks_proxy.hits().is_empty(),
+        "{engine}: expected IPv6 LocalSocks5Proxy hits in EphemeralDir"
+    );
+    socks_sess.dispose().await.expect("dispose socks_sess");
+    assert_pgid_gone(socks_pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn no_auth_ipv6_ephemeral_proxy_chromium() {
+    assert_no_auth_ipv6_ephemeral_proxy(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn no_auth_ipv6_ephemeral_proxy_firefox() {
+    assert_no_auth_ipv6_ephemeral_proxy(EngineKind::Firefox).await;
+}
+
+async fn assert_worker_extra_headers_and_relative_urls_with_env_profile(engine: EngineKind) {
+    let server = TestServer::start().await;
+
+    let profile = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .extra_header("X-Worker-Extra", "wk-999")
+        .build()
+        .expect("valid win11 JP profile with extra header");
+
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            env_profile: Some(profile),
+            ..Default::default()
+        })
+        .await
+        .expect("launch with env_profile + extra_header");
+    let pid = session.info().pid.expect("pid");
+
+    session
+        .navigate(&server.url("/worker-rel-page"))
+        .await
+        .expect("navigate /worker-rel-page");
+
+    let mut out = serde_json::Value::Null;
+    for _ in 0..100 {
+        let val = session
+            .eval_isolated(
+                r#"(() => {
+                    const c = document.getElementById('classic-out')?.textContent || '';
+                    const m = document.getElementById('module-out')?.textContent || '';
+                    const s = document.getElementById('shared-out')?.textContent || '';
+                    if (!c || !m || !s) return null;
+                    return { classic: JSON.parse(c), module: JSON.parse(m), shared: JSON.parse(s) };
+                })()"#,
+            )
+            .await
+            .expect("poll worker-rel outputs");
+        if !val.is_null() {
+            out = val;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !out.is_null(),
+        "{engine}: timed out waiting for /worker-rel-page outputs"
+    );
+
+    let classic = &out["classic"];
+    assert!(
+        classic["error"].is_null(),
+        "{engine}: classic worker relative URL/fetch failed: {classic:?}"
+    );
+    assert_eq!(classic["helperLoaded"], "classic-rel-helper-ok");
+    assert_eq!(classic["locHref"], server.url("/sub/worker-rel-test.js"));
+    assert_eq!(classic["locPathname"], "/sub/worker-rel-test.js");
+    assert_eq!(classic["relResolved"], server.url("/sub/sibling.json"));
+    assert_eq!(
+        classic["relFromLocObj"],
+        server.url("/sub/sibling.json"),
+        "{engine}: new URL('./sibling.json', self.location) mismatch: {classic:?}"
+    );
+    assert_eq!(
+        classic["relFetch"]["x-worker-extra"], "wk-999",
+        "{engine}: classic worker relative fetch() missing X-Worker-Extra: {classic:?}"
+    );
+    assert_eq!(
+        classic["reqFetch"]["x-worker-extra"], "wk-999",
+        "{engine}: classic worker fetch(new Request('../echo-env')) missing X-Worker-Extra: {classic:?}"
+    );
+    assert_eq!(
+        classic["xhrEcho"]["x-worker-extra"], "wk-999",
+        "{engine}: classic worker relative XHR missing X-Worker-Extra: {classic:?}"
+    );
+
+    let module = &out["module"];
+    assert!(
+        module["error"].is_null(),
+        "{engine}: module worker relative URL/fetch failed: {module:?}"
+    );
+    assert_eq!(module["locHref"], server.url("/sub/worker-rel-test.mjs"));
+    assert_eq!(module["metaUrl"], server.url("/sub/worker-rel-test.mjs"));
+    assert_eq!(module["relResolved"], server.url("/sub/sibling.json"));
+    assert_eq!(
+        module["relFetch"]["x-worker-extra"], "wk-999",
+        "{engine}: module worker relative fetch() missing X-Worker-Extra: {module:?}"
+    );
+    assert_eq!(
+        module["reqFetch"]["x-worker-extra"], "wk-999",
+        "{engine}: module worker fetch(new Request('../echo-env')) missing X-Worker-Extra: {module:?}"
+    );
+
+    let shared = &out["shared"];
+    if shared["unsupported"] != true {
+        assert!(
+            shared["error"].is_null(),
+            "{engine}: shared worker error: {shared:?}"
+        );
+        assert_eq!(shared["locHref"], server.url("/sub/worker-shared-rel.js"));
+        assert_eq!(shared["relFromLocObj"], server.url("/sub/sibling.json"));
+    }
+
+    // Dynamic set_env_overrides while worker is running must update X-Worker-Extra
+    let updated_profile = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .extra_header("X-Worker-Extra", "wk-updated-42")
+        .build()
+        .expect("valid updated profile");
+    session
+        .set_env_overrides(updated_profile)
+        .await
+        .expect("set_env_overrides on running worker");
+    session
+        .eval_isolated("document.getElementById('ping-worker').click()")
+        .await
+        .expect("click ping-worker");
+    let mut dyn_out = serde_json::Value::Null;
+    for _ in 0..80 {
+        let val = session
+            .eval_isolated(
+                "(() => { const t = document.getElementById('dyn-out')?.textContent || ''; return t ? JSON.parse(t) : null; })()",
+            )
+            .await
+            .expect("poll dyn-out");
+        if !val.is_null() {
+            dyn_out = val;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !dyn_out.is_null(),
+        "{engine}: timed out waiting for dyn-out"
+    );
+    assert_eq!(
+        dyn_out["dynFetch"]["x-worker-extra"], "wk-updated-42",
+        "{engine}: running worker did not pick up updated X-Worker-Extra after set_env_overrides: {dyn_out:?}"
+    );
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn worker_extra_headers_and_relative_urls_with_env_profile_chromium() {
+    assert_worker_extra_headers_and_relative_urls_with_env_profile(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn worker_extra_headers_and_relative_urls_with_env_profile_firefox() {
+    assert_worker_extra_headers_and_relative_urls_with_env_profile(EngineKind::Firefox).await;
+}
+
+async fn assert_nested_worker_and_srcdoc_iframe_worker(engine: EngineKind) {
+    let server = TestServer::start().await;
+
+    let profile = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .extra_header("X-Worker-Extra", "wk-nested-77")
+        .build()
+        .expect("valid win11 JP profile with extra header");
+
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            env_profile: Some(profile.clone()),
+            ..Default::default()
+        })
+        .await
+        .expect("launch with env_profile + extra_header");
+    let pid = session.info().pid.expect("pid");
+
+    session
+        .navigate(&server.url("/nested-worker-page"))
+        .await
+        .expect("navigate /nested-worker-page");
+
+    let mut out = serde_json::Value::Null;
+    for _ in 0..120 {
+        let val = session
+            .eval_isolated(
+                r#"(() => {
+                    const n = document.getElementById('nested-out')?.textContent || '';
+                    const s = document.getElementById('srcdoc-out')?.textContent || '';
+                    if (!n || !s) return null;
+                    return { nested: JSON.parse(n), srcdoc: JSON.parse(s) };
+                })()"#,
+            )
+            .await
+            .expect("poll nested-worker-page outputs");
+        if !val.is_null() {
+            out = val;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !out.is_null(),
+        "{engine}: timed out waiting for /nested-worker-page outputs"
+    );
+
+    let nested = &out["nested"];
+    assert_eq!(nested["outerHref"], server.url("/sub/outer-worker.js"));
+    assert_eq!(nested["outerHc"], profile.hardware_concurrency);
+
+    for key in ["rel", "rootRel", "abs"] {
+        let item = &nested[key];
+        assert_eq!(item["ok"], true, "{engine} nested[{key}] failed: {item:?}");
+        let d = &item["data"];
+        assert_eq!(d["href"], server.url("/sub/inner-worker.js"), "{engine} nested[{key}]: {d:?}");
+        assert_eq!(d["hc"], profile.hardware_concurrency, "{engine} nested[{key}]: {d:?}");
+        assert_eq!(d["platform"], profile.platform, "{engine} nested[{key}]: {d:?}");
+        assert_eq!(d["ua"], profile.user_agent, "{engine} nested[{key}]: {d:?}");
+        assert_eq!(d["tz"], "Asia/Tokyo", "{engine} nested[{key}]: {d:?}");
+        assert_eq!(d["xExtra"], "wk-nested-77", "{engine} nested[{key}]: {d:?}");
+    }
+
+    let mod_item = &nested["mod"];
+    assert_eq!(mod_item["ok"], true, "{engine} nested[mod] failed: {mod_item:?}");
+    let md = &mod_item["data"];
+    assert_eq!(md["href"], server.url("/sub/inner-mod.mjs"), "{engine} nested[mod]: {md:?}");
+    assert_eq!(md["metaUrl"], server.url("/sub/inner-mod.mjs"), "{engine} nested[mod]: {md:?}");
+    assert_eq!(md["hc"], profile.hardware_concurrency, "{engine} nested[mod]: {md:?}");
+    assert_eq!(md["platform"], profile.platform, "{engine} nested[mod]: {md:?}");
+    assert_eq!(md["ua"], profile.user_agent, "{engine} nested[mod]: {md:?}");
+    assert_eq!(md["tz"], "Asia/Tokyo", "{engine} nested[mod]: {md:?}");
+    assert_eq!(md["xExtra"], "wk-nested-77", "{engine} nested[mod]: {md:?}");
+
+    let l2 = &nested["l2"];
+    assert_eq!(l2["ok"], true, "{engine} nested[l2] failed: {l2:?}");
+    assert_eq!(l2["data"]["l2Href"], server.url("/sub/inner-worker-l2.js"));
+    assert_eq!(l2["data"]["l2Hc"], profile.hardware_concurrency);
+    let l2_inner = &l2["data"]["inner"];
+    assert_eq!(l2_inner["href"], server.url("/sub/inner-worker.js"), "{engine} l2 inner: {l2_inner:?}");
+    assert_eq!(l2_inner["hc"], profile.hardware_concurrency, "{engine} l2 inner: {l2_inner:?}");
+    assert_eq!(l2_inner["platform"], profile.platform, "{engine} l2 inner: {l2_inner:?}");
+    assert_eq!(l2_inner["ua"], profile.user_agent, "{engine} l2 inner: {l2_inner:?}");
+    assert_eq!(l2_inner["tz"], "Asia/Tokyo", "{engine} l2 inner: {l2_inner:?}");
+    assert_eq!(l2_inner["xExtra"], "wk-nested-77", "{engine} l2 inner: {l2_inner:?}");
+
+    let srcdoc = &out["srcdoc"];
+    assert!(srcdoc["error"].is_null(), "{engine} srcdoc worker error: {srcdoc:?}");
+    assert_eq!(srcdoc["href"], server.url("/sub/inner-worker.js"), "{engine} srcdoc: {srcdoc:?}");
+    assert_eq!(srcdoc["hc"], profile.hardware_concurrency, "{engine} srcdoc: {srcdoc:?}");
+    assert_eq!(srcdoc["platform"], profile.platform, "{engine} srcdoc: {srcdoc:?}");
+    assert_eq!(srcdoc["ua"], profile.user_agent, "{engine} srcdoc: {srcdoc:?}");
+    assert_eq!(srcdoc["tz"], "Asia/Tokyo", "{engine} srcdoc: {srcdoc:?}");
+    assert_eq!(srcdoc["xExtra"], "wk-nested-77", "{engine} srcdoc: {srcdoc:?}");
+
+    // Dynamic set_env_overrides must also update running L2 nested worker
+    let updated_profile = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .extra_header("X-Worker-Extra", "wk-nested-updated")
+        .build()
+        .expect("valid updated profile");
+    session
+        .set_env_overrides(updated_profile)
+        .await
+        .expect("set_env_overrides on running nested workers");
+    session
+        .eval_isolated("document.getElementById('ping-nested').click()")
+        .await
+        .expect("click ping-nested");
+
+    let mut dyn_out = serde_json::Value::Null;
+    for _ in 0..80 {
+        let val = session
+            .eval_isolated(
+                "(() => { const t = document.getElementById('nested-dyn-out')?.textContent || ''; return t ? JSON.parse(t) : null; })()",
+            )
+            .await
+            .expect("poll nested-dyn-out");
+        if !val.is_null() {
+            dyn_out = val;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !dyn_out.is_null(),
+        "{engine}: timed out waiting for nested-dyn-out"
+    );
+    assert_eq!(
+        dyn_out["dynInner"]["xExtra"], "wk-nested-updated",
+        "{engine}: nested L2 worker did not pick up updated X-Worker-Extra: {dyn_out:?}"
+    );
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn nested_worker_and_srcdoc_iframe_worker_with_env_profile_chromium() {
+    assert_nested_worker_and_srcdoc_iframe_worker(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn nested_worker_and_srcdoc_iframe_worker_with_env_profile_firefox() {
+    assert_nested_worker_and_srcdoc_iframe_worker(EngineKind::Firefox).await;
+}
+
+async fn assert_window_open_popup_preserves_env_and_network(engine: EngineKind) {
+    use mimikyu_core::driver::{ContextOptions, RouteAction, RouteMock};
+    use mimikyu_core::isolation::VirtualContextPool;
+    use std::collections::BTreeMap;
+
+    let server = TestServer::start().await;
+
+    let profile = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .extra_header("X-Probe-Hdr", "pop1")
+        .build()
+        .expect("valid win11 JP profile with extra header");
+
+    let pool = VirtualContextPool::launch(LaunchOptions {
+        engine,
+        headless: true,
+        ..Default::default()
+    })
+    .await
+    .expect("launch pool");
+    let pool_pid = pool.root_session().info().pid.expect("pool pid");
+
+    let vc = pool
+        .create_labeled_context(
+            "popup-env-vc",
+            ContextOptions {
+                env_profile: Some(profile.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create vc");
+
+    vc.session()
+        .set_blocked_urls(vec!["*blocked-pop*".to_string()])
+        .await
+        .expect("set_blocked_urls");
+
+    let mut mock_hdrs = BTreeMap::new();
+    mock_hdrs.insert("content-type".to_string(), "application/json".to_string());
+    mock_hdrs.insert("access-control-allow-origin".to_string(), "*".to_string());
+    vc.session()
+        .set_route_mock(RouteMock {
+            id: "popup-mock-1".to_string(),
+            url_pattern: "*mock-pop-pre*".to_string(),
+            action: RouteAction::Fulfill {
+                status: 200,
+                headers: mock_hdrs.clone(),
+                body: br#"{"mocked":true,"phase":"pre"}"#.to_vec(),
+            },
+        })
+        .await
+        .expect("set_route_mock");
+
+    vc.session()
+        .navigate(&server.url("/popup-probe-host"))
+        .await
+        .expect("navigate /popup-probe-host");
+
+    // 1. Synchronous window.open('about:blank')
+    vc.session()
+        .eval_isolated("document.getElementById('open-blank-popup').click()")
+        .await
+        .expect("click open-blank-popup");
+    let blank_out = vc
+        .session()
+        .eval_isolated("JSON.parse(document.getElementById('blank-popup-out').textContent)")
+        .await
+        .expect("read blank-popup-out");
+    assert_eq!(
+        blank_out["platform"], profile.platform,
+        "{engine}: window.open('about:blank') platform mismatch: {blank_out:?}"
+    );
+    assert_eq!(
+        blank_out["hc"], profile.hardware_concurrency,
+        "{engine}: window.open('about:blank') hc mismatch: {blank_out:?}"
+    );
+    assert_eq!(
+        blank_out["ua"], profile.user_agent,
+        "{engine}: window.open('about:blank') ua mismatch: {blank_out:?}"
+    );
+    assert_eq!(
+        blank_out["tz"], "Asia/Tokyo",
+        "{engine}: window.open('about:blank') tz mismatch: {blank_out:?}"
+    );
+
+    // 2. window.open('/popup-probe-child')
+    server.reset_hits();
+    vc.session()
+        .eval_isolated("document.getElementById('open-popup').click()")
+        .await
+        .expect("click open-popup");
+
+    let mut child_out = serde_json::Value::Null;
+    for _ in 0..120 {
+        let val = vc
+            .session()
+            .eval_isolated(
+                "(() => { const t = document.getElementById('popup-out')?.textContent || ''; return t ? JSON.parse(t) : null; })()",
+            )
+            .await
+            .expect("poll popup-out");
+        if !val.is_null() {
+            child_out = val;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !child_out.is_null(),
+        "{engine}: timed out waiting for popup-out"
+    );
+    assert_eq!(
+        child_out["syncNav"]["platform"], profile.platform,
+        "{engine}: popup platform mismatch: {child_out:?}"
+    );
+    assert_eq!(
+        child_out["syncNav"]["hc"], profile.hardware_concurrency,
+        "{engine}: popup hc mismatch: {child_out:?}"
+    );
+    assert_eq!(
+        child_out["syncNav"]["ua"], profile.user_agent,
+        "{engine}: popup ua mismatch: {child_out:?}"
+    );
+    assert_eq!(
+        child_out["syncNav"]["tz"], "Asia/Tokyo",
+        "{engine}: popup tz mismatch: {child_out:?}"
+    );
+    assert_eq!(
+        child_out["xHdr"], "pop1",
+        "{engine}: popup extra header missing: {child_out:?}"
+    );
+    assert_eq!(
+        child_out["reqUa"], profile.user_agent,
+        "{engine}: popup HTTP User-Agent mismatch: {child_out:?}"
+    );
+    assert_eq!(
+        child_out["mocked"]["mocked"], true,
+        "{engine}: popup RouteMock missed: {child_out:?}"
+    );
+    assert_eq!(
+        child_out["blockedOk"], false,
+        "{engine}: popup blocked URL succeeded: {child_out:?}"
+    );
+    let hits = server.hits();
+    assert!(
+        !hits.iter().any(|h| h.contains("/blocked-pop.js")),
+        "{engine}: popup /blocked-pop.js hit server: {hits:?}"
+    );
+    assert!(
+        !hits.iter().any(|h| h.contains("/api/mock-pop-pre")),
+        "{engine}: popup /api/mock-pop-pre hit server: {hits:?}"
+    );
+
+    // 3. Dynamic update while popup is open (extra_headers + RouteMock)
+    let updated_profile = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .extra_header("X-Probe-Hdr", "pop2-dyn")
+        .build()
+        .expect("valid updated profile");
+    vc.session()
+        .set_env_overrides(updated_profile)
+        .await
+        .expect("dynamic set_env_overrides");
+    vc.session()
+        .set_route_mock(RouteMock {
+            id: "popup-mock-dyn".to_string(),
+            url_pattern: "*mock-pop-dyn*".to_string(),
+            action: RouteAction::Fulfill {
+                status: 200,
+                headers: mock_hdrs,
+                body: br#"{"mocked":true,"phase":"dyn"}"#.to_vec(),
+            },
+        })
+        .await
+        .expect("dynamic set_route_mock");
+    vc.session()
+        .eval_isolated("document.getElementById('ping-popup').click()")
+        .await
+        .expect("click ping-popup");
+    let mut dyn_out = serde_json::Value::Null;
+    for _ in 0..80 {
+        let val = vc
+            .session()
+            .eval_isolated(
+                "(() => { const t = document.getElementById('popup-dyn-out')?.textContent || ''; return t ? JSON.parse(t) : null; })()",
+            )
+            .await
+            .expect("poll popup-dyn-out");
+        if !val.is_null() {
+            dyn_out = val;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !dyn_out.is_null(),
+        "{engine}: timed out waiting for popup-dyn-out"
+    );
+    assert_eq!(
+        dyn_out["xHdr"], "pop2-dyn",
+        "{engine}: popup did not receive dynamic X-Probe-Hdr: {dyn_out:?}"
+    );
+    assert_eq!(
+        dyn_out["dynMock"]["phase"], "dyn",
+        "{engine}: popup did not receive dynamic RouteMock: {dyn_out:?}"
+    );
+
+    // 4. Nested window.open() from inside the popup
+    vc.session()
+        .eval_isolated("document.getElementById('trigger-grandchild').click()")
+        .await
+        .expect("click trigger-grandchild");
+    let mut gc_out = serde_json::Value::Null;
+    for _ in 0..120 {
+        let val = vc
+            .session()
+            .eval_isolated(
+                "(() => { const t = document.getElementById('grandchild-out')?.textContent || ''; return t ? JSON.parse(t) : null; })()",
+            )
+            .await
+            .expect("poll grandchild-out");
+        if !val.is_null() {
+            gc_out = val;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !gc_out.is_null(),
+        "{engine}: timed out waiting for grandchild-out"
+    );
+    assert_eq!(
+        gc_out["platform"], profile.platform,
+        "{engine}: grandchild popup platform mismatch: {gc_out:?}"
+    );
+    assert_eq!(
+        gc_out["hc"], profile.hardware_concurrency,
+        "{engine}: grandchild popup hc mismatch: {gc_out:?}"
+    );
+    assert_eq!(
+        gc_out["ua"], profile.user_agent,
+        "{engine}: grandchild popup ua mismatch: {gc_out:?}"
+    );
+    assert_eq!(
+        gc_out["tz"], "Asia/Tokyo",
+        "{engine}: grandchild popup tz mismatch: {gc_out:?}"
+    );
+    assert_eq!(
+        gc_out["xHdr"], "pop2-dyn",
+        "{engine}: grandchild popup xHdr mismatch: {gc_out:?}"
+    );
+    assert_eq!(
+        gc_out["mocked"]["mocked"], true,
+        "{engine}: grandchild popup RouteMock missed: {gc_out:?}"
+    );
+
+    vc.dispose().await.expect("dispose vc");
+    pool.shutdown().await.expect("shutdown pool");
+    assert_pgid_gone(pool_pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn window_open_popup_preserves_env_and_network_chromium() {
+    assert_window_open_popup_preserves_env_and_network(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn window_open_popup_preserves_env_and_network_firefox() {
+    assert_window_open_popup_preserves_env_and_network(EngineKind::Firefox).await;
+}
+
+async fn assert_sync_about_blank_iframe_env_and_worker_parity(engine: EngineKind) {
+    use mimikyu_core::driver::ContextOptions;
+    use mimikyu_core::isolation::VirtualContextPool;
+
+    let server = TestServer::start().await;
+    let server2 = TestServer::start().await;
+
+    let profile = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .extra_header("X-Worker-Extra", "sync-iframe-1")
+        .build()
+        .expect("valid win11 JP profile with extra header");
+
+    let pool = VirtualContextPool::launch(LaunchOptions {
+        engine,
+        headless: true,
+        ..Default::default()
+    })
+    .await
+    .expect("launch pool");
+    let pool_pid = pool.root_session().info().pid.expect("pool pid");
+
+    let vc = pool
+        .create_labeled_context(
+            "sync-blank-iframe-vc",
+            ContextOptions {
+                env_profile: Some(profile.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create vc");
+
+    let xo_url = server2.localhost_url("/target");
+    vc.session()
+        .navigate(&server.url(&format!("/sync-blank-iframe-host?xo={xo_url}")))
+        .await
+        .expect("navigate /sync-blank-iframe-host");
+
+    let iframe_out = vc
+        .session()
+        .eval_isolated("JSON.parse(document.getElementById('sync-iframe-out').textContent)")
+        .await
+        .expect("read sync-iframe-out");
+    assert_eq!(iframe_out["xoAccessible"], true);
+
+    for (label, node) in [
+        ("about:blank", &iframe_out["syncNav"]),
+        ("nested about:blank", &iframe_out["nestedNav"]),
+    ] {
+        assert_eq!(
+            node["platform"], profile.platform,
+            "{engine} ({label}): navigator.platform leaked: {node:?}"
+        );
+        assert_eq!(
+            node["hc"], profile.hardware_concurrency,
+            "{engine} ({label}): navigator.hardwareConcurrency leaked: {node:?}"
+        );
+        assert_eq!(
+            node["ua"], profile.user_agent,
+            "{engine} ({label}): navigator.userAgent leaked: {node:?}"
+        );
+        assert_eq!(
+            node["tz"], "Asia/Tokyo",
+            "{engine} ({label}): timezone leaked: {node:?}"
+        );
+    }
+
+    let mut worker_out = serde_json::Value::Null;
+    for _ in 0..120 {
+        let val = vc
+            .session()
+            .eval_isolated(
+                r#"(() => {
+                    const a = document.getElementById('sync-worker-out')?.textContent || '';
+                    const b = document.getElementById('nested-worker-out')?.textContent || '';
+                    if (!a || !b) return null;
+                    return { a: JSON.parse(a), b: JSON.parse(b) };
+                })()"#,
+            )
+            .await
+            .expect("poll sync-worker-out");
+        if !val.is_null() {
+            worker_out = val;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        !worker_out.is_null(),
+        "{engine}: timed out waiting for sync-worker-out"
+    );
+
+    for (label, w) in [("about:blank", &worker_out["a"]), ("nested about:blank", &worker_out["b"])] {
+        assert!(w["error"].is_null(), "{engine} ({label}) worker error: {w:?}");
+        assert_eq!(
+            w["platform"], profile.platform,
+            "{engine} ({label}) worker platform leaked: {w:?}"
+        );
+        assert_eq!(
+            w["hc"], profile.hardware_concurrency,
+            "{engine} ({label}) worker hc leaked: {w:?}"
+        );
+        assert_eq!(
+            w["ua"], profile.user_agent,
+            "{engine} ({label}) worker ua leaked: {w:?}"
+        );
+        assert_eq!(
+            w["tz"], "Asia/Tokyo",
+            "{engine} ({label}) worker tz leaked: {w:?}"
+        );
+        assert_eq!(
+            w["xExtra"], "sync-iframe-1",
+            "{engine} ({label}) worker extra header missing: {w:?}"
+        );
+    }
+
+    vc.dispose().await.expect("dispose vc");
+    pool.shutdown().await.expect("shutdown pool");
+    assert_pgid_gone(pool_pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn sync_about_blank_iframe_env_and_worker_parity_chromium() {
+    assert_sync_about_blank_iframe_env_and_worker_parity(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn sync_about_blank_iframe_env_and_worker_parity_firefox() {
+    assert_sync_about_blank_iframe_env_and_worker_parity(EngineKind::Firefox).await;
+}
+
+async fn click_element_real_mouse(session: &dyn DriverSession, selector: &str) {
+    use mimikyu_core::driver::{MouseButton, MouseEvent, MouseEventType};
+
+    let box_rect = session
+        .resolve_selector_box(selector)
+        .await
+        .expect("resolve_selector_box");
+    let (cx, cy) = box_rect.center();
+    session
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Move,
+            x: cx,
+            y: cy,
+            button: MouseButton::None,
+            click_count: 0,
+            modifiers: 0,
+        })
+        .await
+        .expect("mouse move");
+    session
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Down,
+            x: cx,
+            y: cy,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("mouse down");
+    session
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Up,
+            x: cx,
+            y: cy,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("mouse up");
+}
+
+async fn assert_target_blank_links_preserve_env_and_network_virtual(engine: EngineKind) {
+    use std::collections::BTreeMap;
+    use mimikyu_core::driver::{RouteAction, RouteMock};
+
+    let server = TestServer::start().await;
+    let profile = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .extra_header("X-Probe-Hdr", "tb-vc")
+        .build()
+        .expect("valid profile");
+
+    let pool = VirtualContextPool::launch(LaunchOptions {
+        engine,
+        headless: true,
+        ..Default::default()
+    })
+    .await
+    .expect("launch pool");
+    let pool_pid = pool.root_session().info().pid.expect("pool pid");
+
+    let vc = pool
+        .create_labeled_context(
+            "target-blank-vc",
+            ContextOptions {
+                env_profile: Some(profile.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create vc");
+
+    vc.session()
+        .set_blocked_urls(vec!["*blocked-pop*".to_string()])
+        .await
+        .expect("set_blocked_urls");
+    let mut mock_hdrs = BTreeMap::new();
+    mock_hdrs.insert("content-type".to_string(), "application/json".to_string());
+    mock_hdrs.insert("access-control-allow-origin".to_string(), "*".to_string());
+    vc.session()
+        .set_route_mock(RouteMock {
+            id: "tb-vc-mock".to_string(),
+            url_pattern: "*mock-pop-pre*".to_string(),
+            action: RouteAction::Fulfill {
+                status: 200,
+                headers: mock_hdrs,
+                body: br#"{"mocked":true,"phase":"tb-vc"}"#.to_vec(),
+            },
+        })
+        .await
+        .expect("set_route_mock");
+
+    vc.session()
+        .navigate(&server.url("/target-blank-host"))
+        .await
+        .expect("navigate /target-blank-host");
+
+    click_element_real_mouse(vc.session().as_ref(), "#lnk-blank").await;
+
+    let mut blank_out = serde_json::Value::Null;
+    for _ in 0..120 {
+        let val = vc
+            .session()
+            .eval_isolated(
+                r#"(() => {
+                    const a = document.getElementById('tb-blank')?.textContent || localStorage.getItem('tb_blank') || '';
+                    return a ? JSON.parse(a) : null;
+                })()"#,
+            )
+            .await
+            .expect("poll tb-blank");
+        if !val.is_null() {
+            blank_out = val;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(!blank_out.is_null(), "{engine}: timed out waiting for <a target=_blank>");
+
+    click_element_real_mouse(vc.session().as_ref(), "#lnk-noopener").await;
+
+    let mut noopener_out = serde_json::Value::Null;
+    for _ in 0..120 {
+        let val = vc
+            .session()
+            .eval_isolated(
+                r#"(() => {
+                    const b = document.getElementById('tb-noopener')?.textContent || localStorage.getItem('tb_noopener') || '';
+                    return b ? JSON.parse(b) : null;
+                })()"#,
+            )
+            .await
+            .expect("poll tb-noopener");
+        if !val.is_null() {
+            noopener_out = val;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    if noopener_out.is_null() {
+        let tabs = vc.session().list_tabs().await.unwrap_or_default();
+        let hits = server.hits();
+        panic!("{engine}: timed out waiting for <a target=_blank rel=noopener>; tabs={tabs:?}, hits={hits:?}");
+    }
+    let out = serde_json::json!({ "blank": blank_out, "noopener": noopener_out });
+
+    let tabs = vc.session().list_tabs().await.expect("list_tabs");
+    assert!(
+        tabs.iter().any(|t| t.url.contains("/target-blank-child?tag=blank")),
+        "{engine}: missing navigated target=_blank tab in {tabs:?}"
+    );
+    assert!(
+        tabs.iter()
+            .any(|t| t.url.contains("/target-blank-child?tag=noopener")),
+        "{engine}: missing navigated rel=noopener tab in {tabs:?}"
+    );
+    assert!(
+        !tabs.iter().any(|t| t.url.is_empty()),
+        "{engine}: popup tab frozen at empty url: {tabs:?}"
+    );
+
+    for (tag, node) in [("blank", &out["blank"]), ("noopener", &out["noopener"])] {
+        assert_eq!(node["syncNav"]["platform"], profile.platform, "{engine} {tag}: {node:?}");
+        assert_eq!(node["syncNav"]["hc"], profile.hardware_concurrency, "{engine} {tag}: {node:?}");
+        assert_eq!(node["syncNav"]["ua"], profile.user_agent, "{engine} {tag}: {node:?}");
+        assert_eq!(node["syncNav"]["tz"], "Asia/Tokyo", "{engine} {tag}: {node:?}");
+        assert_eq!(node["xHdr"], "tb-vc", "{engine} {tag}: {node:?}");
+        assert_eq!(node["reqUa"], profile.user_agent, "{engine} {tag}: {node:?}");
+        assert_eq!(node["mocked"]["phase"], "tb-vc", "{engine} {tag}: {node:?}");
+        assert_eq!(node["blockedOk"], false, "{engine} {tag}: {node:?}");
+    }
+    assert_eq!(out["noopener"]["syncNav"]["hasOpener"], false);
+
+    let req_hdrs = server.request_headers();
+    for path_frag in [
+        "GET /target-blank-child?tag=blank",
+        "GET /target-blank-child?tag=noopener",
+    ] {
+        let (_, hdrs) = req_hdrs
+            .iter()
+            .find(|(req, _)| req == path_frag)
+            .unwrap_or_else(|| panic!("{engine}: missing initial server request {path_frag}"));
+        assert_eq!(
+            hdrs.get("x-probe-hdr").map(String::as_str),
+            Some("tb-vc"),
+            "{engine}: {path_frag} missing X-Probe-Hdr: {hdrs:?}"
+        );
+        assert_eq!(
+            hdrs.get("user-agent").map(String::as_str),
+            Some(profile.user_agent.as_str()),
+            "{engine}: {path_frag} User-Agent mismatch: {hdrs:?}"
+        );
+    }
+
+    let hits = server.hits();
+    assert!(!hits.iter().any(|h| h.contains("/blocked-pop.js")));
+    assert!(!hits.iter().any(|h| h.contains("/api/mock-pop-pre")));
+
+    vc.dispose().await.expect("dispose vc");
+    pool.shutdown().await.expect("shutdown pool");
+    assert_pgid_gone(pool_pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn target_blank_links_preserve_env_and_network_virtual_chromium() {
+    assert_target_blank_links_preserve_env_and_network_virtual(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn target_blank_links_preserve_env_and_network_virtual_firefox() {
+    assert_target_blank_links_preserve_env_and_network_virtual(EngineKind::Firefox).await;
+}
+
+async fn assert_frames_index_and_named_sync_about_blank_iframe_worker(engine: EngineKind) {
+    let server = TestServer::start().await;
+    let profile = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .extra_header("X-Worker-Extra", "frames-idx-1")
+        .build()
+        .expect("valid profile");
+
+    let pool = VirtualContextPool::launch(LaunchOptions {
+        engine,
+        headless: true,
+        ..Default::default()
+    })
+    .await
+    .expect("launch pool");
+    let pool_pid = pool.root_session().info().pid.expect("pool pid");
+
+    let vc = pool
+        .create_labeled_context(
+            "frames-index-vc",
+            ContextOptions {
+                env_profile: Some(profile.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create vc");
+
+    vc.session()
+        .navigate(&server.url("/frames-index-host"))
+        .await
+        .expect("navigate /frames-index-host");
+
+    let out = vc
+        .session()
+        .eval_isolated("JSON.parse(document.getElementById('frames-index-out').textContent)")
+        .await
+        .expect("read frames-index-out");
+
+    for label in ["wf", "wi", "wn", "adj", "nestedDiv"] {
+        let node = &out[label];
+        assert_eq!(node["platform"], profile.platform, "{engine} ({label}): {node:?}");
+        assert_eq!(node["hc"], profile.hardware_concurrency, "{engine} ({label}): {node:?}");
+        assert_eq!(node["ua"], profile.user_agent, "{engine} ({label}): {node:?}");
+        assert_eq!(node["tz"], "Asia/Tokyo", "{engine} ({label}): {node:?}");
+    }
+
+    let mut worker_out = serde_json::Value::Null;
+    for _ in 0..120 {
+        let val = vc
+            .session()
+            .eval_isolated(
+                "(() => { const t = document.getElementById('frames-worker-out')?.textContent || ''; return t ? JSON.parse(t) : null; })()",
+            )
+            .await
+            .expect("poll frames-worker-out");
+        if !val.is_null() {
+            worker_out = val;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(!worker_out.is_null(), "{engine}: timed out waiting for frames-worker-out");
+    assert!(worker_out["error"].is_null(), "{engine}: worker error: {worker_out:?}");
+    assert_eq!(worker_out["platform"], profile.platform, "{engine}: {worker_out:?}");
+    assert_eq!(worker_out["hc"], profile.hardware_concurrency, "{engine}: {worker_out:?}");
+    assert_eq!(worker_out["ua"], profile.user_agent, "{engine}: {worker_out:?}");
+    assert_eq!(worker_out["tz"], "Asia/Tokyo", "{engine}: {worker_out:?}");
+    assert_eq!(worker_out["xExtra"], "frames-idx-1", "{engine}: {worker_out:?}");
+
+    vc.dispose().await.expect("dispose vc");
+    pool.shutdown().await.expect("shutdown pool");
+    assert_pgid_gone(pool_pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn frames_index_and_named_sync_about_blank_iframe_worker_chromium() {
+    assert_frames_index_and_named_sync_about_blank_iframe_worker(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn frames_index_and_named_sync_about_blank_iframe_worker_firefox() {
+    assert_frames_index_and_named_sync_about_blank_iframe_worker(EngineKind::Firefox).await;
+}
+
+async fn assert_dynamic_set_env_overrides_updates_loaded_page_and_iframes(engine: EngineKind) {
+    let server = TestServer::start().await;
+    let win_jp = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .extra_header("X-Worker-Extra", "dyn-phase-1")
+        .build()
+        .expect("valid win11 JP profile");
+    let linux_de = EnvProfileBuilder::from_preset(PresetKind::Linux, engine)
+        .geoip("DE")
+        .expect("geoip DE")
+        .extra_header("X-Worker-Extra", "dyn-phase-2")
+        .build()
+        .expect("valid linux DE profile");
+
+    let pool = VirtualContextPool::launch(LaunchOptions {
+        engine,
+        headless: true,
+        ..Default::default()
+    })
+    .await
+    .expect("launch pool");
+    let pool_pid = pool.root_session().info().pid.expect("pool pid");
+
+    let vc = pool
+        .create_labeled_context(
+            "dyn-override-vc",
+            ContextOptions {
+                env_profile: Some(win_jp.clone()),
+                main_world_eval: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create vc");
+
+    vc.session()
+        .navigate(&server.url("/blank"))
+        .await
+        .expect("navigate /blank");
+
+    let snap_expr = r#"(() => ({
+        platform: navigator.platform,
+        hc: navigator.hardwareConcurrency,
+        ua: navigator.userAgent,
+        tz: Intl.DateTimeFormat().resolvedOptions().timeZone
+    }))()"#;
+
+    let main_before = vc.session().eval_main_world(snap_expr).await.expect("main before");
+    let iso_before = vc.session().eval_isolated(snap_expr).await.expect("iso before");
+    assert_eq!(main_before["platform"], win_jp.platform);
+    assert_eq!(iso_before["platform"], win_jp.platform);
+    assert_eq!(main_before["tz"], "Asia/Tokyo");
+    assert_eq!(iso_before["tz"], "Asia/Tokyo");
+
+    // Append an about:blank iframe BEFORE set_env_overrides
+    let pre_frame = vc
+        .session()
+        .eval_main_world(
+            r#"(() => {
+                const f = document.createElement('iframe');
+                f.id = 'pre-frame';
+                document.body.appendChild(f);
+                const w = f.contentWindow;
+                return {
+                    platform: w.navigator.platform,
+                    ua: w.navigator.userAgent,
+                    tz: new w.Intl.DateTimeFormat().resolvedOptions().timeZone
+                };
+            })()"#,
+        )
+        .await
+        .expect("pre_frame");
+    assert_eq!(pre_frame["platform"], win_jp.platform);
+    assert_eq!(pre_frame["tz"], "Asia/Tokyo");
+
+    // Dynamically switch Win11/JP -> Linux/DE on the already-loaded document
+    vc.session()
+        .set_env_overrides(linux_de.clone())
+        .await
+        .expect("set_env_overrides linux_de");
+
+    let main_after = vc.session().eval_main_world(snap_expr).await.expect("main after");
+    let iso_after = vc.session().eval_isolated(snap_expr).await.expect("iso after");
+    for (world, val) in [("main", &main_after), ("isolated", &iso_after)] {
+        assert_eq!(val["platform"], linux_de.platform, "{engine} ({world}): {val:?}");
+        assert_eq!(val["hc"], linux_de.hardware_concurrency, "{engine} ({world}): {val:?}");
+        assert_eq!(val["ua"], linux_de.user_agent, "{engine} ({world}): {val:?}");
+        assert_eq!(val["tz"], "Europe/Berlin", "{engine} ({world}): {val:?}");
+    }
+
+    // Existing pre-override iframe + newly appended about:blank iframes (via frames[i] and contentWindow)
+    let iframes_after = vc
+        .session()
+        .eval_main_world(
+            r#"(() => {
+                const snap = (w) => ({
+                    platform: w.navigator.platform,
+                    hc: w.navigator.hardwareConcurrency,
+                    ua: w.navigator.userAgent,
+                    tz: new w.Intl.DateTimeFormat().resolvedOptions().timeZone
+                });
+                const pre = document.getElementById('pre-frame').contentWindow;
+                const fIdx = document.createElement('iframe');
+                document.body.appendChild(fIdx);
+                const viaFrames = snap(window.frames[window.frames.length - 1]);
+                const fCw = document.createElement('iframe');
+                document.body.appendChild(fCw);
+                const viaCw = snap(fCw.contentWindow);
+                window.__dynFrameWin = fCw.contentWindow;
+                return { pre: snap(pre), viaFrames, viaCw };
+            })()"#,
+        )
+        .await
+        .expect("iframes_after");
+
+    for (label, node) in [
+        ("pre_frame", &iframes_after["pre"]),
+        ("via_frames_index", &iframes_after["viaFrames"]),
+        ("via_contentWindow", &iframes_after["viaCw"]),
+    ] {
+        assert_eq!(node["platform"], linux_de.platform, "{engine} ({label}): {node:?}");
+        assert_eq!(node["hc"], linux_de.hardware_concurrency, "{engine} ({label}): {node:?}");
+        assert_eq!(node["ua"], linux_de.user_agent, "{engine} ({label}): {node:?}");
+        assert_eq!(node["tz"], "Europe/Berlin", "{engine} ({label}): {node:?}");
+    }
+
+    // Worker spawned from newly appended about:blank iframe after dynamic override
+    let wrk_after = vc
+        .session()
+        .eval_main_world(
+            r#"new Promise((resolve, reject) => {
+                const w = new window.__dynFrameWin.Worker('/sub/inner-worker.js');
+                w.onmessage = (ev) => resolve(ev.data);
+                w.onerror = (err) => reject(new Error(String(err.message || err)));
+            })"#,
+        )
+        .await
+        .expect("worker after dynamic override");
+    assert_eq!(wrk_after["platform"], linux_de.platform, "{engine}: {wrk_after:?}");
+    assert_eq!(wrk_after["hc"], linux_de.hardware_concurrency, "{engine}: {wrk_after:?}");
+    assert_eq!(wrk_after["ua"], linux_de.user_agent, "{engine}: {wrk_after:?}");
+    assert_eq!(wrk_after["tz"], "Europe/Berlin", "{engine}: {wrk_after:?}");
+    assert_eq!(wrk_after["xExtra"], "dyn-phase-2", "{engine}: {wrk_after:?}");
+
+    vc.dispose().await.expect("dispose vc");
+    pool.shutdown().await.expect("shutdown pool");
+    assert_pgid_gone(pool_pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn dynamic_set_env_overrides_updates_loaded_page_and_iframes_chromium() {
+    assert_dynamic_set_env_overrides_updates_loaded_page_and_iframes(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn dynamic_set_env_overrides_updates_loaded_page_and_iframes_firefox() {
+    assert_dynamic_set_env_overrides_updates_loaded_page_and_iframes(EngineKind::Firefox).await;
+}
+
+async fn assert_static_iframe_and_dom_insertion_apis(engine: EngineKind) {
+    let server = TestServer::start().await;
+    let profile = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .extra_header("X-Worker-Extra", "static-dom-1")
+        .build()
+        .expect("valid profile");
+
+    let pool = VirtualContextPool::launch(LaunchOptions {
+        engine,
+        headless: true,
+        ..Default::default()
+    })
+    .await
+    .expect("launch pool");
+    let pool_pid = pool.root_session().info().pid.expect("pool pid");
+
+    let vc = pool
+        .create_labeled_context(
+            "static-dom-vc",
+            ContextOptions {
+                env_profile: Some(profile.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create vc");
+
+    vc.session()
+        .navigate(&server.url("/static-and-dom-frames-host"))
+        .await
+        .expect("navigate /static-and-dom-frames-host");
+
+    let static_out = vc
+        .session()
+        .eval_isolated("JSON.parse(document.getElementById('static-frames-out').textContent)")
+        .await
+        .expect("read static-frames-out");
+
+    for label in ["wf", "wi", "wn"] {
+        let node = &static_out[label];
+        assert_eq!(node["platform"], profile.platform, "{engine} ({label}): {node:?}");
+        assert_eq!(node["hc"], profile.hardware_concurrency, "{engine} ({label}): {node:?}");
+        assert_eq!(node["ua"], profile.user_agent, "{engine} ({label}): {node:?}");
+        assert_eq!(node["tz"], "Asia/Tokyo", "{engine} ({label}): {node:?}");
+    }
+
+    let mut worker_out = serde_json::Value::Null;
+    for _ in 0..120 {
+        let val = vc
+            .session()
+            .eval_isolated(
+                "(() => { const t = document.getElementById('static-worker-out')?.textContent || ''; return t ? JSON.parse(t) : null; })()",
+            )
+            .await
+            .expect("poll static-worker-out");
+        if !val.is_null() {
+            worker_out = val;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(!worker_out.is_null(), "{engine}: timed out waiting for static-worker-out");
+    assert!(worker_out["error"].is_null(), "{engine}: worker error: {worker_out:?}");
+    assert_eq!(worker_out["platform"], profile.platform, "{engine}: {worker_out:?}");
+    assert_eq!(worker_out["hc"], profile.hardware_concurrency, "{engine}: {worker_out:?}");
+    assert_eq!(worker_out["ua"], profile.user_agent, "{engine}: {worker_out:?}");
+    assert_eq!(worker_out["tz"], "Asia/Tokyo", "{engine}: {worker_out:?}");
+    assert_eq!(worker_out["xExtra"], "static-dom-1", "{engine}: {worker_out:?}");
+
+    let dom_out = vc
+        .session()
+        .eval_isolated("JSON.parse(document.getElementById('dom-frames-out').textContent)")
+        .await
+        .expect("read dom-frames-out");
+
+    for label in ["rangeSnap", "repSnap", "srSnap", "unsafeSnap", "srUnsafeSnap"] {
+        let node = &dom_out[label];
+        assert_eq!(node["platform"], profile.platform, "{engine} ({label}): {node:?}");
+        assert_eq!(node["hc"], profile.hardware_concurrency, "{engine} ({label}): {node:?}");
+        assert_eq!(node["ua"], profile.user_agent, "{engine} ({label}): {node:?}");
+        assert_eq!(node["tz"], "Asia/Tokyo", "{engine} ({label}): {node:?}");
+    }
+
+    vc.dispose().await.expect("dispose vc");
+    pool.shutdown().await.expect("shutdown pool");
+    assert_pgid_gone(pool_pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn static_iframe_and_dom_insertion_apis_chromium() {
+    assert_static_iframe_and_dom_insertion_apis(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn static_iframe_and_dom_insertion_apis_firefox() {
+    assert_static_iframe_and_dom_insertion_apis(EngineKind::Firefox).await;
+}
+
+async fn assert_dynamic_set_env_overrides_updates_cross_origin_iframe_default_launch(
+    engine: EngineKind,
+) {
+    let server = TestServer::start().await;
+    let server2 = TestServer::start().await;
+    let win_jp = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .build()
+        .expect("valid win11 JP");
+    let linux_de = EnvProfileBuilder::from_preset(PresetKind::Linux, engine)
+        .geoip("DE")
+        .expect("geoip DE")
+        .build()
+        .expect("valid linux DE");
+
+    // Intentionally use default LaunchOptions (no `--site-per-process` on Chromium)
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            env_profile: Some(win_jp.clone()),
+            main_world_eval: true,
+            ..Default::default()
+        })
+        .await
+        .expect("launch session");
+    let pid = session.info().pid.expect("pid");
+
+    let xo_url = server2.localhost_url("/xo-child");
+    session
+        .navigate(&server.url(&format!("/mixed-xo-host?xo={xo_url}")))
+        .await
+        .expect("navigate /mixed-xo-host");
+
+    let mut xo_fid = None;
+    for _ in 0..80 {
+        let frames = session.list_frames().await.expect("list_frames");
+        if let Some(f) = frames
+            .iter()
+            .find(|f| !f.is_main && f.url.starts_with(&xo_url))
+        {
+            xo_fid = Some(f.frame_id.clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let xo_fid = xo_fid.expect("xo-child frame present");
+
+    let snap_expr = r#"(() => ({
+        platform: navigator.platform,
+        langs: Array.from(navigator.languages || []),
+        ua: navigator.userAgent,
+        tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        uadPlat: navigator.userAgentData ? navigator.userAgentData.platform : null
+    }))()"#;
+
+    let main_before = session
+        .eval_main_world_in_frame(snap_expr, Some(&xo_fid))
+        .await
+        .expect("xo main before");
+    let iso_before = session
+        .eval_isolated_in_frame(snap_expr, Some(&xo_fid))
+        .await
+        .expect("xo iso before");
+    for (world, val) in [("main", &main_before), ("isolated", &iso_before)] {
+        assert_eq!(val["platform"], win_jp.platform, "{engine} before ({world}): {val:?}");
+        assert_eq!(val["langs"][0], "ja-JP", "{engine} before ({world}): {val:?}");
+        assert_eq!(val["ua"], win_jp.user_agent, "{engine} before ({world}): {val:?}");
+        assert_eq!(val["tz"], "Asia/Tokyo", "{engine} before ({world}): {val:?}");
+        if engine == EngineKind::Chromium {
+            assert_eq!(val["uadPlat"], "Windows", "{engine} before ({world}): {val:?}");
+        }
+    }
+
+    session
+        .set_env_overrides(linux_de.clone())
+        .await
+        .expect("set_env_overrides linux_de");
+
+    let main_after = session
+        .eval_main_world_in_frame(snap_expr, Some(&xo_fid))
+        .await
+        .expect("xo main after");
+    let iso_after = session
+        .eval_isolated_in_frame(snap_expr, Some(&xo_fid))
+        .await
+        .expect("xo iso after");
+    for (world, val) in [("main", &main_after), ("isolated", &iso_after)] {
+        assert_eq!(val["platform"], linux_de.platform, "{engine} after ({world}): {val:?}");
+        assert_eq!(val["langs"][0], "de-DE", "{engine} after ({world}): {val:?}");
+        assert_eq!(val["ua"], linux_de.user_agent, "{engine} after ({world}): {val:?}");
+        assert_eq!(val["tz"], "Europe/Berlin", "{engine} after ({world}): {val:?}");
+        if engine == EngineKind::Chromium {
+            assert_eq!(val["uadPlat"], "Linux", "{engine} after ({world}): {val:?}");
+        }
+    }
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn dynamic_set_env_overrides_updates_cross_origin_iframe_default_launch_chromium() {
+    assert_dynamic_set_env_overrides_updates_cross_origin_iframe_default_launch(
+        EngineKind::Chromium,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn dynamic_set_env_overrides_updates_cross_origin_iframe_default_launch_firefox() {
+    assert_dynamic_set_env_overrides_updates_cross_origin_iframe_default_launch(EngineKind::Firefox)
+        .await;
+}
+
+async fn assert_dynamic_set_env_overrides_updates_nested_cross_origin_in_oopif(
+    engine: EngineKind,
+) {
+    let server1 = TestServer::start().await;
+    let server2 = TestServer::start().await;
+    let server3 = TestServer::start().await;
+    let win_jp = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .build()
+        .expect("valid win11 JP");
+    let linux_de = EnvProfileBuilder::from_preset(PresetKind::Linux, engine)
+        .geoip("DE")
+        .expect("geoip DE")
+        .build()
+        .expect("valid linux DE");
+
+    let extra_args = if engine == EngineKind::Chromium {
+        vec!["--site-per-process".to_string()]
+    } else {
+        vec![]
+    };
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            env_profile: Some(win_jp.clone()),
+            main_world_eval: true,
+            extra_args,
+            ..Default::default()
+        })
+        .await
+        .expect("launch session");
+    let pid = session.info().pid.expect("pid");
+
+    // 127.0.0.1:P1 -> localhost:P2 (OOPIF under --site-per-process)
+    //              -> localhost:P3 (same-site cross-origin, shares OOPIF process)
+    let nested_url = server3.localhost_url("/xo-child");
+    let mid_url = server2.localhost_url(&format!("/nested-so-xo-middle?xo={nested_url}"));
+    session
+        .navigate(&server1.url(&format!("/mixed-xo-host?xo={mid_url}")))
+        .await
+        .expect("navigate /mixed-xo-host -> /nested-so-xo-middle -> /xo-child");
+
+    let mut mid_fid = None;
+    let mut nested_fid = None;
+    for _ in 0..80 {
+        let frames = session.list_frames().await.expect("list_frames");
+        if mid_fid.is_none() {
+            mid_fid = frames
+                .iter()
+                .find(|f| !f.is_main && f.url.starts_with(&mid_url))
+                .map(|f| f.frame_id.clone());
+        }
+        if nested_fid.is_none() {
+            nested_fid = frames
+                .iter()
+                .find(|f| !f.is_main && f.url.starts_with(&nested_url))
+                .map(|f| f.frame_id.clone());
+        }
+        if mid_fid.is_some() && nested_fid.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let mid_fid = mid_fid.expect("OOPIF root frame present");
+    let nested_fid = nested_fid.expect("nested cross-origin frame inside OOPIF present");
+
+    let snap_expr = r#"(() => ({
+        platform: navigator.platform,
+        langs: Array.from(navigator.languages || []),
+        ua: navigator.userAgent,
+        tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        uadPlat: navigator.userAgentData ? navigator.userAgentData.platform : null
+    }))()"#;
+
+    for (label, fid) in [("oopif-root", &mid_fid), ("nested-xo-in-oopif", &nested_fid)] {
+        let main_before = session
+            .eval_main_world_in_frame(snap_expr, Some(fid))
+            .await
+            .expect("before main");
+        let iso_before = session
+            .eval_isolated_in_frame(snap_expr, Some(fid))
+            .await
+            .expect("before iso");
+        for (world, val) in [("main", &main_before), ("isolated", &iso_before)] {
+            assert_eq!(
+                val["platform"], win_jp.platform,
+                "{engine} {label} before ({world}): {val:?}"
+            );
+            assert_eq!(
+                val["langs"][0], "ja-JP",
+                "{engine} {label} before ({world}): {val:?}"
+            );
+            assert_eq!(
+                val["ua"], win_jp.user_agent,
+                "{engine} {label} before ({world}): {val:?}"
+            );
+            assert_eq!(
+                val["tz"], "Asia/Tokyo",
+                "{engine} {label} before ({world}): {val:?}"
+            );
+            if engine == EngineKind::Chromium {
+                assert_eq!(
+                    val["uadPlat"], "Windows",
+                    "{engine} {label} before ({world}): {val:?}"
+                );
+            }
+        }
+    }
+
+    session
+        .set_env_overrides(linux_de.clone())
+        .await
+        .expect("set_env_overrides linux_de");
+
+    for (label, fid) in [("oopif-root", &mid_fid), ("nested-xo-in-oopif", &nested_fid)] {
+        let main_after = session
+            .eval_main_world_in_frame(snap_expr, Some(fid))
+            .await
+            .expect("after main");
+        let iso_after = session
+            .eval_isolated_in_frame(snap_expr, Some(fid))
+            .await
+            .expect("after iso");
+        for (world, val) in [("main", &main_after), ("isolated", &iso_after)] {
+            assert_eq!(
+                val["platform"], linux_de.platform,
+                "{engine} {label} after ({world}): {val:?}"
+            );
+            assert_eq!(
+                val["langs"][0], "de-DE",
+                "{engine} {label} after ({world}): {val:?}"
+            );
+            assert_eq!(
+                val["ua"], linux_de.user_agent,
+                "{engine} {label} after ({world}): {val:?}"
+            );
+            assert_eq!(
+                val["tz"], "Europe/Berlin",
+                "{engine} {label} after ({world}): {val:?}"
+            );
+            if engine == EngineKind::Chromium {
+                assert_eq!(
+                    val["uadPlat"], "Linux",
+                    "{engine} {label} after ({world}): {val:?}"
+                );
+            }
+        }
+    }
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn dynamic_set_env_overrides_updates_nested_cross_origin_in_oopif_chromium() {
+    assert_dynamic_set_env_overrides_updates_nested_cross_origin_in_oopif(EngineKind::Chromium)
+        .await;
+}
+
+#[tokio::test]
+async fn dynamic_set_env_overrides_updates_nested_cross_origin_in_oopif_firefox() {
+    assert_dynamic_set_env_overrides_updates_nested_cross_origin_in_oopif(EngineKind::Firefox)
+        .await;
+}
+
+async fn assert_dynamic_set_env_overrides_updates_popup_cross_origin_iframe(
+    engine: EngineKind,
+    use_virtual: bool,
+) {
+    let server1 = TestServer::start().await;
+    let server2 = TestServer::start().await;
+    let win_jp = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .build()
+        .expect("valid win11 JP");
+    let linux_de = EnvProfileBuilder::from_preset(PresetKind::Linux, engine)
+        .geoip("DE")
+        .expect("geoip DE")
+        .build()
+        .expect("valid linux DE");
+
+    let mut vc_opt = None;
+    let mut pool_opt = None;
+    let session = if use_virtual {
+        let pool = VirtualContextPool::launch(LaunchOptions {
+            engine,
+            headless: true,
+            ..Default::default()
+        })
+        .await
+        .expect("launch pool");
+        let vc = pool
+            .create_labeled_context(
+                "popup-xo-vc",
+                ContextOptions {
+                    env_profile: Some(win_jp.clone()),
+                    main_world_eval: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create virtual context");
+        let sess = vc.session().clone();
+        vc_opt = Some(vc);
+        pool_opt = Some(pool);
+        sess
+    } else {
+        driver_for(engine)
+            .launch(LaunchOptions {
+                engine,
+                headless: true,
+                profile_mode: ProfileMode::EphemeralDir,
+                env_profile: Some(win_jp.clone()),
+                main_world_eval: true,
+                ..Default::default()
+            })
+            .await
+            .expect("launch ephemeral")
+    };
+    let pid = if let Some(ref pool) = pool_opt {
+        pool.root_session().info().pid.expect("pool pid")
+    } else {
+        session.info().pid.expect("pid")
+    };
+
+    session
+        .navigate(&server1.url("/"))
+        .await
+        .expect("navigate opener /");
+
+    let setup_js = r#"(() => {
+        window.__xoReady = false;
+        window.__xoReports = {};
+        window.addEventListener('message', (ev) => {
+            if (!ev.data) return;
+            if (ev.data.kind === 'popup-xo-ready') window.__xoReady = true;
+            else if (ev.data.kind === 'xo-env-report') window.__xoReports[ev.data.tag] = ev.data.payload;
+        });
+    })()"#;
+    session.eval_main_world(setup_js).await.expect("setup opener listener");
+
+    let xo_url = server2.localhost_url("/xo-env-probe");
+    let popup_url = server1.url(&format!("/popup-xo-env?xo={xo_url}"));
+    let open_js = format!(
+        "window.__pop = window.open({}, '_blank'); Boolean(window.__pop)",
+        serde_json::to_string(&popup_url).unwrap()
+    );
+    let opened = session
+        .eval_main_world(&open_js)
+        .await
+        .expect("window.open popup");
+    assert_eq!(opened, serde_json::json!(true), "{engine}: window.open failed");
+
+    let mut ready = false;
+    for _ in 0..100 {
+        if session
+            .eval_main_world("Boolean(window.__xoReady)")
+            .await
+            .ok()
+            .and_then(|v| v.as_bool())
+            == Some(true)
+        {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "{engine} vc={use_virtual}: timed out waiting for popup-xo-ready");
+
+    session
+        .eval_main_world("window.__pop.postMessage({ kind: 'collect-all', tag: 'before' }, '*')")
+        .await
+        .expect("request before report");
+    let mut before = serde_json::Value::Null;
+    for _ in 0..80 {
+        let val = session
+            .eval_main_world("window.__xoReports.before || null")
+            .await
+            .expect("poll before report");
+        if !val.is_null() {
+            before = val;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(!before.is_null(), "{engine} vc={use_virtual}: missing before report");
+
+    for label in ["pop", "so", "xo"] {
+        let node = &before[label];
+        assert_eq!(
+            node["platform"], win_jp.platform,
+            "{engine} vc={use_virtual} {label} before: {node:?}"
+        );
+        assert_eq!(
+            node["langs"][0], "ja-JP",
+            "{engine} vc={use_virtual} {label} before: {node:?}"
+        );
+        assert_eq!(
+            node["ua"], win_jp.user_agent,
+            "{engine} vc={use_virtual} {label} before: {node:?}"
+        );
+        assert_eq!(
+            node["tz"], "Asia/Tokyo",
+            "{engine} vc={use_virtual} {label} before: {node:?}"
+        );
+        assert_eq!(
+            node["screenW"], win_jp.screen_width,
+            "{engine} vc={use_virtual} {label} before: {node:?}"
+        );
+        if engine == EngineKind::Chromium {
+            assert_eq!(
+                node["uadPlat"], "Windows",
+                "{engine} vc={use_virtual} {label} before: {node:?}"
+            );
+        }
+    }
+
+    // Opener tab remains the active session context while popup + its cross-origin iframe are open.
+    session
+        .set_env_overrides(linux_de.clone())
+        .await
+        .expect("set_env_overrides linux_de");
+
+    session
+        .eval_main_world("window.__pop.postMessage({ kind: 'collect-all', tag: 'after' }, '*')")
+        .await
+        .expect("request after report");
+    let mut after = serde_json::Value::Null;
+    for _ in 0..80 {
+        let val = session
+            .eval_main_world("window.__xoReports.after || null")
+            .await
+            .expect("poll after report");
+        if !val.is_null() {
+            after = val;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(!after.is_null(), "{engine} vc={use_virtual}: missing after report");
+
+    for label in ["pop", "so", "xo"] {
+        let node = &after[label];
+        assert_eq!(
+            node["platform"], linux_de.platform,
+            "{engine} vc={use_virtual} {label} after: {node:?}"
+        );
+        assert_eq!(
+            node["langs"][0], "de-DE",
+            "{engine} vc={use_virtual} {label} after: {node:?}"
+        );
+        assert_eq!(
+            node["ua"], linux_de.user_agent,
+            "{engine} vc={use_virtual} {label} after: {node:?}"
+        );
+        assert_eq!(
+            node["tz"], "Europe/Berlin",
+            "{engine} vc={use_virtual} {label} after: {node:?}"
+        );
+        assert_eq!(
+            node["screenW"], linux_de.screen_width,
+            "{engine} vc={use_virtual} {label} after: {node:?}"
+        );
+        assert_eq!(
+            node["echo"]["user-agent"], linux_de.user_agent,
+            "{engine} vc={use_virtual} {label} echo ua after: {node:?}"
+        );
+        assert!(
+            node["echo"]["accept-language"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("de-DE"),
+            "{engine} vc={use_virtual} {label} echo accept-language after: {node:?}"
+        );
+        if engine == EngineKind::Chromium {
+            assert_eq!(
+                node["uadPlat"], "Linux",
+                "{engine} vc={use_virtual} {label} after: {node:?}"
+            );
+        }
+    }
+
+    if engine == EngineKind::Firefox {
+        let tabs = session.list_tabs().await.expect("list_tabs");
+        let popup_tid = tabs
+            .iter()
+            .find(|t| t.url.contains("/popup-xo-env"))
+            .expect("popup tab in list_tabs")
+            .target_id
+            .clone();
+        let snap_expr = r#"(() => ({
+            platform: navigator.platform,
+            ua: navigator.userAgent,
+            tz: Intl.DateTimeFormat().resolvedOptions().timeZone
+        }))()"#;
+        let pop_main = session
+            .eval_main_world_in_frame(snap_expr, Some(&popup_tid))
+            .await
+            .expect("firefox popup eval_main_world_in_frame");
+        let pop_iso = session
+            .eval_isolated_in_frame(snap_expr, Some(&popup_tid))
+            .await
+            .expect("firefox popup eval_isolated_in_frame");
+        for (world, val) in [("main", &pop_main), ("isolated", &pop_iso)] {
+            assert_eq!(val["platform"], linux_de.platform, "firefox {world}: {val:?}");
+            assert_eq!(val["ua"], linux_de.user_agent, "firefox {world}: {val:?}");
+            assert_eq!(val["tz"], "Europe/Berlin", "firefox {world}: {val:?}");
+        }
+    }
+
+    if let Some(vc) = vc_opt {
+        vc.dispose().await.expect("dispose vc");
+    } else {
+        session.dispose().await.expect("dispose session");
+    }
+    if let Some(pool) = pool_opt {
+        pool.shutdown().await.expect("shutdown pool");
+    }
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn dynamic_set_env_overrides_updates_popup_cross_origin_iframe_chromium() {
+    assert_dynamic_set_env_overrides_updates_popup_cross_origin_iframe(
+        EngineKind::Chromium,
+        false,
+    )
+    .await;
+    assert_dynamic_set_env_overrides_updates_popup_cross_origin_iframe(EngineKind::Chromium, true)
+        .await;
+}
+
+#[tokio::test]
+async fn dynamic_set_env_overrides_updates_popup_cross_origin_iframe_firefox() {
+    assert_dynamic_set_env_overrides_updates_popup_cross_origin_iframe(EngineKind::Firefox, false)
+        .await;
+    assert_dynamic_set_env_overrides_updates_popup_cross_origin_iframe(EngineKind::Firefox, true)
+        .await;
+}
+
+async fn assert_blob_worker_and_shared_worker_immediate_revoke(engine: EngineKind) {
+    let server = TestServer::start().await;
+    let win_jp = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .build()
+        .expect("valid win11 JP");
+
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            env_profile: Some(win_jp.clone()),
+            main_world_eval: true,
+            ..Default::default()
+        })
+        .await
+        .expect("launch session");
+    let pid = session.info().pid.expect("pid");
+
+    session
+        .navigate(&server.url("/"))
+        .await
+        .expect("navigate /");
+
+    let probe_js = r#"(async () => {
+        const withTimeout = (p, label) => Promise.race([
+            p,
+            new Promise((_, rej) => setTimeout(() => rej(new Error(label + ' timed out')), 5000))
+        ]);
+
+        const runClassic = () => withTimeout(new Promise((resolve) => {
+            const b = new Blob([
+                '"use strict"; function strictCheck() { return this === undefined; } postMessage({ ok: true, strict: strictCheck(), platform: navigator.platform, ua: navigator.userAgent, tz: Intl.DateTimeFormat().resolvedOptions().timeZone });'
+            ], { type: 'application/javascript' });
+            const u = URL.createObjectURL(b);
+            const w = new Worker(u);
+            URL.revokeObjectURL(u);
+            w.onmessage = (e) => { w.terminate(); resolve(e.data); };
+            w.onerror = (e) => { w.terminate(); resolve({ error: e.message || 'classic error' }); };
+        }), 'classic');
+
+        const runModule = () => withTimeout(new Promise((resolve) => {
+            const b = new Blob([
+                'export const x = 1; postMessage({ ok: true, platform: navigator.platform, ua: navigator.userAgent, tz: Intl.DateTimeFormat().resolvedOptions().timeZone });'
+            ], { type: 'application/javascript' });
+            const u = URL.createObjectURL(b);
+            const w = new Worker(u, { type: 'module' });
+            URL.revokeObjectURL(u);
+            w.onmessage = (e) => { w.terminate(); resolve(e.data); };
+            w.onerror = (e) => { w.terminate(); resolve({ error: e.message || 'module error' }); };
+        }), 'module');
+
+        const runShared = () => withTimeout(new Promise((resolve) => {
+            const b = new Blob([
+                'let count = 0; onconnect = (ev) => { count++; const p = ev.ports[0]; p.postMessage({ ok: true, count, platform: navigator.platform, ua: navigator.userAgent, tz: Intl.DateTimeFormat().resolvedOptions().timeZone }); };'
+            ], { type: 'application/javascript' });
+            const u = URL.createObjectURL(b);
+            const sw1 = new SharedWorker(u, 'rev-shared-worker');
+            const sw2 = new SharedWorker(u, 'rev-shared-worker');
+            URL.revokeObjectURL(u);
+            const msgs = [];
+            const onErr = (e) => resolve({ error: e.message || 'shared error' });
+            sw1.onerror = onErr;
+            sw2.onerror = onErr;
+            const onMsg = (ev) => {
+                msgs.push(ev.data);
+                if (msgs.length === 2) resolve({ msgs });
+            };
+            sw1.port.onmessage = onMsg;
+            sw2.port.onmessage = onMsg;
+            sw1.port.start();
+            sw2.port.start();
+        }), 'shared');
+
+        const runNested = () => withTimeout(new Promise((resolve) => {
+            const outerSrc = `
+                const innerBlob = new Blob([
+                    'postMessage({ ok: true, platform: navigator.platform, tz: Intl.DateTimeFormat().resolvedOptions().timeZone });'
+                ], { type: 'application/javascript' });
+                const u2 = URL.createObjectURL(innerBlob);
+                const w2 = new Worker(u2);
+                URL.revokeObjectURL(u2);
+                w2.onmessage = (e) => { w2.terminate(); postMessage({ ok: true, outerPlatform: navigator.platform, inner: e.data }); };
+                w2.onerror = (e) => { w2.terminate(); postMessage({ error: e.message || 'nested inner error' }); };
+            `;
+            const u1 = URL.createObjectURL(new Blob([outerSrc], { type: 'application/javascript' }));
+            const w1 = new Worker(u1);
+            URL.revokeObjectURL(u1);
+            w1.onmessage = (e) => { w1.terminate(); resolve(e.data); };
+            w1.onerror = (e) => { w1.terminate(); resolve({ error: e.message || 'nested outer error' }); };
+        }), 'nested');
+
+        return {
+            noGlobalLeak: !('__mimikyu' in globalThis),
+            classic: await runClassic(),
+            module: await runModule(),
+            shared: await runShared(),
+            nested: await runNested(),
+        };
+    })()"#;
+
+    let res = session
+        .eval_main_world(probe_js)
+        .await
+        .expect("eval blob worker revoke probe");
+
+    assert_eq!(res["noGlobalLeak"], true, "{engine}: leaked global: {res:?}");
+
+    assert_eq!(res["classic"]["ok"], true, "{engine} classic: {res:?}");
+    assert_eq!(res["classic"]["strict"], true, "{engine} classic strict: {res:?}");
+    assert_eq!(res["classic"]["platform"], win_jp.platform, "{engine} classic: {res:?}");
+    assert_eq!(res["classic"]["ua"], win_jp.user_agent, "{engine} classic: {res:?}");
+    assert_eq!(res["classic"]["tz"], "Asia/Tokyo", "{engine} classic: {res:?}");
+
+    assert_eq!(res["module"]["ok"], true, "{engine} module: {res:?}");
+    assert_eq!(res["module"]["platform"], win_jp.platform, "{engine} module: {res:?}");
+    assert_eq!(res["module"]["ua"], win_jp.user_agent, "{engine} module: {res:?}");
+    assert_eq!(res["module"]["tz"], "Asia/Tokyo", "{engine} module: {res:?}");
+
+    let shared_msgs = res["shared"]["msgs"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{engine} shared missing msgs: {res:?}"));
+    assert_eq!(shared_msgs.len(), 2, "{engine} shared: {res:?}");
+    let mut counts: Vec<i64> = shared_msgs
+        .iter()
+        .map(|m| m["count"].as_i64().unwrap_or(0))
+        .collect();
+    counts.sort();
+    assert_eq!(counts, vec![1, 2], "{engine} SharedWorker must deduplicate: {res:?}");
+    for m in shared_msgs {
+        assert_eq!(m["ok"], true, "{engine} shared msg: {res:?}");
+        assert_eq!(m["platform"], win_jp.platform, "{engine} shared msg: {res:?}");
+        assert_eq!(m["tz"], "Asia/Tokyo", "{engine} shared msg: {res:?}");
+    }
+
+    assert_eq!(res["nested"]["ok"], true, "{engine} nested: {res:?}");
+    assert_eq!(res["nested"]["outerPlatform"], win_jp.platform, "{engine} nested: {res:?}");
+    assert_eq!(res["nested"]["inner"]["ok"], true, "{engine} nested inner: {res:?}");
+    assert_eq!(res["nested"]["inner"]["platform"], win_jp.platform, "{engine} nested inner: {res:?}");
+    assert_eq!(res["nested"]["inner"]["tz"], "Asia/Tokyo", "{engine} nested inner: {res:?}");
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn blob_worker_and_shared_worker_immediate_revoke_chromium() {
+    assert_blob_worker_and_shared_worker_immediate_revoke(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn blob_worker_and_shared_worker_immediate_revoke_firefox() {
+    assert_blob_worker_and_shared_worker_immediate_revoke(EngineKind::Firefox).await;
+}
+
+async fn assert_ephemeral_popup_close_then_immediate_set_env_overrides(engine: EngineKind) {
+    let server = TestServer::start().await;
+    let p1 = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("DE")
+        .expect("geoip DE")
+        .build()
+        .expect("valid win11 DE");
+    let p2 = EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+        .geoip("JP")
+        .expect("geoip JP")
+        .build()
+        .expect("valid win11 JP");
+
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            main_world_eval: true,
+            env_profile: Some(p1),
+            ..Default::default()
+        })
+        .await
+        .expect("launch ephemeral");
+    let pid = session.info().pid.expect("pid");
+
+    session
+        .navigate(&server.url("/target"))
+        .await
+        .expect("navigate /target");
+
+    for iter in 0..3 {
+        let open_res = session
+            .eval_main_world(&format!(
+                r#"(async () => {{
+                    const pop = window.open('/target', 'close_race_{iter}', 'width=320,height=240');
+                    if (!pop) return {{ opened: false }};
+                    await new Promise((r) => setTimeout(r, 80));
+                    pop.close();
+                    return {{ opened: true }};
+                }})()"#
+            ))
+            .await
+            .expect("open and close popup");
+        assert_eq!(open_res["opened"], true, "{engine} iter {iter}: {open_res:?}");
+
+        let target_prof = if iter % 2 == 0 { p2.clone() } else {
+            EnvProfileBuilder::from_preset(PresetKind::Win11, engine)
+                .geoip("DE")
+                .unwrap()
+                .build()
+                .unwrap()
+        };
+        let expected_tz = target_prof.timezone.clone();
+        session
+            .set_env_overrides(target_prof)
+            .await
+            .unwrap_or_else(|e| panic!("{engine} iter {iter}: set_env_overrides after pop.close() failed: {e}"));
+        let tz = session
+            .eval_isolated("Intl.DateTimeFormat().resolvedOptions().timeZone")
+            .await
+            .expect("check tz after override");
+        assert_eq!(tz, expected_tz, "{engine} iter {iter}: tz mismatch");
+    }
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn ephemeral_popup_close_then_immediate_set_env_overrides_chromium() {
+    assert_ephemeral_popup_close_then_immediate_set_env_overrides(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn ephemeral_popup_close_then_immediate_set_env_overrides_firefox() {
+    assert_ephemeral_popup_close_then_immediate_set_env_overrides(EngineKind::Firefox).await;
+}

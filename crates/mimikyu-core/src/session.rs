@@ -11,7 +11,8 @@ use serde_json::Value;
 
 use crate::driver::{
     driver_for, now_ms, ContextOptions, DriverSession, EngineKind, EnvProfile, LaunchOptions,
-    NavInfo, ProfileMode, ProxyConfig, ScreenshotFormat, SelectBy, WebRtcPolicy,
+    NavInfo, OriginStorage, ProfileMode, ProxyConfig, ScreenshotFormat, SelectBy, StorageState,
+    WebRtcPolicy,
 };
 use crate::env_profile::{validate_profile, CoherenceReport, EnvProfileBuilder, PresetKind};
 use crate::error::{MimikyuError, Result};
@@ -25,7 +26,8 @@ use crate::input::{
     TypeOptions,
 };
 use crate::isolation::{
-    export_storage_state, import_storage_state, load_session_cookies, save_session_cookies,
+    export_storage_state, import_storage_state, load_session_cookies, load_session_origins,
+    merge_origin_storage, save_session_cookies, save_session_origins, save_storage_state,
     NamedProfileInfo, ProfileLock, ProfileStore, VirtualContext, VirtualContextPool,
 };
 use crate::network::BlockPolicy;
@@ -450,11 +452,12 @@ impl SessionManager {
             blocked_urls: Vec::new(),
         };
 
-        let download_dir = safe_session_download_dir(&self.config.state_dir, &session_id);
-        let mut ephemeral_download_dir = if persistent_path.is_none() {
-            Some(download_dir.clone())
+        let (download_dir, mut ephemeral_download_dir) = if let Some(ref prof_dir) = persistent_path
+        {
+            (prof_dir.join("downloads"), None)
         } else {
-            None
+            let dl_dir = safe_session_download_dir(&self.config.state_dir, &session_id);
+            (dl_dir.clone(), Some(dl_dir))
         };
 
         let (driver, virtual_ctx, mode, dedicated_pid): (
@@ -520,18 +523,30 @@ impl SessionManager {
                 }
             };
             if let Some(ref prof_dir) = persistent_path {
-                match load_session_cookies(prof_dir) {
-                    Ok(session_cookies) if !session_cookies.is_empty() => {
-                        if let Err(err) = drv.set_cookies(session_cookies).await {
-                            let _ = drv.dispose().await;
-                            return Err(err);
-                        }
-                    }
-                    Ok(_) => {}
+                let session_cookies = match load_session_cookies(prof_dir) {
+                    Ok(c) => c,
                     Err(err) => {
                         let _ = drv.dispose().await;
                         return Err(err);
                     }
+                };
+                let session_origins = match load_session_origins(prof_dir) {
+                    Ok(o) => o,
+                    Err(err) => {
+                        let _ = drv.dispose().await;
+                        return Err(err);
+                    }
+                };
+                if (!session_cookies.is_empty() || !session_origins.is_empty())
+                    && let Err(err) = drv
+                        .set_storage_state(StorageState {
+                            cookies: session_cookies,
+                            origins: session_origins,
+                        })
+                        .await
+                {
+                    let _ = drv.dispose().await;
+                    return Err(err);
                 }
             }
             let pid = drv.info().pid;
@@ -624,13 +639,16 @@ impl SessionManager {
         Ok(summary)
     }
 
-    async fn get_pool_slot(&self, engine: EngineKind, headless: bool) -> PoolSlot {
+    async fn get_pool_slot(&self, engine: EngineKind, headless: bool) -> Result<PoolSlot> {
         let mut pools = self.pools.lock().await;
-        Arc::clone(
+        if self.registry.lock().shutting_down {
+            return Err(MimikyuError::Disposed);
+        }
+        Ok(Arc::clone(
             pools
                 .entry((engine, headless))
                 .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None))),
-        )
+        ))
     }
 
     async fn create_virtual_context(
@@ -640,8 +658,12 @@ impl SessionManager {
         session_id: &str,
         ctx_opts: ContextOptions,
     ) -> Result<VirtualContext> {
-        let slot = self.get_pool_slot(engine, headless).await;
+        let slot = self.get_pool_slot(engine, headless).await?;
         let mut slot_guard = slot.lock().await;
+
+        if self.registry.lock().shutting_down {
+            return Err(MimikyuError::Disposed);
+        }
 
         if slot_guard.is_none() {
             let pool = self.launch_virtual_pool(engine, headless).await?;
@@ -722,7 +744,30 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
-        export_storage_state(managed.driver.as_ref(), out_path).await?;
+        if let Some(ref prof_dir) = managed.persistent_path {
+            let mut state = managed.driver.storage_state().await?;
+            state.cookies.retain(|c| !c.name.trim().is_empty());
+            if let Ok(pending_origins) = load_session_origins(prof_dir)
+                && !pending_origins.is_empty()
+            {
+                let still_pending: HashSet<String> = managed
+                    .driver
+                    .pending_storage_origins()
+                    .into_iter()
+                    .collect();
+                let existing_origins: HashSet<String> =
+                    state.origins.iter().map(|o| o.origin.clone()).collect();
+                for po in pending_origins {
+                    if still_pending.contains(&po.origin) && !existing_origins.contains(&po.origin)
+                    {
+                        state.origins.push(po);
+                    }
+                }
+            }
+            save_storage_state(out_path, &state)?;
+        } else {
+            export_storage_state(managed.driver.as_ref(), out_path).await?;
+        }
         Ok(())
     }
 
@@ -738,7 +783,33 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
-        import_storage_state(managed.driver.as_ref(), in_path).await?;
+        let state = import_storage_state(managed.driver.as_ref(), in_path).await?;
+        if let Some(ref prof_dir) = managed.persistent_path {
+            if let Ok(cookies) = managed.driver.cookies().await {
+                save_session_cookies(prof_dir, &cookies)?;
+            }
+            let pending_origins: HashSet<String> = managed
+                .driver
+                .pending_storage_origins()
+                .into_iter()
+                .collect();
+            let mut stored_origins = load_session_origins(prof_dir).unwrap_or_default();
+            let mut hydrated_in_import: HashSet<String> = HashSet::new();
+            let mut pending_in_import: Vec<OriginStorage> = Vec::new();
+            for orig in state.origins {
+                if orig.local_storage.is_empty() && orig.session_storage.is_empty() {
+                    continue;
+                }
+                if pending_origins.contains(&orig.origin) {
+                    pending_in_import.push(orig);
+                } else {
+                    hydrated_in_import.insert(orig.origin);
+                }
+            }
+            stored_origins.retain(|o| !hydrated_in_import.contains(&o.origin));
+            merge_origin_storage(&mut stored_origins, pending_in_import);
+            save_session_origins(prof_dir, &stored_origins)?;
+        }
         Ok(())
     }
 
@@ -1019,7 +1090,6 @@ impl SessionManager {
         };
 
         if let Some(ref sel) = req.selector {
-            prevalidate_css_selector(managed.driver.as_ref(), sel).await?;
             WaitEngine::wait_selector(managed.driver.as_ref(), sel, req.state, wait_opts.clone())
                 .await?;
         }
@@ -1373,10 +1443,21 @@ async fn dispose_session_entry(entry: SessionEntry) -> Result<()> {
         return Ok(());
     }
     managed.disposed = true;
-    if let Some(ref prof_dir) = managed.persistent_path
-        && let Ok(cookies) = managed.driver.cookies().await
-    {
-        let _ = save_session_cookies(prof_dir, &cookies);
+    if let Some(ref prof_dir) = managed.persistent_path {
+        if let Ok(cookies) = managed.driver.cookies().await {
+            let _ = save_session_cookies(prof_dir, &cookies);
+        }
+        let still_pending: HashSet<String> = managed
+            .driver
+            .pending_storage_origins()
+            .into_iter()
+            .collect();
+        if let Ok(mut stored_origins) = load_session_origins(prof_dir)
+            && !stored_origins.is_empty()
+        {
+            stored_origins.retain(|o| still_pending.contains(&o.origin));
+            let _ = save_session_origins(prof_dir, &stored_origins);
+        }
     }
     let res = if let Some(vc) = managed.virtual_ctx.take() {
         vc.dispose().await
@@ -1390,14 +1471,15 @@ async fn dispose_session_entry(entry: SessionEntry) -> Result<()> {
 }
 
 fn safe_session_download_dir(state_dir: &Path, session_id: &str) -> PathBuf {
-    let safe_id = if !session_id.is_empty()
+    let is_lowercase_safe = !session_id.is_empty()
         && session_id != "."
         && session_id != ".."
         && !session_id.contains("..")
         && session_id
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
-    {
+            .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-' | '_' | '.'));
+
+    let safe_id = if is_lowercase_safe {
         session_id.to_string()
     } else {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1427,24 +1509,6 @@ async fn dispose_pool_arc(pool: Arc<VirtualContextPool>) {
             let _ = shared.root_session().dispose().await;
         }
     }
-}
-
-async fn prevalidate_css_selector(driver: &dyn DriverSession, selector: &str) -> Result<()> {
-    if selector.trim().is_empty() {
-        return Err(MimikyuError::InvalidConfig(
-            "wait selector cannot be empty".to_string(),
-        ));
-    }
-    let sel_json = serde_json::to_string(selector)?;
-    let js = format!(
-        "(() => {{ try {{ document.createDocumentFragment().querySelector({sel_json}); return null; }} catch (e) {{ return String(e && e.message ? e.message : e); }} }})()"
-    );
-    if let Ok(Value::String(err_msg)) = driver.eval_isolated(&js).await {
-        return Err(MimikyuError::InvalidConfig(format!(
-            "invalid CSS selector '{selector}': {err_msg}"
-        )));
-    }
-    Ok(())
 }
 
 async fn execute_batch_with_open_invalidation(

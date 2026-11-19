@@ -77,14 +77,21 @@ impl Drop for ProxyRelay {
     }
 }
 
+fn strip_ipv6_brackets(host: &str) -> String {
+    host.strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host)
+        .to_string()
+}
+
 fn parse_upstream(proxy: &ProxyConfig) -> Result<UpstreamKind> {
-    let parsed = url::Url::parse(&proxy.server)
-        .or_else(|_| url::Url::parse(&format!("http://{}", proxy.server)))?;
+    let parsed = crate::driver::parse_proxy_url(&proxy.server)?;
 
     let host = parsed
         .host_str()
-        .ok_or_else(|| MimikyuError::InvalidConfig(format!("proxy missing host: {}", proxy.server)))?
-        .to_string();
+        .map(strip_ipv6_brackets)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| MimikyuError::InvalidConfig(format!("proxy missing host: {}", proxy.server)))?;
 
     let scheme = parsed.scheme().to_ascii_lowercase();
     let port = parsed.port_or_known_default().unwrap_or(match scheme.as_str() {
@@ -173,12 +180,16 @@ fn percent_decode(raw: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn is_hop_by_hop_or_proxy_auth_header(line: &str) -> bool {
+fn is_hop_by_hop_or_proxy_auth_header(line: &str, preserve_upgrade_conn: bool) -> bool {
     let Some((name, _)) = line.split_once(':') else {
         return false;
     };
+    let lower = name.trim().to_ascii_lowercase();
+    if preserve_upgrade_conn && lower == "connection" {
+        return false;
+    }
     matches!(
-        name.trim().to_ascii_lowercase().as_str(),
+        lower.as_str(),
         "proxy-authorization" | "proxy-connection" | "connection" | "keep-alive"
     )
 }
@@ -312,11 +323,16 @@ async fn forward_chunked_body<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     }
 }
 
+enum RelayOutcome {
+    Completed,
+    Upgraded,
+}
+
 async fn relay_http_response<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
     req_method: &str,
     up_read: &mut R,
     client_write: &mut W,
-) -> Result<()> {
+) -> Result<RelayOutcome> {
     let mut buf = Vec::with_capacity(4096);
     for _ in 0..8 {
         let head_end = read_head_into_buf(up_read, &mut buf).await?;
@@ -328,7 +344,18 @@ async fn relay_http_response<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
             .nth(1)
             .and_then(|s| s.parse::<u16>().ok());
 
-        if matches!(status_code, Some(100..=199)) && status_code != Some(101) {
+        if status_code == Some(101) {
+            client_write.write_all(&buf[..head_end + 4]).await?;
+            if buf.len() > head_end + 4 {
+                client_write.write_all(&buf[head_end + 4..]).await?;
+                buf.clear();
+            }
+            client_write.flush().await?;
+            let _ = tokio::io::copy(up_read, client_write).await;
+            return Ok(RelayOutcome::Upgraded);
+        }
+
+        if matches!(status_code, Some(100..=199)) {
             client_write.write_all(&buf[..head_end + 4]).await?;
             buf.drain(..head_end + 4);
             continue;
@@ -388,7 +415,7 @@ async fn relay_http_response<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         }
 
         let _ = client_write.flush().await;
-        return Ok(());
+        return Ok(RelayOutcome::Completed);
     }
 
     Err(MimikyuError::Transport(
@@ -411,8 +438,20 @@ async fn relay_single_http_exchange(
 
     let res = relay_http_response(req_method, &mut up_read, &mut client_write).await;
     let _ = client_write.shutdown().await;
-    c2u.abort();
-    res
+    match res {
+        Ok(RelayOutcome::Upgraded) => {
+            let _ = c2u.await;
+            Ok(())
+        }
+        Ok(RelayOutcome::Completed) => {
+            c2u.abort();
+            Ok(())
+        }
+        Err(e) => {
+            c2u.abort();
+            Err(e)
+        }
+    }
 }
 
 async fn handle_client(mut client: TcpStream, upstream: UpstreamKind) -> Result<()> {
@@ -434,6 +473,11 @@ async fn handle_client(mut client: TcpStream, upstream: UpstreamKind) -> Result<
     }
 
     let is_connect = method.eq_ignore_ascii_case("CONNECT");
+    let has_upgrade = !is_connect
+        && rest_headers.iter().any(|h| {
+            h.split_once(':')
+                .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("upgrade"))
+        });
 
     match upstream {
         UpstreamKind::Http {
@@ -454,7 +498,7 @@ async fn handle_client(mut client: TcpStream, upstream: UpstreamKind) -> Result<
                             continue;
                         }
                     }
-                } else if is_hop_by_hop_or_proxy_auth_header(h) {
+                } else if is_hop_by_hop_or_proxy_auth_header(h, has_upgrade) {
                     continue;
                 }
                 out.push_str(h);
@@ -463,7 +507,7 @@ async fn handle_client(mut client: TcpStream, upstream: UpstreamKind) -> Result<
             if let Some(ref auth) = auth_header {
                 out.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
             }
-            if !is_connect {
+            if !is_connect && !has_upgrade {
                 out.push_str("Connection: close\r\n");
             }
             out.push_str("\r\n");
@@ -490,8 +534,9 @@ async fn handle_client(mut client: TcpStream, upstream: UpstreamKind) -> Result<
             } else if let Ok(u) = url::Url::parse(target) {
                 let h = u
                     .host_str()
-                    .ok_or_else(|| MimikyuError::InvalidConfig("missing target host".into()))?
-                    .to_string();
+                    .map(strip_ipv6_brackets)
+                    .filter(|s| !s.is_empty())
+                    .ok_or_else(|| MimikyuError::InvalidConfig("missing target host".into()))?;
                 let p = u.port_or_known_default().unwrap_or(80);
                 let mut pq = u.path().to_string();
                 if pq.is_empty() {
@@ -530,13 +575,16 @@ async fn handle_client(mut client: TcpStream, upstream: UpstreamKind) -> Result<
                 let path = origin_path.as_deref().unwrap_or("/");
                 let mut out = format!("{method} {path} {version}\r\n");
                 for h in rest_headers {
-                    if h.is_empty() || is_hop_by_hop_or_proxy_auth_header(h) {
+                    if h.is_empty() || is_hop_by_hop_or_proxy_auth_header(h, has_upgrade) {
                         continue;
                     }
                     out.push_str(h);
                     out.push_str("\r\n");
                 }
-                out.push_str("Connection: close\r\n\r\n");
+                if !has_upgrade {
+                    out.push_str("Connection: close\r\n");
+                }
+                out.push_str("\r\n");
                 up.write_all(out.as_bytes()).await?;
                 if !leftover.is_empty() {
                     up.write_all(&leftover).await?;
@@ -559,6 +607,9 @@ fn parse_host_port(raw: &str, default_port: u16) -> Result<(String, u16)> {
             .and_then(|p| p.parse::<u16>().ok())
             .unwrap_or(default_port);
         return Ok((host.to_string(), port));
+    }
+    if trimmed.parse::<IpAddr>().is_ok() {
+        return Ok((trimmed.to_string(), default_port));
     }
     if let Some((host, p)) = trimmed.rsplit_once(':')
         && let Ok(port) = p.parse::<u16>()
@@ -819,5 +870,292 @@ mod tests {
         }
 
         srv.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_relay_parses_schemeless_credentials_and_starts() {
+        let cfg = ProxyConfig {
+            server: "alice:secret@127.0.0.1:8080".to_string(),
+            username: None,
+            password: None,
+            bypass: Vec::new(),
+        };
+        assert!(cfg.needs_relay());
+        match parse_upstream(&cfg).expect("schemeless credentials must parse") {
+            UpstreamKind::Http {
+                host,
+                port,
+                auth_header,
+            } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 8080);
+                let expected = format!("Basic {}", BASE64.encode("alice:secret"));
+                assert_eq!(auth_header, Some(expected));
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+
+        let relay = ProxyRelay::start(&cfg)
+            .await
+            .expect("ProxyRelay::start must succeed with schemeless credentials");
+        assert_ne!(relay.local_addr().port(), 0);
+        drop(relay);
+    }
+
+    #[tokio::test]
+    async fn proxy_relay_preserves_101_switching_protocols_bidirectional() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = listener.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let (head, _) = read_http_head(&mut s).await.unwrap();
+            let head_str = String::from_utf8_lossy(&head);
+            assert!(
+                head_str.to_ascii_lowercase().contains("upgrade: websocket"),
+                "upstream must see Upgrade header: {head_str}"
+            );
+            assert!(
+                head_str.to_ascii_lowercase().contains("connection: upgrade"),
+                "upstream must see Connection: Upgrade: {head_str}"
+            );
+            s.write_all(
+                b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut buf = [0u8; 10];
+            s.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping-frame");
+            s.write_all(b"pong-frame").await.unwrap();
+            s.flush().await.unwrap();
+        });
+
+        let relay = ProxyRelay::start(&ProxyConfig {
+            server: format!("http://alice:secret@{up_addr}"),
+            username: None,
+            password: None,
+            bypass: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let mut client = TcpStream::connect(relay.local_addr()).await.unwrap();
+        client
+            .write_all(
+                b"GET http://127.0.0.1:80/ws HTTP/1.1\r\nHost: 127.0.0.1:80\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            )
+            .await
+            .unwrap();
+
+        let (resp_head, leftover) = read_http_head(&mut client).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp_head);
+        assert!(
+            resp_str.starts_with("HTTP/1.1 101 Switching Protocols"),
+            "expected 101 response, got: {resp_str}"
+        );
+        assert!(!resp_str.to_ascii_lowercase().contains("connection: close"));
+
+        client.write_all(b"ping-frame").await.unwrap();
+        client.flush().await.unwrap();
+
+        let mut got = leftover;
+        while got.len() < 10 {
+            let mut chunk = [0u8; 32];
+            let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut chunk))
+                .await
+                .expect("read upgraded response")
+                .unwrap();
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&chunk[..n]);
+        }
+        assert_eq!(&got, b"pong-frame");
+        drop(client);
+        let _ = srv.await;
+    }
+
+    #[test]
+    fn parse_upstream_strips_ipv6_brackets() {
+        let http_cfg = ProxyConfig {
+            server: "http://u:p@[::1]:8080".to_string(),
+            username: None,
+            password: None,
+            bypass: Vec::new(),
+        };
+        match parse_upstream(&http_cfg).expect("ipv6 http upstream should parse") {
+            UpstreamKind::Http { host, port, .. } => {
+                assert_eq!(host, "::1");
+                assert_eq!(port, 8080);
+            }
+            other => panic!("expected Http, got {other:?}"),
+        }
+
+        let socks_cfg = ProxyConfig {
+            server: "socks5h://u:p@[2001:db8::1]:1080".to_string(),
+            username: None,
+            password: None,
+            bypass: Vec::new(),
+        };
+        match parse_upstream(&socks_cfg).expect("ipv6 socks5 upstream should parse") {
+            UpstreamKind::Socks5 { host, port, .. } => {
+                assert_eq!(host, "2001:db8::1");
+                assert_eq!(port, 1080);
+            }
+            other => panic!("expected Socks5, got {other:?}"),
+        }
+
+        assert_eq!(
+            parse_host_port("[::1]:8443", 443).unwrap(),
+            ("::1".to_string(), 8443)
+        );
+        assert_eq!(
+            parse_host_port("::1", 443).unwrap(),
+            ("::1".to_string(), 443)
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_relay_forwards_http_and_connect_via_ipv6_upstream() {
+        let Ok(listener) = TcpListener::bind("[::1]:0").await else {
+            return;
+        };
+        let up_addr = listener.local_addr().unwrap();
+        let expected_auth = format!("Basic {}", BASE64.encode("u:p"));
+
+        let srv = tokio::spawn(async move {
+            // Connection 1: HTTP GET
+            let (mut s1, _) = listener.accept().await.unwrap();
+            let (head1, _) = read_http_head(&mut s1).await.unwrap();
+            let h1 = String::from_utf8_lossy(&head1).into_owned();
+            assert!(h1.contains(&format!("Proxy-Authorization: {expected_auth}")));
+            s1.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nipv6-ok")
+                .await
+                .unwrap();
+            let _ = s1.shutdown().await;
+
+            // Connection 2: CONNECT tunnel
+            let (mut s2, _) = listener.accept().await.unwrap();
+            let (head2, _) = read_http_head(&mut s2).await.unwrap();
+            let h2 = String::from_utf8_lossy(&head2).into_owned();
+            assert!(h2.starts_with("CONNECT [::1]:443 HTTP/1.1"));
+            assert!(h2.contains(&format!("Proxy-Authorization: {expected_auth}")));
+            s2.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut ping = [0u8; 4];
+            s2.read_exact(&mut ping).await.unwrap();
+            assert_eq!(&ping, b"ping");
+            s2.write_all(b"pong").await.unwrap();
+            let _ = s2.shutdown().await;
+        });
+
+        let relay = ProxyRelay::start(&ProxyConfig {
+            server: format!("http://u:p@[::1]:{}", up_addr.port()),
+            username: None,
+            password: None,
+            bypass: Vec::new(),
+        })
+        .await
+        .expect("start relay with IPv6 HTTP upstream");
+
+        let mut c1 = TcpStream::connect(relay.local_addr()).await.unwrap();
+        c1.write_all(b"GET http://example.com/hello HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp1 = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), c1.read_to_end(&mut resp1))
+            .await
+            .expect("HTTP GET via IPv6 upstream")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&resp1).ends_with("\r\n\r\nipv6-ok"));
+
+        let mut c2 = TcpStream::connect(relay.local_addr()).await.unwrap();
+        c2.write_all(b"CONNECT [::1]:443 HTTP/1.1\r\nHost: [::1]:443\r\n\r\n")
+            .await
+            .unwrap();
+        let (conn_head, _) = read_http_head(&mut c2).await.unwrap();
+        assert!(String::from_utf8_lossy(&conn_head).starts_with("HTTP/1.1 200"));
+        c2.write_all(b"ping").await.unwrap();
+        let mut pong = [0u8; 4];
+        c2.read_exact(&mut pong).await.unwrap();
+        assert_eq!(&pong, b"pong");
+
+        drop(c2);
+        let _ = srv.await;
+    }
+
+    #[tokio::test]
+    async fn proxy_relay_forwards_socks5_ipv6_upstream_and_ipv6_atyp04_target() {
+        let Ok(listener) = TcpListener::bind("[::1]:0").await else {
+            return;
+        };
+        let socks_addr = listener.local_addr().unwrap();
+
+        let srv = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            // 1. Greeting: VER=5, NMETHODS=2, [0x00, 0x02]
+            let mut greet = [0u8; 4];
+            s.read_exact(&mut greet).await.unwrap();
+            assert_eq!(greet[0], 0x05);
+            s.write_all(&[0x05, 0x02]).await.unwrap();
+
+            // 2. Username/Password auth
+            let mut ulen_hdr = [0u8; 2];
+            s.read_exact(&mut ulen_hdr).await.unwrap();
+            let mut rest = vec![0u8; ulen_hdr[1] as usize];
+            s.read_exact(&mut rest).await.unwrap();
+            let mut plen = [0u8; 1];
+            s.read_exact(&mut plen).await.unwrap();
+            let mut pass = vec![0u8; plen[0] as usize];
+            s.read_exact(&mut pass).await.unwrap();
+            assert_eq!(&rest, b"u");
+            assert_eq!(&pass, b"p");
+            s.write_all(&[0x01, 0x00]).await.unwrap();
+
+            // 3. CONNECT request: must use ATYP=0x04 for "::1" and port 8080
+            let mut req_hdr = [0u8; 4];
+            s.read_exact(&mut req_hdr).await.unwrap();
+            assert_eq!(req_hdr, [0x05, 0x01, 0x00, 0x04]);
+            let mut v6_and_port = [0u8; 18];
+            s.read_exact(&mut v6_and_port).await.unwrap();
+            assert_eq!(&v6_and_port[..16], &std::net::Ipv6Addr::LOCALHOST.octets());
+            assert_eq!(u16::from_be_bytes([v6_and_port[16], v6_and_port[17]]), 8080);
+            s.write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0])
+                .await
+                .unwrap();
+
+            // 4. Forwarded origin-form HTTP request
+            let (head, _) = read_http_head(&mut s).await.unwrap();
+            let head_str = String::from_utf8_lossy(&head);
+            assert!(head_str.starts_with("GET /v6path HTTP/1.1"));
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nsocks6-ok")
+                .await
+                .unwrap();
+            let _ = s.shutdown().await;
+        });
+
+        let relay = ProxyRelay::start(&ProxyConfig {
+            server: format!("socks5h://u:p@[::1]:{}", socks_addr.port()),
+            username: None,
+            password: None,
+            bypass: Vec::new(),
+        })
+        .await
+        .expect("start relay with IPv6 SOCKS5 upstream");
+
+        let mut client = TcpStream::connect(relay.local_addr()).await.unwrap();
+        client
+            .write_all(b"GET http://[::1]:8080/v6path HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), client.read_to_end(&mut resp))
+            .await
+            .expect("SOCKS5 IPv6 target response")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&resp).ends_with("\r\n\r\nsocks6-ok"));
+        let _ = srv.await;
     }
 }

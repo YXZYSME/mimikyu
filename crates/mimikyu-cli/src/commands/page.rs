@@ -11,6 +11,7 @@ use serde_json::Value;
 use crate::batch::load_normalized_batch_actions;
 use crate::cli::{BatchArgs, SnapshotArgs, WaitArgs};
 use crate::client::ExecClient;
+use crate::commands::absolutize_cli_path;
 use crate::output::{format_batch_failure, print_json_ok, CliError};
 
 fn emit_value(json_mode: bool, data: &Value, human: impl FnOnce()) -> anyhow::Result<()> {
@@ -206,6 +207,7 @@ pub async fn run_upload(
     path: PathBuf,
     json_mode: bool,
 ) -> anyhow::Result<()> {
+    let path = absolutize_cli_path(path)?;
     let data = client
         .call(DaemonOp::Upload {
             session_id: session_id.to_string(),
@@ -393,6 +395,7 @@ pub async fn run_screenshot(
     full_page: bool,
     json_mode: bool,
 ) -> anyhow::Result<()> {
+    let out_path = absolutize_cli_path(out_path)?;
     let data = client
         .call(DaemonOp::Screenshot {
             session_id: session_id.to_string(),
@@ -418,6 +421,7 @@ pub async fn run_pdf(
     out_path: PathBuf,
     json_mode: bool,
 ) -> anyhow::Result<()> {
+    let out_path = absolutize_cli_path(out_path)?;
     let data = client
         .call(DaemonOp::Pdf {
             session_id: session_id.to_string(),

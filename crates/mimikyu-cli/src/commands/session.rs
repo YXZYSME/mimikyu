@@ -13,6 +13,7 @@ use crate::cli::{
     SessionSubcommand,
 };
 use crate::client::ExecClient;
+use crate::commands::absolutize_cli_path;
 use crate::output::print_json_ok;
 
 pub fn parse_viewport(raw: &str) -> CoreResult<(u32, u32)> {
@@ -62,6 +63,7 @@ pub async fn handle_session(
             run_session_close(client, target, json_mode).await
         }
         SessionSubcommand::Export { file } => {
+            let file = absolutize_cli_path(file)?;
             let data = client
                 .call(DaemonOp::SessionExport {
                     session_id: global_session.to_string(),
@@ -77,6 +79,7 @@ pub async fn handle_session(
             })
         }
         SessionSubcommand::Import { file } => {
+            let file = absolutize_cli_path(file)?;
             let data = client
                 .call(DaemonOp::SessionImport {
                     session_id: global_session.to_string(),
@@ -94,6 +97,20 @@ pub async fn handle_session(
     }
 }
 
+fn normalize_profile_spec(raw: String) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    let is_path_spec = (trimmed.contains('/') || trimmed.contains('\\'))
+        && !trimmed.starts_with("~/")
+        && !trimmed.starts_with("~\\")
+        && trimmed != "."
+        && trimmed != "..";
+    if is_path_spec && Path::new(trimmed).is_relative() {
+        let abs = absolutize_cli_path(std::path::PathBuf::from(trimmed))?;
+        return Ok(abs.to_string_lossy().into_owned());
+    }
+    Ok(raw)
+}
+
 async fn run_session_new(
     client: &ExecClient,
     args: SessionNewArgs,
@@ -107,11 +124,12 @@ async fn run_session_new(
         .map(str::parse::<PresetKind>)
         .transpose()?;
     let viewport = args.viewport.as_deref().map(parse_viewport).transpose()?;
+    let profile = args.profile.map(normalize_profile_spec).transpose()?;
 
     let opts = SessionCreateOpts {
         session_id: Some(global_session.to_string()),
         engine: global_engine,
-        profile: args.profile,
+        profile,
         ephemeral: args.ephemeral,
         virtual_ctx: args.r#virtual,
         preset,
@@ -209,7 +227,20 @@ pub async fn handle_profile(
             })
         }
         ProfileSubcommand::Export { name, file } => {
+            mimikyu_core::isolation::validate_profile_name(&name)?;
             validate_export_target(&file)?;
+            let profiles = client.call(DaemonOp::ProfileList).await?;
+            let exists = profiles.as_array().is_some_and(|arr| {
+                arr.iter()
+                    .any(|p| p["name"].as_str() == Some(name.as_str()))
+            });
+            if !exists {
+                return Err(MimikyuError::NotFound(format!(
+                    "named profile '{name}' does not exist"
+                ))
+                .into());
+            }
+            let file = absolutize_cli_path(file)?;
             let sid = transient_session_id("prof-exp");
             let opts = SessionCreateOpts {
                 session_id: Some(sid.clone()),
@@ -233,6 +264,7 @@ pub async fn handle_profile(
             })
         }
         ProfileSubcommand::Import { name, file } => {
+            mimikyu_core::isolation::validate_profile_name(&name)?;
             if file.as_os_str().is_empty() || !file.is_file() {
                 return Err(MimikyuError::InvalidConfig(format!(
                     "import file '{}' does not exist or is not a file",
@@ -240,16 +272,28 @@ pub async fn handle_profile(
                 ))
                 .into());
             }
+            let file = absolutize_cli_path(file)?;
+            let _ = mimikyu_core::isolation::load_storage_state(&file)?;
+            let profiles = client.call(DaemonOp::ProfileList).await?;
+            let existed_before = profiles.as_array().is_some_and(|arr| {
+                arr.iter()
+                    .any(|p| p["name"].as_str() == Some(name.as_str()))
+            });
             let sid = transient_session_id("prof-imp");
             let opts = SessionCreateOpts {
                 session_id: Some(sid.clone()),
                 engine: global_engine,
-                profile: Some(name),
+                profile: Some(name.clone()),
                 main_world_eval: true,
                 headless: true,
                 ..Default::default()
             };
-            client.call(DaemonOp::SessionNew(opts)).await?;
+            if let Err(err) = client.call(DaemonOp::SessionNew(opts)).await {
+                if !existed_before {
+                    let _ = client.call(DaemonOp::ProfileDelete { name }).await;
+                }
+                return Err(err.into());
+            }
             let res = client
                 .call(DaemonOp::SessionImport {
                     session_id: sid.clone(),
@@ -257,7 +301,15 @@ pub async fn handle_profile(
                 })
                 .await;
             let _ = client.call(DaemonOp::SessionClose { session_id: sid }).await;
-            let data = res?;
+            let data = match res {
+                Ok(data) => data,
+                Err(err) => {
+                    if !existed_before {
+                        let _ = client.call(DaemonOp::ProfileDelete { name }).await;
+                    }
+                    return Err(err.into());
+                }
+            };
             emit_value(json_mode, &data, || {
                 println!("imported profile from {}", data["path"].as_str().unwrap_or(""));
             })

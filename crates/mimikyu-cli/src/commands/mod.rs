@@ -24,6 +24,13 @@ pub fn resolve_state_dir(explicit: Option<PathBuf>) -> PathBuf {
     explicit.unwrap_or_else(|| SessionManagerConfig::default().state_dir)
 }
 
+pub fn absolutize_cli_path(path: PathBuf) -> anyhow::Result<PathBuf> {
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return Ok(path);
+    }
+    Ok(std::env::current_dir()?.join(path))
+}
+
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     let json_mode = cli.json;
     let global_session = cli.session;

@@ -27,7 +27,7 @@ pub struct Cli {
     pub engine: Option<EngineKind>,
 
     /// State directory for persistent profiles and daemon sockets
-    #[arg(long, global = true)]
+    #[arg(long, global = true, allow_hyphen_values = true)]
     pub state_dir: Option<PathBuf>,
 
     /// Execute directly in-process without starting or connecting to the background daemon
@@ -94,6 +94,7 @@ pub enum Commands {
         /// Target @eN ref or CSS selector
         target: String,
         /// Value to fill
+        #[arg(allow_hyphen_values = true)]
         value: String,
         /// Use kinematic humanize typing
         #[arg(long)]
@@ -105,6 +106,7 @@ pub enum Commands {
         /// Target @eN ref or CSS selector
         target: String,
         /// Text to type
+        #[arg(allow_hyphen_values = true)]
         text: String,
         /// Use kinematic humanize typing cadence
         #[arg(long)]
@@ -116,6 +118,7 @@ pub enum Commands {
         /// Target @eN ref or CSS selector
         target: String,
         /// Option value or label
+        #[arg(allow_hyphen_values = true)]
         value: String,
     },
 
@@ -124,6 +127,7 @@ pub enum Commands {
         /// Target @eN ref or CSS selector
         target: String,
         /// Local file path
+        #[arg(allow_hyphen_values = true)]
         path: PathBuf,
     },
 
@@ -161,6 +165,7 @@ pub enum Commands {
     /// Evaluate JavaScript in isolated world or opt-in main world
     Eval {
         /// JavaScript expression or body to evaluate
+        #[arg(allow_hyphen_values = true)]
         js: String,
         /// Evaluate in the page main world instead of isolated world
         #[arg(long)]
@@ -386,15 +391,15 @@ pub struct WaitArgs {
     pub idle: bool,
 
     /// Wait until page text contains this substring
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub text: Option<String>,
 
     /// Wait until current URL contains this substring
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub url: Option<String>,
 
     /// Wait for CSS selector state
-    #[arg(long)]
+    #[arg(long, allow_hyphen_values = true)]
     pub selector: Option<String>,
 
     /// Desired selector state (attached | visible | hidden | detached)

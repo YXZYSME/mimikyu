@@ -707,6 +707,61 @@ async fn assert_navigation_snapshot_stale_refs_and_m3_ops(engine: EngineKind) {
         t0.elapsed()
     );
 
+    let t_batch = Instant::now();
+    let bad_batch_css = mgr
+        .batch(
+            "s_main",
+            vec![BatchAction::WaitSelector {
+                selector: "div[[[".into(),
+                timeout_ms: Some(10_000),
+                state: None,
+            }],
+        )
+        .await
+        .expect("batch invalid CSS returns BatchReport");
+    assert!(!bad_batch_css.ok);
+    assert!(
+        t_batch.elapsed() < Duration::from_secs(3),
+        "batch WaitSelector invalid CSS took too long: {:?}",
+        t_batch.elapsed()
+    );
+    let bad_batch_err = bad_batch_css.error.expect("batch error");
+    assert!(
+        bad_batch_err.message.contains("invalid CSS selector"),
+        "{engine}: unexpected batch CSS error: {}",
+        bad_batch_err.message
+    );
+
+    for (label, target, expect_not_found) in [
+        ("invalid CSS", "div[[[", false),
+        ("empty", "", false),
+        ("unknown ref", "@e999", true),
+    ] {
+        let t_st = Instant::now();
+        let err = mgr
+            .wait(
+                "s_main",
+                WaitRequest {
+                    idle: true,
+                    stable_target: Some(target.into()),
+                    timeout_ms: Some(10_000),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("wait_idle stable_target must fail fast");
+        assert!(
+            t_st.elapsed() < Duration::from_secs(3),
+            "{engine} wait_idle({label}) stalled: {:?}",
+            t_st.elapsed()
+        );
+        if expect_not_found {
+            assert!(matches!(err, MimikyuError::ElementNotFound(_)));
+        } else {
+            assert!(matches!(err, MimikyuError::InvalidConfig(_)));
+        }
+    }
+
     mgr.open("s_main", &server.url("/spa-delayed"))
         .await
         .expect("open /spa-delayed");
@@ -1437,5 +1492,296 @@ async fn session_manager_download_isolation_and_ephemeral_cleanup_chromium() {
 
 #[tokio::test]
 async fn session_manager_download_isolation_and_ephemeral_cleanup_firefox() {
-    assert_session_download_isolation(EngineKind::Firefox, false).await;
+    assert_session_download_isolation(EngineKind::Firefox, true).await;
+}
+
+#[tokio::test]
+async fn session_manager_nameless_cookie_does_not_brick_persistent_profile() {
+    let server = TestServer::start().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mgr = SessionManager::new(tmp.path().join("state")).expect("SessionManager");
+
+    mgr.create_session(SessionCreateOpts {
+        session_id: Some("p1".into()),
+        profile: Some("p_nameless".into()),
+        ..Default::default()
+    })
+    .await
+    .expect("create p1");
+    mgr.open("p1", &server.url("/"))
+        .await
+        .expect("open /");
+    mgr.eval("p1", "document.cookie = 'js_nameless'; document.cookie = 'good=ok'; true", false)
+        .await
+        .expect("set cookies");
+    mgr.close_session("p1").await.expect("close p1");
+
+    // Reopening the same persistent profile must succeed cleanly
+    mgr.create_session(SessionCreateOpts {
+        session_id: Some("p2".into()),
+        profile: Some("p_nameless".into()),
+        ..Default::default()
+    })
+    .await
+    .expect("reopen p_nameless after nameless JS cookie");
+    mgr.open("p2", &server.url("/"))
+        .await
+        .expect("open / on p2");
+    let val = mgr
+        .eval("p2", "document.cookie", false)
+        .await
+        .expect("read cookies");
+    assert!(
+        val.as_str().unwrap_or("").contains("good=ok"),
+        "valid session cookie should persist: {val:?}"
+    );
+    mgr.shutdown_all().await.expect("shutdown_all");
+}
+
+#[tokio::test]
+async fn session_manager_persistent_and_case_varying_download_dirs_isolated() {
+    let server = TestServer::start().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let mgr = SessionManager::new(state_dir.clone()).expect("SessionManager");
+    let expected_payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+
+    // Persistent profile alice with default session_id="default" must NOT use state_dir/downloads/default
+    mgr.create_session(SessionCreateOpts {
+        session_id: Some("default".into()),
+        profile: Some("alice".into()),
+        ..Default::default()
+    })
+    .await
+    .expect("create alice");
+    mgr.open("default", &server.url("/download-page"))
+        .await
+        .expect("open alice");
+    let snap = mgr.snapshot("default", SnapshotOptions::default()).await.unwrap();
+    let dl_ref = find_ref_by_name_substr(&snap, "Download Sample Bin");
+    mgr.click("default", &dl_ref, None).await.unwrap();
+
+    let alice_dl = state_dir
+        .join("profiles")
+        .join("alice")
+        .join("downloads")
+        .join("sample-rust-test.bin");
+    let got_alice = wait_for_file_bytes(&alice_dl, expected_payload.len()).await;
+    assert_eq!(got_alice, expected_payload);
+    assert!(
+        !state_dir.join("downloads").join("default").exists(),
+        "persistent profile must not write to shared state_dir/downloads/default"
+    );
+    mgr.close_session("default").await.expect("close alice");
+
+    // Case-varying ephemeral session IDs ("Work" vs "work") must not collide on APFS
+    mgr.create_session(SessionCreateOpts {
+        session_id: Some("Work".into()),
+        ephemeral: true,
+        ..Default::default()
+    })
+    .await
+    .expect("create Work");
+    mgr.create_session(SessionCreateOpts {
+        session_id: Some("work".into()),
+        ephemeral: true,
+        ..Default::default()
+    })
+    .await
+    .expect("create work");
+
+    mgr.open("Work", &server.url("/download-page")).await.unwrap();
+    let s_upper = mgr.snapshot("Work", SnapshotOptions::default()).await.unwrap();
+    let r_upper = find_ref_by_name_substr(&s_upper, "Download Sample Bin");
+    mgr.click("Work", &r_upper, None).await.unwrap();
+
+    mgr.open("work", &server.url("/download-page")).await.unwrap();
+    let s_lower = mgr.snapshot("work", SnapshotOptions::default()).await.unwrap();
+    let r_lower = find_ref_by_name_substr(&s_lower, "Download Sample Bin");
+    mgr.click("work", &r_lower, None).await.unwrap();
+
+    let lower_dl = state_dir
+        .join("downloads")
+        .join("work")
+        .join("sample-rust-test.bin");
+    let got_lower = wait_for_file_bytes(&lower_dl, expected_payload.len()).await;
+    assert_eq!(got_lower, expected_payload);
+    assert!(
+        !state_dir
+            .join("downloads")
+            .join("work")
+            .join("sample-rust-test (1).bin")
+            .exists(),
+        "case-varying session IDs must not collide on APFS"
+    );
+
+    mgr.shutdown_all().await.expect("shutdown_all");
+}
+
+#[tokio::test]
+async fn session_manager_shutdown_blocks_concurrent_virtual_pool_spawn() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let mgr = SessionManager::new(tmp.path().join("state")).expect("SessionManager");
+    mgr.shutdown_all().await.expect("shutdown_all");
+
+    let err = mgr
+        .create_session(SessionCreateOpts {
+            session_id: Some("post-shutdown".into()),
+            virtual_ctx: true,
+            ..Default::default()
+        })
+        .await
+        .expect_err("create_session after shutdown_all must return Disposed");
+    assert!(matches!(err, MimikyuError::Disposed));
+}
+
+async fn assert_persistent_profile_import_persists_origins_across_restart(engine: EngineKind) {
+    let server = TestServer::start().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let state_dir = tmp.path().join("state");
+    let origin = server.url("");
+    let state_path = tmp.path().join("imported_state.json");
+    let export_before_nav_path = tmp.path().join("exported_before_nav.json");
+
+    let state_json = serde_json::json!({
+        "cookies": [
+            {
+                "name": "prof_sess",
+                "value": "s_val_99",
+                "domain": "127.0.0.1",
+                "path": "/",
+                "expires": null,
+                "http_only": false,
+                "secure": false,
+                "same_site": null
+            }
+        ],
+        "origins": [
+            {
+                "origin": origin,
+                "local_storage": { "ls_key": "ls_persisted_ok" },
+                "session_storage": { "ss_key": "ss_restored_ok" }
+            }
+        ]
+    });
+    std::fs::write(&state_path, serde_json::to_vec_pretty(&state_json).unwrap()).unwrap();
+
+    // 1. Transient session on about:blank imports StorageState and closes immediately.
+    {
+        let mgr = SessionManager::new(state_dir.clone()).expect("mgr 1");
+        mgr.create_session(SessionCreateOpts {
+            session_id: Some("imp-transient".into()),
+            engine: Some(engine),
+            profile: Some("origin_prof".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("create transient import session");
+        mgr.import_session("imp-transient", &state_path)
+            .await
+            .expect("import_session");
+        mgr.close_session("imp-transient")
+            .await
+            .expect("close transient import session");
+        mgr.shutdown_all().await.expect("shutdown mgr 1");
+    }
+
+    // 2. Simulate fresh daemon restart (new SessionManager): export before nav retains pending origins,
+    //    then navigating to target origin hydrates localStorage, sessionStorage, and cookies.
+    {
+        let mgr = SessionManager::new(state_dir.clone()).expect("mgr 2");
+        mgr.create_session(SessionCreateOpts {
+            session_id: Some("use-prof".into()),
+            engine: Some(engine),
+            profile: Some("origin_prof".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("reopen persistent profile");
+
+        mgr.export_session("use-prof", &export_before_nav_path)
+            .await
+            .expect("export before nav");
+        let pre_exp: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&export_before_nav_path).unwrap()).unwrap();
+        assert_eq!(
+            pre_exp["origins"].as_array().map(Vec::len),
+            Some(1),
+            "{engine}: unhydrated origin must survive in profile export before nav: {pre_exp}"
+        );
+
+        mgr.open("use-prof", &server.url("/"))
+            .await
+            .expect("open target origin");
+
+        assert_eq!(
+            mgr.eval("use-prof", "localStorage.getItem('ls_key')", false)
+                .await
+                .unwrap(),
+            serde_json::json!("ls_persisted_ok"),
+            "{engine}: localStorage must restore on target origin"
+        );
+        assert_eq!(
+            mgr.eval("use-prof", "sessionStorage.getItem('ss_key')", false)
+                .await
+                .unwrap(),
+            serde_json::json!("ss_restored_ok"),
+            "{engine}: sessionStorage must restore on target origin"
+        );
+        let ck = mgr
+            .eval("use-prof", "document.cookie", false)
+            .await
+            .unwrap();
+        assert!(
+            ck.as_str().unwrap_or("").contains("prof_sess=s_val_99"),
+            "{engine}: cookie missing: {ck}"
+        );
+
+        // Mutate localStorage after hydration; subsequent restart must preserve the mutation
+        // rather than overwriting it with stale imported origin data.
+        mgr.eval(
+            "use-prof",
+            "localStorage.setItem('ls_key', 'ls_mutated_ok')",
+            false,
+        )
+        .await
+        .expect("mutate localStorage");
+
+        mgr.close_session("use-prof").await.expect("close use-prof");
+        mgr.shutdown_all().await.expect("shutdown mgr 2");
+    }
+
+    // 3. Reopen profile after hydration: localStorage mutation persists from browser profile disk.
+    {
+        let mgr = SessionManager::new(state_dir.clone()).expect("mgr 3");
+        mgr.create_session(SessionCreateOpts {
+            session_id: Some("use-prof-2".into()),
+            engine: Some(engine),
+            profile: Some("origin_prof".into()),
+            ..Default::default()
+        })
+        .await
+        .expect("reopen persistent profile 2");
+        mgr.open("use-prof-2", &server.url("/"))
+            .await
+            .expect("open target origin 2");
+        assert_eq!(
+            mgr.eval("use-prof-2", "localStorage.getItem('ls_key')", false)
+                .await
+                .unwrap(),
+            serde_json::json!("ls_mutated_ok"),
+            "{engine}: mutated localStorage must not be overwritten by stale sidecar"
+        );
+        mgr.shutdown_all().await.expect("shutdown mgr 3");
+    }
+}
+
+#[tokio::test]
+async fn persistent_profile_import_persists_origins_across_restart_chromium() {
+    assert_persistent_profile_import_persists_origins_across_restart(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn persistent_profile_import_persists_origins_across_restart_firefox() {
+    assert_persistent_profile_import_persists_origins_across_restart(EngineKind::Firefox).await;
 }

@@ -56,20 +56,49 @@ pub struct LinkExtractResult {
 }
 
 const JS_COLLECT_LINKS: &str = r#"
+const isVisible = (el) => {
+    if (!el || el.nodeType !== 1) return false;
+    if (el.hasAttribute('hidden') || el.getAttribute('aria-hidden') === 'true') return false;
+    try {
+        const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+        const cs = win.getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+    } catch {}
+    return true;
+};
+const isSubtreeVisible = (startEl) => {
+    let cur = startEl;
+    while (cur) {
+        if (cur.nodeType === 1) {
+            if (!isVisible(cur)) return false;
+            cur = cur.parentElement || (cur.getRootNode ? cur.getRootNode().host : null);
+        } else if (cur.nodeType === 11) {
+            cur = cur.host || null;
+        } else {
+            cur = null;
+        }
+    }
+    return true;
+};
+const isInsideScope = (startEl, scopeRoot) => {
+    if (!scopeRoot) return false;
+    let cur = startEl;
+    while (cur) {
+        if (cur === scopeRoot) return true;
+        if (cur.nodeType === 1) {
+            cur = cur.parentElement || (cur.getRootNode ? cur.getRootNode().host : null);
+        } else if (cur.nodeType === 11) {
+            cur = cur.host || null;
+        } else {
+            cur = null;
+        }
+    }
+    return false;
+};
 const collectLinksFromRoot = (root, includeShadow, frameId) => {
     const out = [];
     const seen = new Set();
     const origin = window.location.origin;
-    const isVisible = (el) => {
-        if (!el || el.nodeType !== 1) return false;
-        if (el.hasAttribute('hidden') || el.getAttribute('aria-hidden') === 'true') return false;
-        try {
-            const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
-            const cs = win.getComputedStyle(el);
-            if (cs.display === 'none' || cs.visibility === 'hidden') return false;
-        } catch {}
-        return true;
-    };
     const visit = (node) => {
         if (!node) return;
         if (node.nodeType === 1) {
@@ -132,10 +161,7 @@ async fn extract_links_in_frame(
     let val = session.eval_isolated_in_frame(&js, frame_id).await?;
     let mut links: Vec<ExtractedLink> = serde_json::from_value(val).unwrap_or_default();
 
-    if opts.include_shadow_dom
-        && session.capabilities().supports_closed_shadow_dom
-        && opts.selector.is_none()
-    {
+    if opts.include_shadow_dom && session.capabilities().supports_closed_shadow_dom {
         let owned_main_fid;
         let shadow_fid = match frame_id {
             Some(f) => Some(f),
@@ -153,8 +179,11 @@ async fn extract_links_in_frame(
             .await
             .unwrap_or_default();
         let fn_decl = format!(
-            r#"function(fid) {{
+            r#"function(fid, sel) {{
                 {JS_COLLECT_LINKS}
+                if (!this || !this.host || !isSubtreeVisible(this.host)) return [];
+                const scopeRoot = sel ? document.querySelector(sel) : (document.body || document.documentElement);
+                if (!isInsideScope(this.host, scopeRoot)) return [];
                 return collectLinksFromRoot(this, true, fid);
             }}"#
         );
@@ -164,7 +193,10 @@ async fn extract_links_in_frame(
                     bid,
                     frame_id,
                     &fn_decl,
-                    vec![serde_json::json!(frame_id)],
+                    vec![
+                        serde_json::json!(frame_id),
+                        serde_json::json!(opts.selector),
+                    ],
                 )
                 .await
                 && let Ok(sr_links) = serde_json::from_value::<Vec<ExtractedLink>>(sr_val)

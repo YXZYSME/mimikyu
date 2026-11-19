@@ -463,13 +463,19 @@ pub fn build_chromium_args(
         args.push("--headless=new".to_string());
     }
 
-    if let Some(ref env) = opts.env_profile {
-        if env.disable_automation_controlled {
-            args.push("--disable-blink-features=AutomationControlled".to_string());
-        }
-        if !env.locale.is_empty() {
-            args.push(format!("--lang={}", env.locale));
-        }
+    let disable_automation = opts
+        .env_profile
+        .as_ref()
+        .map(|e| e.disable_automation_controlled)
+        .unwrap_or(true);
+    if disable_automation {
+        args.push("--disable-blink-features=AutomationControlled".to_string());
+    }
+
+    if let Some(ref env) = opts.env_profile
+        && !env.locale.is_empty()
+    {
+        args.push(format!("--lang={}", env.locale));
     }
 
     match effective_webrtc_policy(opts) {
@@ -761,8 +767,51 @@ fn spawn_stderr_drain(
     })
 }
 
+/// Strip mimikyu-managed dynamic preference entries from an existing `prefs.js`
+/// so persistent profiles do not retain stale `EnvProfile`/`WebRtcPolicy`/`ProxyConfig`
+/// overrides across relaunches when omitted.
+fn strip_managed_firefox_prefs_js(profile_dir: &Path) -> Result<()> {
+    const MANAGED_PREFIXES: &[&str] = &[
+        "user_pref(\"general.useragent.override\",",
+        "user_pref(\"intl.accept_languages\",",
+        "user_pref(\"intl.locale.requested\",",
+        "user_pref(\"media.peerconnection.enabled\",",
+        "user_pref(\"media.peerconnection.ice.default_address_only\",",
+        "user_pref(\"media.peerconnection.ice.no_host\",",
+        "user_pref(\"media.peerconnection.ice.proxy_only_if_behind_proxy\",",
+        "user_pref(\"network.proxy.",
+        "user_pref(\"browser.download.folderList\",",
+        "user_pref(\"browser.download.dir\",",
+        "user_pref(\"browser.download.useDownloadDir\",",
+        "user_pref(\"browser.download.alwaysOpenPanel\",",
+        "user_pref(\"browser.download.manager.showWhenStarting\",",
+        "user_pref(\"browser.helperApps.neverAsk.saveToDisk\",",
+    ];
+    let prefs_path = profile_dir.join("prefs.js");
+    let content = match fs::read_to_string(&prefs_path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(MimikyuError::Io(e)),
+    };
+    let mut changed = false;
+    let mut filtered = String::with_capacity(content.len());
+    for line in content.split_inclusive('\n') {
+        let trimmed = line.trim_start();
+        if MANAGED_PREFIXES.iter().any(|p| trimmed.starts_with(p)) {
+            changed = true;
+            continue;
+        }
+        filtered.push_str(line);
+    }
+    if changed {
+        fs::write(&prefs_path, filtered)?;
+    }
+    Ok(())
+}
+
 /// Write R3-compliant debloated `user.js` into the Firefox profile directory before launch.
 pub fn write_firefox_user_js(profile_dir: &Path, opts: &LaunchOptions) -> Result<()> {
+    strip_managed_firefox_prefs_js(profile_dir)?;
     let mut prefs = String::from(FIREFOX_DEBLOATED_USER_JS);
 
     if let Some(ref env) = opts.env_profile {
@@ -878,7 +927,11 @@ fn append_firefox_proxy_prefs(
     bypass: &[String],
 ) -> Result<()> {
     let parsed = crate::driver::parse_proxy_url(server)?;
-    let host = parsed.host_str().unwrap_or("127.0.0.1");
+    let raw_host = parsed.host_str().unwrap_or("127.0.0.1");
+    let host = raw_host
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(raw_host);
     let port = resolve_proxy_port(&parsed);
 
     prefs.push_str("user_pref(\"network.proxy.type\", 1);\n");
@@ -1353,6 +1406,49 @@ mod tests {
             content.contains(&format!("user_pref(\"browser.download.dir\", {expected_json});")),
             "expected escaped download.dir {expected_json} in:\n{content}"
         );
+    }
+
+    #[test]
+    fn write_firefox_user_js_strips_ipv6_brackets_for_proxy_prefs() {
+        let dir_http = tempfile::tempdir().unwrap();
+        let opts_http = LaunchOptions {
+            engine: EngineKind::Firefox,
+            profile_mode: ProfileMode::EphemeralDir,
+            proxy: Some(crate::driver::ProxyConfig {
+                server: "http://[::1]:8118".to_string(),
+                username: None,
+                password: None,
+                bypass: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        write_firefox_user_js(dir_http.path(), &opts_http).unwrap();
+        let http_prefs = fs::read_to_string(dir_http.path().join("user.js")).unwrap();
+        assert!(http_prefs.contains("user_pref(\"network.proxy.http\", \"::1\");"));
+        assert!(http_prefs.contains("user_pref(\"network.proxy.http_port\", 8118);"));
+        assert!(http_prefs.contains("user_pref(\"network.proxy.ssl\", \"::1\");"));
+        assert!(http_prefs.contains("user_pref(\"network.proxy.ssl_port\", 8118);"));
+        assert!(!http_prefs.contains("\"[::1]\""));
+
+        let dir_socks = tempfile::tempdir().unwrap();
+        let opts_socks = LaunchOptions {
+            engine: EngineKind::Firefox,
+            profile_mode: ProfileMode::EphemeralDir,
+            proxy: Some(crate::driver::ProxyConfig {
+                server: "socks5h://[::1]:1080".to_string(),
+                username: None,
+                password: None,
+                bypass: Vec::new(),
+            }),
+            ..Default::default()
+        };
+        write_firefox_user_js(dir_socks.path(), &opts_socks).unwrap();
+        let socks_prefs = fs::read_to_string(dir_socks.path().join("user.js")).unwrap();
+        assert!(socks_prefs.contains("user_pref(\"network.proxy.socks\", \"::1\");"));
+        assert!(socks_prefs.contains("user_pref(\"network.proxy.socks_port\", 1080);"));
+        assert!(socks_prefs.contains("user_pref(\"network.proxy.socks_version\", 5);"));
+        assert!(socks_prefs.contains("user_pref(\"network.proxy.socks_remote_dns\", true);"));
+        assert!(!socks_prefs.contains("\"[::1]\""));
     }
 }
 

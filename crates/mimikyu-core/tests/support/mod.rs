@@ -10,9 +10,12 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
+type RecordedHeaders = Vec<(String, BTreeMap<String, String>)>;
+
 pub struct TestServer {
     addr: SocketAddr,
     hits: Arc<Mutex<Vec<String>>>,
+    req_headers: Arc<Mutex<RecordedHeaders>>,
     cache_counter: Arc<AtomicUsize>,
     task: JoinHandle<()>,
 }
@@ -25,8 +28,14 @@ impl TestServer {
         let addr = listener.local_addr().expect("local_addr");
         let hits = Arc::new(Mutex::new(Vec::new()));
         let hits_clone = Arc::clone(&hits);
+        let req_headers = Arc::new(Mutex::new(Vec::new()));
+        let req_headers_clone = Arc::clone(&req_headers);
         let cache_counter = Arc::new(AtomicUsize::new(0));
         let cache_clone = Arc::clone(&cache_counter);
+        let flaky_counter = Arc::new(AtomicUsize::new(0));
+        let flaky_clone = Arc::clone(&flaky_counter);
+        let cd_reset_counter = Arc::new(AtomicUsize::new(0));
+        let cd_reset_clone = Arc::clone(&cd_reset_counter);
 
         let task = tokio::spawn(async move {
             loop {
@@ -34,7 +43,10 @@ impl TestServer {
                     break;
                 };
                 let hits_req = Arc::clone(&hits_clone);
+                let req_headers_req = Arc::clone(&req_headers_clone);
                 let cache_req = Arc::clone(&cache_clone);
+                let flaky_req = Arc::clone(&flaky_clone);
+                let cd_reset_req = Arc::clone(&cd_reset_clone);
                 tokio::spawn(async move {
                     let mut buf = Vec::with_capacity(4096);
                     let mut tmp = [0u8; 2048];
@@ -73,6 +85,9 @@ impl TestServer {
                     }
 
                     hits_req.lock().push(format!("{method} {raw_target}"));
+                    req_headers_req
+                        .lock()
+                        .push((format!("{method} {raw_target}"), headers.clone()));
 
                     if (method, path) == ("GET", "/sse-stream") {
                         let hdr = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\n\r\ndata: hello\n\n";
@@ -80,6 +95,122 @@ impl TestServer {
                             let _ = stream.flush().await;
                             tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
                             let _ = stream.write_all(b"data: done\n\n").await;
+                        }
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+
+                    if (method, path) == ("GET", "/download/slow-same.bin") {
+                        let payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"same.bin\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        );
+                        if stream.write_all(hdr.as_bytes()).await.is_ok()
+                            && stream.write_all(&payload[..512]).await.is_ok()
+                        {
+                            let _ = stream.flush().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(320)).await;
+                            let _ = stream.write_all(&payload[512..]).await;
+                            let _ = stream.flush().await;
+                        }
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+
+                    if (method, path) == ("GET", "/download/abort.bin") {
+                        let partial: Vec<u8> = vec![0xAB; 512];
+                        let hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"abort.bin\"\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n";
+                        if stream.write_all(hdr.as_bytes()).await.is_ok()
+                            && stream.write_all(&partial).await.is_ok()
+                        {
+                            let _ = stream.flush().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                        }
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+
+                    if (method, path) == ("GET", "/download/popup-slow.bin") {
+                        let payload: Vec<u8> = (0..4096).map(|i| ((i * 3 + 11) % 251) as u8).collect();
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"popup-slow.bin\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        );
+                        if stream.write_all(hdr.as_bytes()).await.is_ok()
+                            && stream.write_all(&payload[..512]).await.is_ok()
+                        {
+                            let _ = stream.flush().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            let _ = stream.write_all(&payload[512..]).await;
+                            let _ = stream.flush().await;
+                        }
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+
+                    if (method, path) == ("GET", "/download/flaky-same.bin") {
+                        let seq = flaky_req.fetch_add(1, Ordering::SeqCst) + 1;
+                        if seq == 1 {
+                            let payload: Vec<u8> =
+                                (0..4096).map(|i| ((i * 5 + 3) % 251) as u8).collect();
+                            let hdr = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                payload.len()
+                            );
+                            if stream.write_all(hdr.as_bytes()).await.is_ok()
+                                && stream.write_all(&payload[..512]).await.is_ok()
+                            {
+                                let _ = stream.flush().await;
+                                tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+                                let _ = stream.write_all(&payload[512..]).await;
+                                let _ = stream.flush().await;
+                            }
+                        } else {
+                            let partial: Vec<u8> = vec![0xCD; 512];
+                            let hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n";
+                            if stream.write_all(hdr.as_bytes()).await.is_ok()
+                                && stream.write_all(&partial).await.is_ok()
+                            {
+                                let _ = stream.flush().await;
+                                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            }
+                        }
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+
+                    if (method, path) == ("GET", "/download/asset-poison.bin") {
+                        let payload: Vec<u8> = (0..4096).map(|i| ((i * 9 + 5) % 251) as u8).collect();
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        );
+                        if stream.write_all(hdr.as_bytes()).await.is_ok()
+                            && stream.write_all(&payload[..512]).await.is_ok()
+                        {
+                            let _ = stream.flush().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                            let _ = stream.write_all(&payload[512..]).await;
+                            let _ = stream.flush().await;
+                        }
+                        let _ = stream.shutdown().await;
+                        return;
+                    }
+
+                    if (method, path) == ("GET", "/download/slow-hold.bin") {
+                        let payload: Vec<u8> = (0..4096).map(|i| ((i + 19) % 251) as u8).collect();
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"slow-hold.bin\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            payload.len()
+                        );
+                        if stream.write_all(hdr.as_bytes()).await.is_ok()
+                            && stream.write_all(&payload[..512]).await.is_ok()
+                        {
+                            let _ = stream.flush().await;
+                            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                            let _ = stream.write_all(&payload[512..]).await;
+                            let _ = stream.flush().await;
                         }
                         let _ = stream.shutdown().await;
                         return;
@@ -2274,6 +2405,1322 @@ self.onconnect = (e) => {
                                 payload,
                             )
                         }
+                        ("GET", "/download-slow-page") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Slow Download Test</title></head>
+<body>
+  <a id="dl-slow" href="/download/slow-same.bin" download="same.bin">Slow Same</a>
+  <a id="dl-fast" href="/download/fast-same.bin" download="same.bin">Fast Same</a>
+  <a id="dl-abort" href="/download/abort.bin" download="abort.bin">Abort</a>
+  <a id="dl-empty" href="/download/empty.bin" download="empty.bin">Empty</a>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/download/fast-same.bin") => {
+                            let payload: Vec<u8> = (0..512).map(|i| ((i + 7) % 251) as u8).collect();
+                            (
+                                "200 OK",
+                                "application/octet-stream",
+                                vec![(
+                                    "Content-Disposition",
+                                    "attachment; filename=\"same.bin\"".to_string(),
+                                )],
+                                payload,
+                            )
+                        }
+                        ("GET", "/download/empty.bin") => (
+                            "200 OK",
+                            "application/octet-stream",
+                            vec![(
+                                "Content-Disposition",
+                                "attachment; filename=\"empty.bin\"".to_string(),
+                            )],
+                            Vec::new(),
+                        ),
+                        ("GET", "/popup-download-host") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Popup Download Host</title></head>
+<body>
+  <button id="popup-dl" style="padding:8px;" onclick="window.open('/popup-dl.html')">Popup DL</button>
+  <a id="blank-dl" style="display:inline-block;padding:8px;" href="/download/popup-direct.bin" target="_blank">Blank DL</a>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/popup-dl.html") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Popup DL Redirect</title></head>
+<body>
+  <p>Starting download...</p>
+  <script>window.location.href = '/download/popup-slow.bin';</script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/download/popup-direct.bin") => {
+                            let payload: Vec<u8> =
+                                (0..1024).map(|i| ((i * 7 + 1) % 251) as u8).collect();
+                            (
+                                "200 OK",
+                                "application/octet-stream",
+                                vec![(
+                                    "Content-Disposition",
+                                    "attachment; filename=\"popup-direct.bin\"".to_string(),
+                                )],
+                                payload,
+                            )
+                        }
+                        ("GET", "/download-same-url-concurrent-page") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Same URL Concurrent Download</title></head>
+<body>
+  <a id="d1" style="display:inline-block;padding:8px;" href="/download/flaky-same.bin" download="ok.bin">Download OK</a>
+  <a id="d2" style="display:inline-block;padding:8px;" href="/download/flaky-same.bin" download="fail.bin">Download Fail</a>
+  <a id="d-hold" style="display:inline-block;padding:8px;" href="/download/slow-hold.bin" download="slow-hold.bin">Slow Hold</a>
+  <a id="d-empty" style="display:inline-block;padding:8px;" href="/download/empty.bin" download="empty.bin">Empty</a>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/download/zero-poison.bin") => (
+                            "200 OK",
+                            "application/octet-stream",
+                            vec![],
+                            Vec::new(),
+                        ),
+                        ("GET", "/download-after-fetch-page") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Download After Fetch</title></head>
+<body>
+  <a id="dl-after-abort" style="display:inline-block;padding:8px;" href="/download/asset-poison.bin" download="ok-after-abort.bin">After Abort</a>
+  <a id="dl-after-ok" style="display:inline-block;padding:8px;" href="/download/asset-poison.bin" download="ok-after-fetch.bin">After OK Fetch</a>
+  <a id="dl-zero-after-ok" style="display:inline-block;padding:8px;" href="/download/zero-poison.bin" download="zero-after-fetch.bin">Zero After Fetch</a>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/iframe-selector-host") => {
+                            let xo_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("xo="))
+                                .unwrap_or("/iframe-selector-sub");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>Iframe Selector Host</title></head>
+<body>
+  <iframe id="so-sel-ifr" src="/iframe-selector-sub" style="display:block;width:340px;height:180px;"></iframe>
+  <iframe id="xo-sel-ifr" src="{xo_url}" style="display:block;width:340px;height:180px;"></iframe>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/iframe-selector-sub") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Iframe Selector Sub</title></head>
+<body>
+  <select id="sub-sel">
+    <option value="a">Alpha</option>
+    <option value="b">Beta</option>
+  </select>
+  <input id="sub-inp" type="text" value="initial-sub-val" />
+  <div style="height:1200px;">spacer</div>
+  <button id="sub-bottom">SubBottom</button>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/oopif-net-host") => {
+                            let xo_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("xo="))
+                                .unwrap_or("/oopif-net-sub");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>OOPIF Net Host</title></head>
+<body>
+  <iframe id="oopif-net-frame" src="{xo_url}" style="display:block;width:360px;height:200px;"></iframe>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/oopif-net-sub") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>OOPIF Net Sub</title></head>
+<body>
+  <p id="oopif-sub-ok">oopif-sub-loaded</p>
+  <img id="oopif-img" src="/assets/sub-avatar?id=7" alt="oopif-img" />
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/oopif-net-worker.js") => (
+                            "200 OK",
+                            "application/javascript; charset=utf-8",
+                            vec![],
+                            br#"self.onmessage = async (ev) => {
+  const { blockUrl, mockUrl } = ev.data;
+  let blockedOk = false;
+  try {
+    const r = await fetch(blockUrl);
+    blockedOk = r.ok;
+  } catch {
+    blockedOk = false;
+  }
+  const mocked = await (await fetch(mockUrl)).json();
+  self.postMessage({ blockedOk, mocked });
+};"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/worker-rel-page") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Worker Rel Probe</title></head>
+<body>
+  <pre id="classic-out"></pre>
+  <pre id="module-out"></pre>
+  <pre id="shared-out"></pre>
+  <pre id="dyn-out"></pre>
+  <button id="ping-worker" onclick="window.__relWorker.postMessage('ping')">Ping</button>
+  <script>
+    const w = new Worker('/sub/worker-rel-test.js');
+    window.__relWorker = w;
+    w.onmessage = (ev) => {
+      if (ev.data && ev.data.dynFetch) {
+        document.getElementById('dyn-out').textContent = JSON.stringify(ev.data);
+      } else {
+        document.getElementById('classic-out').textContent = JSON.stringify(ev.data);
+      }
+    };
+    w.onerror = (err) => {
+      document.getElementById('classic-out').textContent = JSON.stringify({ error: String(err.message || err) });
+    };
+    const mw = new Worker('/sub/worker-rel-test.mjs', { type: 'module' });
+    mw.onmessage = (ev) => {
+      document.getElementById('module-out').textContent = JSON.stringify(ev.data);
+    };
+    mw.onerror = (err) => {
+      document.getElementById('module-out').textContent = JSON.stringify({ error: String(err.message || err) });
+    };
+    if (typeof SharedWorker === 'function') {
+      try {
+        const sw = new SharedWorker('/sub/worker-shared-rel.js');
+        sw.port.onmessage = (ev) => {
+          document.getElementById('shared-out').textContent = JSON.stringify(ev.data);
+        };
+        sw.onerror = (err) => {
+          document.getElementById('shared-out').textContent = JSON.stringify({ error: String(err.message || err) });
+        };
+        sw.port.start();
+      } catch (e) {
+        document.getElementById('shared-out').textContent = JSON.stringify({ unsupported: true, error: String(e) });
+      }
+    } else {
+      document.getElementById('shared-out').textContent = JSON.stringify({ unsupported: true });
+    }
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/sub/worker-rel-helper.js") => (
+                            "200 OK",
+                            "application/javascript; charset=utf-8",
+                            vec![],
+                            br#"self.__relHelperLoaded = 'classic-rel-helper-ok';"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/sub/worker-rel-test.js") => (
+                            "200 OK",
+                            "application/javascript; charset=utf-8",
+                            vec![],
+                            br#"(async () => {
+  try {
+    importScripts('./worker-rel-helper.js');
+    const relFetch = await (await fetch('/echo-env')).json();
+    const reqFetch = await (await fetch(new Request('../echo-env'))).json();
+    const xhrEcho = await new Promise((resolve, reject) => {
+      const x = new XMLHttpRequest();
+      x.open('GET', '/echo-env');
+      x.onload = () => resolve(JSON.parse(x.responseText));
+      x.onerror = () => reject(new Error('xhr-failed'));
+      x.send();
+    });
+    const relResolved = new URL('./sibling.json', self.location.href).href;
+    const relFromLocObj = new URL('./sibling.json', self.location).href;
+    self.postMessage({
+      helperLoaded: self.__relHelperLoaded || null,
+      locHref: self.location.href,
+      locPathname: self.location.pathname,
+      relResolved,
+      relFromLocObj,
+      relFetch,
+      reqFetch,
+      xhrEcho
+    });
+  } catch (e) {
+    self.postMessage({ error: String(e), locHref: self.location.href });
+  }
+})();
+self.onmessage = async () => {
+  try {
+    const dynFetch = await (await fetch('/echo-env')).json();
+    self.postMessage({ dynFetch });
+  } catch (e) {
+    self.postMessage({ dynFetch: { error: String(e) } });
+  }
+};"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/sub/worker-shared-rel.js") => (
+                            "200 OK",
+                            "application/javascript; charset=utf-8",
+                            vec![],
+                            br#"self.onconnect = async (ev) => {
+  const port = ev.ports[0];
+  try {
+    const relFetch = await (await fetch('/echo-env')).json();
+    const relFromLocObj = new URL('./sibling.json', self.location).href;
+    port.postMessage({ locHref: self.location.href, relFromLocObj, relFetch });
+  } catch (e) {
+    port.postMessage({ error: String(e), locHref: self.location.href });
+  }
+};"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/sub/worker-rel-test.mjs") => (
+                            "200 OK",
+                            "application/javascript; charset=utf-8",
+                            vec![],
+                            br#"try {
+  const relFetch = await (await fetch('/echo-env')).json();
+  const reqFetch = await (await fetch(new Request('../echo-env'))).json();
+  const relResolved = new URL('./sibling.json', self.location.href).href;
+  self.postMessage({
+    locHref: self.location.href,
+    metaUrl: import.meta.url,
+    relResolved,
+    relFetch,
+    reqFetch
+  });
+} catch (e) {
+  self.postMessage({ error: String(e), locHref: self.location.href });
+}"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/nested-worker-page") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Nested Worker & Srcdoc Probe</title></head>
+<body>
+  <pre id="nested-out"></pre>
+  <pre id="srcdoc-out"></pre>
+  <pre id="nested-dyn-out"></pre>
+  <button id="ping-nested" onclick="window.__outerWorker.postMessage('ping-l2')">Ping L2</button>
+  <script>
+    const outer = new Worker('/sub/outer-worker.js');
+    window.__outerWorker = outer;
+    outer.onmessage = (ev) => {
+      if (ev.data && ev.data.dynL2) {
+        document.getElementById('nested-dyn-out').textContent = JSON.stringify(ev.data.dynL2);
+      } else {
+        document.getElementById('nested-out').textContent = JSON.stringify(ev.data);
+      }
+    };
+    outer.onerror = (err) => {
+      document.getElementById('nested-out').textContent = JSON.stringify({ error: String(err.message || err) });
+    };
+    window.addEventListener('message', (ev) => {
+      if (ev.data && ev.data.srcdocWorker) {
+        document.getElementById('srcdoc-out').textContent = JSON.stringify(ev.data.srcdocWorker);
+      }
+    });
+  </script>
+  <iframe id="srcdoc-frame" srcdoc="<!doctype html><script>
+    const w = new Worker('/sub/inner-worker.js');
+    w.onmessage = (ev) => parent.postMessage({ srcdocWorker: ev.data }, '*');
+    w.onerror = (err) => parent.postMessage({ srcdocWorker: { error: String(err.message || err) } }, '*');
+  </script>"></iframe>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/sub/outer-worker.js") => (
+                            "200 OK",
+                            "application/javascript; charset=utf-8",
+                            vec![],
+                            br#"function runChild(url, opts) {
+  return new Promise((resolve) => {
+    try {
+      const w = opts ? new Worker(url, opts) : new Worker(url);
+      w.onmessage = (ev) => resolve({ ok: true, data: ev.data, worker: w });
+      w.onerror = (err) => resolve({ ok: false, err: String(err.message || err) });
+    } catch (e) {
+      resolve({ ok: false, throwErr: String(e) });
+    }
+  });
+}
+(async () => {
+  const rel = await runChild('./inner-worker.js');
+  const rootRel = await runChild('/sub/inner-worker.js');
+  const abs = await runChild(self.location.origin + '/sub/inner-worker.js');
+  const mod = await runChild('./inner-mod.mjs', { type: 'module' });
+  const l2 = await runChild('./inner-worker-l2.js');
+  self.__l2Worker = l2.worker || null;
+  self.postMessage({
+    outerHref: self.location.href,
+    outerHc: navigator.hardwareConcurrency,
+    rel: { ok: rel.ok, data: rel.data || null, err: rel.err || rel.throwErr || null },
+    rootRel: { ok: rootRel.ok, data: rootRel.data || null, err: rootRel.err || rootRel.throwErr || null },
+    abs: { ok: abs.ok, data: abs.data || null, err: abs.err || abs.throwErr || null },
+    mod: { ok: mod.ok, data: mod.data || null, err: mod.err || mod.throwErr || null },
+    l2: { ok: l2.ok, data: l2.data || null, err: l2.err || l2.throwErr || null }
+  });
+})();
+self.onmessage = (ev) => {
+  if (ev.data === 'ping-l2' && self.__l2Worker) {
+    self.__l2Worker.onmessage = (e2) => self.postMessage({ dynL2: e2.data });
+    self.__l2Worker.postMessage('ping-inner');
+  }
+};"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/sub/inner-worker-l2.js") => (
+                            "200 OK",
+                            "application/javascript; charset=utf-8",
+                            vec![],
+                            br#"let innerRef = null;
+(async () => {
+  try {
+    const w = new Worker('./inner-worker.js');
+    innerRef = w;
+    w.onmessage = (ev) => {
+      if (ev.data && ev.data.dynInner) {
+        self.postMessage({ dynInner: ev.data.dynInner });
+      } else {
+        self.postMessage({ l2Href: self.location.href, l2Hc: navigator.hardwareConcurrency, inner: ev.data });
+      }
+    };
+    w.onerror = (err) => self.postMessage({ error: String(err.message || err) });
+  } catch (e) {
+    self.postMessage({ error: String(e) });
+  }
+})();
+self.onmessage = (ev) => {
+  if (ev.data === 'ping-inner' && innerRef) {
+    innerRef.postMessage('ping-fetch');
+  }
+};"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/sub/inner-worker.js") => (
+                            "200 OK",
+                            "application/javascript; charset=utf-8",
+                            vec![],
+                            br#"(async () => {
+  try {
+    const env = await (await fetch('/echo-env')).json();
+    self.postMessage({
+      href: self.location.href,
+      hc: navigator.hardwareConcurrency,
+      platform: navigator.platform,
+      ua: navigator.userAgent,
+      tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      xExtra: env['x-worker-extra'] || null
+    });
+  } catch (e) {
+    self.postMessage({ error: String(e) });
+  }
+})();
+self.onmessage = async (ev) => {
+  if (ev.data === 'ping-fetch') {
+    try {
+      const env = await (await fetch('/echo-env')).json();
+      self.postMessage({ dynInner: { xExtra: env['x-worker-extra'] || null, hc: navigator.hardwareConcurrency } });
+    } catch (e) {
+      self.postMessage({ dynInner: { error: String(e) } });
+    }
+  }
+};"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/sub/inner-mod.mjs") => (
+                            "200 OK",
+                            "application/javascript; charset=utf-8",
+                            vec![],
+                            br#"try {
+  const env = await (await fetch('/echo-env')).json();
+  self.postMessage({
+    href: self.location.href,
+    metaUrl: import.meta.url,
+    hc: navigator.hardwareConcurrency,
+    platform: navigator.platform,
+    ua: navigator.userAgent,
+    tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+    xExtra: env['x-worker-extra'] || null
+  });
+} catch (e) {
+  self.postMessage({ error: String(e) });
+}"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/download-cd-reset-page") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>CD Reset Page</title></head>
+<body>
+  <a id="dl-cd" style="display:inline-block;padding:8px;" href="/download/cd-reset.bin">Download With CD</a>
+  <a id="dl-attr" style="display:inline-block;padding:8px;" href="/download/cd-reset.bin" download="client-named.bin">Download Client Named</a>
+  <a id="dl-cd-3" style="display:inline-block;padding:8px;" href="/download/cd-reset.bin">Download With CD 3</a>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/download/cd-reset.bin") => {
+                            let seq = cd_reset_req.fetch_add(1, Ordering::SeqCst) + 1;
+                            let mut hdrs = Vec::new();
+                            if seq == 1 {
+                                hdrs.push((
+                                    "Content-Disposition",
+                                    "attachment; filename=\"first.bin\"".to_string(),
+                                ));
+                            } else if seq == 3 {
+                                hdrs.push((
+                                    "Content-Disposition",
+                                    "attachment; filename=\"third.bin\"".to_string(),
+                                ));
+                            }
+                            let payload = vec![seq as u8; 512];
+                            (
+                                "200 OK",
+                                "application/octet-stream",
+                                hdrs,
+                                payload,
+                            )
+                        }
+                        ("GET", "/popup-probe-host") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Popup Probe Host</title></head>
+<body>
+  <pre id="popup-out"></pre>
+  <pre id="grandchild-out"></pre>
+  <pre id="blank-popup-out"></pre>
+  <pre id="popup-dyn-out"></pre>
+  <button id="open-popup" style="padding:8px;" onclick="window.__pop = window.open('/popup-probe-child', '_blank')">Open Popup</button>
+  <button id="open-blank-popup" style="padding:8px;" onclick="
+    const w = window.open('about:blank', '_blank');
+    const syncOut = {
+      platform: w.navigator.platform,
+      hc: w.navigator.hardwareConcurrency,
+      ua: w.navigator.userAgent,
+      tz: new w.Intl.DateTimeFormat().resolvedOptions().timeZone
+    };
+    w.close();
+    document.getElementById('blank-popup-out').textContent = JSON.stringify(syncOut);
+  ">Open Blank Popup</button>
+  <button id="ping-popup" style="padding:8px;" onclick="if (window.__pop) window.__pop.postMessage('ping-dyn', '*')">Ping Popup</button>
+  <button id="trigger-grandchild" style="padding:8px;" onclick="if (window.__pop) window.__pop.postMessage('open-grandchild', '*')">Trigger Grandchild</button>
+  <script>
+    window.addEventListener('message', (ev) => {
+      if (!ev.data) return;
+      if (ev.data.kind === 'child') {
+        document.getElementById('popup-out').textContent = JSON.stringify(ev.data.payload);
+      } else if (ev.data.kind === 'grandchild') {
+        document.getElementById('grandchild-out').textContent = JSON.stringify(ev.data.payload);
+      } else if (ev.data.kind === 'dyn') {
+        document.getElementById('popup-dyn-out').textContent = JSON.stringify(ev.data.payload);
+      }
+    });
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/popup-probe-child") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Popup Probe Child</title></head>
+<body>
+  <button id="open-grandchild" style="padding:8px;" onclick="window.open('/popup-probe-grandchild', '_blank')">Open Grandchild</button>
+  <script>
+    const syncNav = {
+      platform: navigator.platform,
+      hc: navigator.hardwareConcurrency,
+      ua: navigator.userAgent,
+      tz: Intl.DateTimeFormat().resolvedOptions().timeZone
+    };
+    (async () => {
+      const env = await (await fetch('/echo-env')).json();
+      let mocked = null;
+      try { mocked = await (await fetch('/api/mock-pop-pre')).json(); } catch (e) { mocked = { err: String(e) }; }
+      let blockedOk = false;
+      try { const r = await fetch('/blocked-pop.js'); blockedOk = r.ok; } catch { blockedOk = false; }
+      if (window.opener) {
+        window.opener.postMessage({
+          kind: 'child',
+          payload: {
+            syncNav,
+            xHdr: env['x-probe-hdr'] || null,
+            reqUa: env['user-agent'] || null,
+            mocked,
+            blockedOk
+          }
+        }, '*');
+      }
+    })();
+    window.addEventListener('message', async (ev) => {
+      if (ev.data === 'ping-dyn' && window.opener) {
+        const env = await (await fetch('/echo-env')).json();
+        let dynMock = null;
+        try { dynMock = await (await fetch('/api/mock-pop-dyn')).json(); } catch (e) { dynMock = { err: String(e) }; }
+        window.opener.postMessage({
+          kind: 'dyn',
+          payload: {
+            xHdr: env['x-probe-hdr'] || null,
+            dynMock
+          }
+        }, '*');
+      } else if (ev.data === 'open-grandchild') {
+        window.open('/popup-probe-grandchild', '_blank');
+      } else if (ev.data && ev.data.kind === 'grandchild' && window.opener) {
+        window.opener.postMessage(ev.data, '*');
+      }
+    });
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/popup-probe-grandchild") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Popup Probe Grandchild</title></head>
+<body>
+  <script>
+    (async () => {
+      const env = await (await fetch('/echo-env')).json();
+      let mocked = null;
+      try { mocked = await (await fetch('/api/mock-pop-pre')).json(); } catch (e) { mocked = { err: String(e) }; }
+      const payload = {
+        platform: navigator.platform,
+        hc: navigator.hardwareConcurrency,
+        ua: navigator.userAgent,
+        tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        xHdr: env['x-probe-hdr'] || null,
+        mocked
+      };
+      if (window.opener) window.opener.postMessage({ kind: 'grandchild', payload }, '*');
+    })();
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/popup-xo-env") => {
+                            let xo_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("xo="))
+                                .unwrap_or("/xo-env-probe");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>Popup XO Env</title></head>
+<body>
+  <iframe id="so" src="/xo-env-probe"></iframe>
+  <iframe id="xo" src="{xo_url}"></iframe>
+  <script>
+    const readSelf = async () => {{
+      const echo = await (await fetch('/echo-env')).json();
+      return {{
+        platform: navigator.platform,
+        langs: Array.from(navigator.languages || []),
+        ua: navigator.userAgent,
+        hc: navigator.hardwareConcurrency,
+        tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        screenW: screen.width,
+        uadPlat: navigator.userAgentData ? navigator.userAgentData.platform : null,
+        echo
+      }};
+    }};
+    const results = {{}};
+    const pending = {{}};
+    const askFrame = (id) => new Promise((resolve) => {{
+      pending[id] = resolve;
+      document.getElementById(id).contentWindow.postMessage({{ kind: 'probe', id }}, '*');
+    }});
+    window.addEventListener('message', async (ev) => {{
+      const d = ev.data;
+      if (!d) return;
+      if (d.kind === 'probe-reply' && pending[d.id]) {{
+        const cb = pending[d.id];
+        delete pending[d.id];
+        cb(d.payload);
+      }} else if (d.kind === 'collect-all') {{
+        const [pop, so, xo] = await Promise.all([readSelf(), askFrame('so'), askFrame('xo')]);
+        if (window.opener) {{
+          window.opener.postMessage({{ kind: 'xo-env-report', tag: d.tag, payload: {{ pop, so, xo }} }}, '*');
+        }}
+      }}
+    }});
+    Promise.all([
+      new Promise((r) => {{
+        const f = document.getElementById('so');
+        if (f.contentDocument && f.contentDocument.readyState === 'complete') r();
+        else f.addEventListener('load', r, {{ once: true }});
+      }}),
+      new Promise((r) => {{
+        const f = document.getElementById('xo');
+        f.addEventListener('load', r, {{ once: true }});
+      }})
+    ]).then(() => {{
+      if (window.opener) window.opener.postMessage({{ kind: 'popup-xo-ready' }}, '*');
+    }});
+  </script>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/xo-env-probe") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>XO Env Probe</title></head>
+<body>
+  <script>
+    window.addEventListener('message', async (ev) => {
+      if (!ev.data || ev.data.kind !== 'probe') return;
+      const echo = await (await fetch('/echo-env')).json();
+      ev.source.postMessage({
+        kind: 'probe-reply',
+        id: ev.data.id,
+        payload: {
+          platform: navigator.platform,
+          langs: Array.from(navigator.languages || []),
+          ua: navigator.userAgent,
+          hc: navigator.hardwareConcurrency,
+          tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+          screenW: screen.width,
+          uadPlat: navigator.userAgentData ? navigator.userAgentData.platform : null,
+          echo
+        }
+      }, '*');
+    });
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/sync-blank-iframe-host") => {
+                            let xo_url = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("xo="))
+                                .unwrap_or("/target");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head><title>Sync Blank Iframe Host</title></head>
+<body>
+  <pre id="sync-iframe-out"></pre>
+  <pre id="sync-worker-out"></pre>
+  <pre id="nested-worker-out"></pre>
+  <script>
+    const f = document.createElement('iframe');
+    document.body.appendChild(f);
+    const syncNav = {{
+      platform: f.contentWindow.navigator.platform,
+      hc: f.contentWindow.navigator.hardwareConcurrency,
+      ua: f.contentWindow.navigator.userAgent,
+      tz: new f.contentWindow.Intl.DateTimeFormat().resolvedOptions().timeZone
+    }};
+    const f2 = f.contentDocument.createElement('iframe');
+    f.contentDocument.body.appendChild(f2);
+    const nestedNav = {{
+      platform: f2.contentWindow.navigator.platform,
+      hc: f2.contentWindow.navigator.hardwareConcurrency,
+      ua: f2.contentWindow.navigator.userAgent,
+      tz: new f2.contentWindow.Intl.DateTimeFormat().resolvedOptions().timeZone
+    }};
+    const xf = document.createElement('iframe');
+    xf.src = {xo_json};
+    document.body.appendChild(xf);
+    let xoAccessible = Boolean(xf.contentWindow);
+    document.getElementById('sync-iframe-out').textContent = JSON.stringify({{ syncNav, nestedNav, xoAccessible }});
+
+    window.addEventListener('message', (ev) => {{
+      if (ev.data && ev.data.blankWorker) {{
+        document.getElementById('sync-worker-out').textContent = JSON.stringify(ev.data.blankWorker);
+      }} else if (ev.data && ev.data.nestedBlankWorker) {{
+        document.getElementById('nested-worker-out').textContent = JSON.stringify(ev.data.nestedBlankWorker);
+      }}
+    }});
+
+    const s1 = f.contentDocument.createElement('script');
+    s1.textContent = `
+      const w = new Worker('/sub/inner-worker.js');
+      w.onmessage = (ev) => window.top.postMessage({{ blankWorker: ev.data }}, '*');
+      w.onerror = (err) => window.top.postMessage({{ blankWorker: {{ error: String(err.message || err) }} }}, '*');
+    `;
+    f.contentDocument.body.appendChild(s1);
+
+    let nestedSpawned = false;
+    const spawnNested = () => {{
+      if (nestedSpawned) return;
+      nestedSpawned = true;
+      const f3 = f.contentDocument.createElement('iframe');
+      f.contentDocument.body.appendChild(f3);
+      const s2 = f3.contentDocument.createElement('script');
+      s2.textContent = `
+        const w = new Worker('/sub/inner-worker.js');
+        w.onmessage = (ev) => window.top.postMessage({{ nestedBlankWorker: ev.data }}, '*');
+        w.onerror = (err) => window.top.postMessage({{ nestedBlankWorker: {{ error: String(err.message || err) }} }}, '*');
+      `;
+      f3.contentDocument.body.appendChild(s2);
+    }};
+    f.addEventListener('load', spawnNested, {{ once: true }});
+    setTimeout(spawnNested, 25);
+  </script>
+</body>
+</html>"#,
+                                xo_json = serde_json::to_string(xo_url).unwrap()
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/target-blank-host") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Target Blank Host</title></head>
+<body>
+  <pre id="tb-blank"></pre>
+  <pre id="tb-noopener"></pre>
+  <a id="lnk-blank" href="/target-blank-child?tag=blank" target="_blank" style="display:inline-block;padding:12px;">Open Target Blank</a>
+  <a id="lnk-noopener" href="/target-blank-child?tag=noopener" target="_blank" rel="noopener" style="display:inline-block;padding:12px;">Open Target Blank Noopener</a>
+  <script>
+    const bc = new BroadcastChannel('target_blank_probe');
+    bc.onmessage = (ev) => {
+      if (ev.data && ev.data.tag) {
+        const el = document.getElementById('tb-' + ev.data.tag);
+        if (el) el.textContent = JSON.stringify(ev.data.payload);
+      }
+    };
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/target-blank-child") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Target Blank Child</title></head>
+<body>
+  <script>
+    const tag = new URLSearchParams(location.search).get('tag') || 'blank';
+    document.title = 'Child ' + tag;
+    const syncNav = {
+      platform: navigator.platform,
+      hc: navigator.hardwareConcurrency,
+      ua: navigator.userAgent,
+      tz: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      hasOpener: Boolean(window.opener)
+    };
+    (async () => {
+      const env = await (await fetch('/echo-env')).json();
+      let mocked = null;
+      try { mocked = await (await fetch('/api/mock-pop-pre')).json(); } catch (e) { mocked = { err: String(e) }; }
+      let blockedOk = false;
+      try { const r = await fetch('/blocked-pop.js'); blockedOk = r.ok; } catch { blockedOk = false; }
+      const payload = {
+        syncNav,
+        xHdr: env['x-probe-hdr'] || null,
+        reqUa: env['user-agent'] || null,
+        mocked,
+        blockedOk
+      };
+      try { localStorage.setItem('tb_' + tag, JSON.stringify(payload)); } catch {}
+      try { new BroadcastChannel('target_blank_probe').postMessage({ tag, payload }); } catch {}
+    })();
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/frames-index-host") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Frames Index Host</title></head>
+<body>
+  <pre id="frames-index-out"></pre>
+  <pre id="frames-worker-out"></pre>
+  <script>
+    const snapWin = (w) => ({
+      platform: w.navigator.platform,
+      hc: w.navigator.hardwareConcurrency,
+      ua: w.navigator.userAgent,
+      tz: new w.Intl.DateTimeFormat().resolvedOptions().timeZone
+    });
+
+    const f1 = document.createElement('iframe');
+    document.body.appendChild(f1);
+    const wf = window.frames[window.frames.length - 1];
+    const wi = window[window.length - 1];
+    const wfSnap = snapWin(wf);
+    const wiSnap = snapWin(wi);
+
+    const f2 = document.createElement('iframe');
+    f2.name = 'myNamedFrame';
+    document.body.appendChild(f2);
+    const wnSnap = snapWin(window.myNamedFrame);
+
+    document.body.insertAdjacentHTML('beforeend', '<iframe name="htmlAdjFrame"></iframe>');
+    const adjSnap = snapWin(window.htmlAdjFrame);
+
+    const wrap = document.createElement('div');
+    const f4 = document.createElement('iframe');
+    f4.name = 'nestedDivFrame';
+    wrap.appendChild(f4);
+    document.body.appendChild(wrap);
+    const nestedDivSnap = snapWin(window.nestedDivFrame);
+
+    document.getElementById('frames-index-out').textContent = JSON.stringify({
+      wf: wfSnap,
+      wi: wiSnap,
+      wn: wnSnap,
+      adj: adjSnap,
+      nestedDiv: nestedDivSnap
+    });
+
+    window.addEventListener('message', (ev) => {
+      if (ev.data && ev.data.framesWorker) {
+        document.getElementById('frames-worker-out').textContent = JSON.stringify(ev.data.framesWorker);
+      }
+    });
+
+    const s1 = wf.document.createElement('script');
+    s1.textContent = `
+      const w = new Worker('/sub/inner-worker.js');
+      w.onmessage = (ev) => window.top.postMessage({ framesWorker: ev.data }, '*');
+      w.onerror = (err) => window.top.postMessage({ framesWorker: { error: String(err.message || err) } }, '*');
+    `;
+    wf.document.body.appendChild(s1);
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/static-and-dom-frames-host") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>Static and DOM Frames Host</title></head>
+<body>
+  <iframe id="static_f" name="staticFrame"></iframe>
+  <pre id="static-frames-out"></pre>
+  <pre id="static-worker-out"></pre>
+  <pre id="dom-frames-out"></pre>
+  <script>
+    const snapWin = (w) => ({
+      platform: w.navigator.platform,
+      hc: w.navigator.hardwareConcurrency,
+      ua: w.navigator.userAgent,
+      tz: new w.Intl.DateTimeFormat().resolvedOptions().timeZone
+    });
+    const wi = window[0];
+    const wn = window.staticFrame;
+    const wf = window.frames[0];
+    document.getElementById('static-frames-out').textContent = JSON.stringify({
+      wf: snapWin(wf),
+      wi: snapWin(wi),
+      wn: snapWin(wn)
+    });
+    const sw = new wf.Worker('/sub/inner-worker.js');
+    sw.onmessage = (ev) => {
+      document.getElementById('static-worker-out').textContent = JSON.stringify(ev.data);
+    };
+    sw.onerror = (err) => {
+      document.getElementById('static-worker-out').textContent = JSON.stringify({ error: String(err.message || err) });
+    };
+
+    const rangeHost = document.createElement('div');
+    document.body.appendChild(rangeHost);
+    const rng = document.createRange();
+    rng.selectNodeContents(rangeHost);
+    const rangeFrame = document.createElement('iframe');
+    rangeFrame.name = 'rangeFrame';
+    rng.insertNode(rangeFrame);
+    const rangeSnap = snapWin(window.rangeFrame);
+
+    const repHost = document.createElement('div');
+    document.body.appendChild(repHost);
+    const repFrame = document.createElement('iframe');
+    repFrame.name = 'repFrame';
+    repHost.replaceChildren(repFrame);
+    const repSnap = snapWin(window.repFrame);
+
+    const srHost = document.createElement('div');
+    document.body.appendChild(srHost);
+    const sr = srHost.attachShadow({ mode: 'open' });
+    const srFrame = document.createElement('iframe');
+    sr.replaceChildren(srFrame);
+    const srSnap = snapWin(window.frames[window.frames.length - 1]);
+
+    const unsafeHost = document.createElement('div');
+    document.body.appendChild(unsafeHost);
+    unsafeHost.setHTMLUnsafe('<iframe name="unsafeFrame"></iframe>');
+    const unsafeSnap = snapWin(window.unsafeFrame);
+
+    const srUnsafeHost = document.createElement('div');
+    document.body.appendChild(srUnsafeHost);
+    const srUnsafe = srUnsafeHost.attachShadow({ mode: 'open' });
+    srUnsafe.setHTMLUnsafe('<iframe name="srUnsafeFrame"></iframe>');
+    const srUnsafeSnap = snapWin(window.frames[window.frames.length - 1]);
+
+    document.getElementById('dom-frames-out').textContent = JSON.stringify({
+      rangeSnap,
+      repSnap,
+      srSnap,
+      unsafeSnap,
+      srUnsafeSnap
+    });
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/anim-host") => {
+                            let xo = query
+                                .split('&')
+                                .find_map(|kv| kv.strip_prefix("xo="))
+                                .unwrap_or("/anim-xo-child");
+                            let html = format!(
+                                r#"<!doctype html>
+<html>
+<head>
+  <title>Anim Host</title>
+  <style>
+    html {{ scroll-behavior: smooth; }}
+    @keyframes spin {{ from {{ opacity: 0.5; }} to {{ opacity: 1; }} }}
+    #box {{ animation: spin 10s linear infinite; transition: opacity 5s; }}
+  </style>
+</head>
+<body>
+  <div id="box">main</div>
+  <button id="open-pop" onclick="window.__pop = window.open('/anim-popup', 'animpop', 'width=400,height=300')">Open</button>
+  <iframe id="xo-ifr" src="{xo}"></iframe>
+  <script>
+    const bc = new BroadcastChannel('anim-probe');
+    window.__animReplies = {{}};
+    window.__popLoads = 0;
+    bc.onmessage = (ev) => {{
+      const d = ev.data || {{}};
+      if (d.kind === 'pop-loaded') window.__popLoads += 1;
+      if (d.kind === 'probe-reply' && d.tag) window.__animReplies[d.tag] = d;
+    }};
+    window.__askPop = (tag) => {{
+      delete window.__animReplies[tag];
+      bc.postMessage({{ kind: 'probe', tag }});
+    }};
+    window.__reloadPop = () => bc.postMessage({{ kind: 'reload' }});
+  </script>
+</body>
+</html>"#
+                            );
+                            (
+                                "200 OK",
+                                "text/html; charset=utf-8",
+                                vec![],
+                                html.into_bytes(),
+                            )
+                        }
+                        ("GET", "/anim-xo-child") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head>
+  <style>
+    html { scroll-behavior: smooth; }
+    @keyframes spin { from { opacity: 0.5; } to { opacity: 1; } }
+    #box { animation: spin 10s linear infinite; transition: opacity 5s; }
+  </style>
+</head>
+<body><div id="box">xo</div></body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/anim-popup") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head>
+  <title>Anim Popup</title>
+  <style>
+    html { scroll-behavior: smooth; }
+    @keyframes spin { from { opacity: 0.5; } to { opacity: 1; } }
+    #box { animation: spin 10s linear infinite; transition: opacity 5s; }
+  </style>
+</head>
+<body>
+  <div id="box">pop</div>
+  <iframe id="pop-child" src="/anim-popup-child"></iframe>
+  <script>
+    const bc = new BroadcastChannel('anim-probe');
+    let childReady = false;
+    let pendingTag = null;
+    const readSelf = () => {
+      const b = document.getElementById('box');
+      const cs = getComputedStyle(b);
+      const hcs = getComputedStyle(document.documentElement);
+      return { animDur: cs.animationDuration, transDur: cs.transitionDuration, scrollBeh: hcs.scrollBehavior };
+    };
+    window.addEventListener('message', (ev) => {
+      const d = ev.data || {};
+      if (d.kind === 'child-ready') {
+        childReady = true;
+        bc.postMessage({ kind: 'pop-loaded' });
+      } else if (d.kind === 'child-reply') {
+        bc.postMessage({ kind: 'probe-reply', tag: d.tag, pop: readSelf(), child: d.child });
+      }
+    });
+    bc.onmessage = (ev) => {
+      const d = ev.data || {};
+      if (d.kind === 'probe') {
+        const ifr = document.getElementById('pop-child');
+        if (ifr && ifr.contentWindow) {
+          ifr.contentWindow.postMessage({ kind: 'probe-child', tag: d.tag }, '*');
+        }
+      } else if (d.kind === 'reload') {
+        location.reload();
+      }
+    };
+    const ifr = document.getElementById('pop-child');
+    ifr.addEventListener('load', () => {
+      if (!childReady) {
+        childReady = true;
+        bc.postMessage({ kind: 'pop-loaded' });
+      }
+    });
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/anim-popup-child") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head>
+  <style>
+    html { scroll-behavior: smooth; }
+    @keyframes spin { from { opacity: 0.5; } to { opacity: 1; } }
+    #box { animation: spin 10s linear infinite; transition: opacity 5s; }
+  </style>
+</head>
+<body>
+  <div id="box">child</div>
+  <script>
+    window.addEventListener('message', (ev) => {
+      const d = ev.data || {};
+      if (d.kind === 'probe-child') {
+        const b = document.getElementById('box');
+        const cs = getComputedStyle(b);
+        const hcs = getComputedStyle(document.documentElement);
+        ev.source.postMessage({
+          kind: 'child-reply',
+          tag: d.tag,
+          child: { animDur: cs.animationDuration, transDur: cs.transitionDuration, scrollBeh: hcs.scrollBehavior }
+        }, '*');
+      }
+    });
+    if (window.parent && window.parent !== window) {
+      window.parent.postMessage({ kind: 'child-ready' }, '*');
+    }
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/sw-net-host") => (
+                            "200 OK",
+                            "text/html; charset=utf-8",
+                            vec![],
+                            br#"<!doctype html>
+<html>
+<head><title>SharedWorker Network Host</title></head>
+<body>
+  <script>
+    window.__sw = new SharedWorker('/sw-net.js');
+    window.__sw.port.start();
+    window.__runSwProbe = () => new Promise((resolve) => {
+      const onMsg = (ev) => {
+        window.__sw.port.removeEventListener('message', onMsg);
+        resolve(ev.data);
+      };
+      window.__sw.port.addEventListener('message', onMsg);
+      window.__sw.port.postMessage({ action: 'probe' });
+    });
+  </script>
+</body>
+</html>"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/sw-net.js") => (
+                            "200 OK",
+                            "application/javascript; charset=utf-8",
+                            vec![],
+                            br#"onconnect = (ev) => {
+  const port = ev.ports[0];
+  port.onmessage = async () => {
+    let blockedFailed = false;
+    try {
+      const r = await fetch('/blocked-sw.png');
+      if (!r.ok) blockedFailed = true;
+    } catch {
+      blockedFailed = true;
+    }
+    const mockResp = await fetch('/api/sw-mock');
+    const mockJson = await mockResp.json();
+    const mockHdr = mockResp.headers.get('x-sw-mock');
+    const liveResp = await fetch('/api/sw-live');
+    const liveJson = await liveResp.json();
+    const xhrRes = await new Promise((resolve) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open('GET', '/api/sw-xhr-mock', true);
+      xhr.onload = () => {
+        try {
+          resolve({ ok: true, status: xhr.status, body: JSON.parse(xhr.responseText) });
+        } catch {
+          resolve({ ok: false, status: xhr.status, body: null });
+        }
+      };
+      xhr.onerror = () => resolve({ ok: false, status: 0, body: null });
+      xhr.send();
+    });
+    port.postMessage({
+      blockedFailed,
+      mockStatus: mockResp.status,
+      mockHdr,
+      mockJson,
+      liveJson,
+      xhrRes
+    });
+  };
+  port.start();
+};"#
+                                .to_vec(),
+                        ),
+                        ("GET", "/blocked-sw.png") => (
+                            "200 OK",
+                            "image/png",
+                            vec![],
+                            vec![137, 80, 78, 71, 13, 10, 26, 10],
+                        ),
+                        ("GET", "/api/sw-mock") => (
+                            "200 OK",
+                            "application/json",
+                            vec![],
+                            br#"{"live":true,"mocked":false}"#.to_vec(),
+                        ),
+                        ("GET", "/api/sw-live") => (
+                            "200 OK",
+                            "application/json",
+                            vec![],
+                            br#"{"live":true}"#.to_vec(),
+                        ),
+                        ("GET", "/api/sw-xhr-mock") => (
+                            "200 OK",
+                            "application/json",
+                            vec![],
+                            br#"{"xhrLive":true}"#.to_vec(),
+                        ),
                         _ => (
                             "404 Not Found",
                             "text/plain",
@@ -2303,9 +3750,15 @@ self.onconnect = (e) => {
         Self {
             addr,
             hits,
+            req_headers,
             cache_counter,
             task,
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn request_headers(&self) -> RecordedHeaders {
+        self.req_headers.lock().clone()
     }
 
     #[allow(dead_code)]
@@ -2326,6 +3779,7 @@ self.onconnect = (e) => {
     #[allow(dead_code)]
     pub fn reset_hits(&self) {
         self.hits.lock().clear();
+        self.req_headers.lock().clear();
     }
 
     #[allow(dead_code)]
@@ -2350,9 +3804,18 @@ pub struct LocalHttpProxy {
 impl LocalHttpProxy {
     #[allow(dead_code)]
     pub async fn start(auth: Option<(String, String)>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        Self::start_on("127.0.0.1:0", auth).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn start_ipv6(auth: Option<(String, String)>) -> Self {
+        Self::start_on("[::1]:0", auth).await
+    }
+
+    async fn start_on(bind_addr: &str, auth: Option<(String, String)>) -> Self {
+        let listener = TcpListener::bind(bind_addr)
             .await
-            .expect("bind proxy 127.0.0.1:0");
+            .unwrap_or_else(|e| panic!("bind proxy {bind_addr}: {e}"));
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(Mutex::new(Vec::new()));
         let hits_clone = Arc::clone(&hits);
@@ -2489,9 +3952,18 @@ pub struct LocalSocks5Proxy {
 impl LocalSocks5Proxy {
     #[allow(dead_code)]
     pub async fn start(auth: Option<(String, String)>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0")
+        Self::start_on("127.0.0.1:0", auth).await
+    }
+
+    #[allow(dead_code)]
+    pub async fn start_ipv6(auth: Option<(String, String)>) -> Self {
+        Self::start_on("[::1]:0", auth).await
+    }
+
+    async fn start_on(bind_addr: &str, auth: Option<(String, String)>) -> Self {
+        let listener = TcpListener::bind(bind_addr)
             .await
-            .expect("bind socks5 127.0.0.1:0");
+            .unwrap_or_else(|e| panic!("bind socks5 {bind_addr}: {e}"));
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(Mutex::new(Vec::new()));
         let hits_clone = Arc::clone(&hits);

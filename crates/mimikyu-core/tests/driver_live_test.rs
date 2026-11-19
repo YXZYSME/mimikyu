@@ -924,3 +924,1733 @@ async fn live_firefox_download_isolation_ephemeral() {
     let rc = unsafe { libc::kill(-(pid as libc::pid_t), 0) };
     assert_eq!(rc, -1, "firefox process group should be gone after dispose");
 }
+
+#[tokio::test]
+async fn live_firefox_virtual_context_download_isolation_concurrent() {
+    let server = TestServer::start().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dl1 = tmp.path().join("v1-dl");
+    let dl2 = tmp.path().join("v2-dl");
+    let expected_payload: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+
+    let pool = mimikyu_core::isolation::VirtualContextPool::launch(LaunchOptions {
+        engine: EngineKind::Firefox,
+        headless: true,
+        ..Default::default()
+    })
+    .await
+    .expect("launch firefox pool");
+    let pool_pid = pool.root_session().info().pid.expect("pool pid") as libc::pid_t;
+    let pool_profile_dl = pool
+        .root_session()
+        .info()
+        .profile_dir
+        .clone()
+        .unwrap()
+        .join("downloads");
+
+    let vc1 = pool
+        .create_labeled_context(
+            "v1",
+            ContextOptions {
+                download_dir: Some(dl1.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("vc1");
+    let vc2 = pool
+        .create_labeled_context(
+            "v2",
+            ContextOptions {
+                download_dir: Some(dl2.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("vc2");
+
+    vc1.session()
+        .navigate(&server.url("/download-page"))
+        .await
+        .expect("nav v1");
+    vc2.session()
+        .navigate(&server.url("/download-page"))
+        .await
+        .expect("nav v2");
+
+    let b1 = vc1.session().resolve_selector_box("#dl-bin").await.unwrap();
+    let b2 = vc2.session().resolve_selector_box("#dl-bin").await.unwrap();
+    let (x1, y1) = b1.center();
+    let (x2, y2) = b2.center();
+
+    let (r1, r2) = tokio::join!(
+        vc1.session().dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: x1,
+            y: y1,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        }),
+        vc2.session().dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: x2,
+            y: y2,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+    );
+    r1.expect("click v1");
+    r2.expect("click v2");
+
+    let got1 = wait_for_download_file(&dl1.join("sample-rust-test.bin"), expected_payload.len()).await;
+    let got2 = wait_for_download_file(&dl2.join("sample-rust-test.bin"), expected_payload.len()).await;
+    assert_eq!(got1, expected_payload);
+    assert_eq!(got2, expected_payload);
+    assert!(
+        !pool_profile_dl.join("sample-rust-test.bin").exists()
+            && !pool_profile_dl.join("sample-rust-test(1).bin").exists(),
+        "pool shared downloads dir must not retain colliding files"
+    );
+
+    vc1.dispose().await.expect("dispose vc1");
+    vc2.dispose().await.expect("dispose vc2");
+    pool.shutdown().await.expect("shutdown pool");
+    support::assert_pgid_gone(pool_pid);
+}
+
+#[tokio::test]
+async fn live_firefox_virtual_context_slow_and_aborted_download_isolation() {
+    let server = TestServer::start().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dl1 = tmp.path().join("v1-dl");
+    let dl2 = tmp.path().join("v2-dl");
+    let slow_payload: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
+    let fast_payload: Vec<u8> = (0..512).map(|i| ((i + 7) % 251) as u8).collect();
+
+    let pool = mimikyu_core::isolation::VirtualContextPool::launch(LaunchOptions {
+        engine: EngineKind::Firefox,
+        headless: true,
+        ..Default::default()
+    })
+    .await
+    .expect("launch firefox pool");
+    let pool_pid = pool.root_session().info().pid.expect("pool pid") as libc::pid_t;
+    let pool_profile_dl = pool
+        .root_session()
+        .info()
+        .profile_dir
+        .clone()
+        .unwrap()
+        .join("downloads");
+
+    let vc1 = pool
+        .create_labeled_context(
+            "slow-v1",
+            ContextOptions {
+                download_dir: Some(dl1.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("vc1");
+    let vc2 = pool
+        .create_labeled_context(
+            "fast-v2",
+            ContextOptions {
+                download_dir: Some(dl2.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("vc2");
+
+    vc1.session()
+        .navigate(&server.url("/download-slow-page"))
+        .await
+        .expect("nav v1");
+    vc2.session()
+        .navigate(&server.url("/download-slow-page"))
+        .await
+        .expect("nav v2");
+
+    let b_slow = vc1.session().resolve_selector_box("#dl-slow").await.unwrap();
+    let b_fast = vc2.session().resolve_selector_box("#dl-fast").await.unwrap();
+    let (sx, sy) = b_slow.center();
+    let (fx, fy) = b_fast.center();
+
+    // Start slow (>300ms) download in vc1, then immediately trigger fast same-name download in vc2
+    vc1.session()
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: sx,
+            y: sy,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #dl-slow");
+    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    vc2.session()
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: fx,
+            y: fy,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #dl-fast");
+
+    let got_slow = wait_for_download_file(&dl1.join("same.bin"), slow_payload.len()).await;
+    let got_fast = wait_for_download_file(&dl2.join("same.bin"), fast_payload.len()).await;
+    assert_eq!(got_slow, slow_payload, "slow download must not truncate to 0 bytes");
+    assert_eq!(got_fast, fast_payload, "fast concurrent download must preserve exact bytes");
+
+    // Aborted transfer in vc1 must NOT relocate a 0-byte placeholder into dl1
+    let b_abort = vc1.session().resolve_selector_box("#dl-abort").await.unwrap();
+    let (ax, ay) = b_abort.center();
+    vc1.session()
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: ax,
+            y: ay,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #dl-abort");
+
+    // Genuine Content-Length: 0 download in vc2 must still relocate cleanly
+    let b_empty = vc2.session().resolve_selector_box("#dl-empty").await.unwrap();
+    let (ex, ey) = b_empty.center();
+    vc2.session()
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: ex,
+            y: ey,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #dl-empty");
+
+    let got_empty = wait_for_download_file(&dl2.join("empty.bin"), 0).await;
+    assert!(got_empty.is_empty());
+
+    tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+    assert!(
+        !dl1.join("abort.bin").exists(),
+        "aborted transfer must not relocate 0-byte placeholder into dl1"
+    );
+    let dl1_entries: Vec<_> = std::fs::read_dir(&dl1)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        dl1_entries,
+        vec!["same.bin".to_string()],
+        "dl1 should contain only same.bin, got {dl1_entries:?}"
+    );
+    if pool_profile_dl.exists() {
+        let pool_entries: Vec<_> = std::fs::read_dir(&pool_profile_dl)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            pool_entries.is_empty(),
+            "pool_download_dir must be empty after relocation/cleanup, got {pool_entries:?}"
+        );
+    }
+
+    vc1.dispose().await.expect("dispose vc1");
+    vc2.dispose().await.expect("dispose vc2");
+    pool.shutdown().await.expect("shutdown pool");
+    support::assert_pgid_gone(pool_pid);
+}
+
+#[tokio::test]
+async fn live_firefox_virtual_context_popup_download_isolation() {
+    let server = TestServer::start().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dl1 = tmp.path().join("v1-popup-dl");
+    let dl2 = tmp.path().join("v2-popup-dl");
+    let popup_slow_payload: Vec<u8> = (0..4096).map(|i| ((i * 3 + 11) % 251) as u8).collect();
+    let popup_direct_payload: Vec<u8> = (0..1024).map(|i| ((i * 7 + 1) % 251) as u8).collect();
+
+    let pool = mimikyu_core::isolation::VirtualContextPool::launch(LaunchOptions {
+        engine: EngineKind::Firefox,
+        headless: true,
+        ..Default::default()
+    })
+    .await
+    .expect("launch firefox pool");
+    let pool_pid = pool.root_session().info().pid.expect("pool pid") as libc::pid_t;
+    let pool_profile_dl = pool
+        .root_session()
+        .info()
+        .profile_dir
+        .clone()
+        .unwrap()
+        .join("downloads");
+
+    let vc1 = pool
+        .create_labeled_context(
+            "popup-v1",
+            ContextOptions {
+                download_dir: Some(dl1.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("vc1");
+    let vc2 = pool
+        .create_labeled_context(
+            "popup-v2",
+            ContextOptions {
+                download_dir: Some(dl2.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("vc2");
+
+    vc1.session()
+        .navigate(&server.url("/popup-download-host"))
+        .await
+        .expect("nav vc1 /popup-download-host");
+
+    let b_popup = vc1
+        .session()
+        .resolve_selector_box("#popup-dl")
+        .await
+        .expect("resolve #popup-dl");
+    let (px, py) = b_popup.center();
+    vc1.session()
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: px,
+            y: py,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #popup-dl");
+
+    let got_popup_slow =
+        wait_for_download_file(&dl1.join("popup-slow.bin"), popup_slow_payload.len()).await;
+    assert_eq!(got_popup_slow, popup_slow_payload);
+
+    let b_blank = vc1
+        .session()
+        .resolve_selector_box("#blank-dl")
+        .await
+        .expect("resolve #blank-dl");
+    let (bx, by) = b_blank.center();
+    vc1.session()
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: bx,
+            y: by,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #blank-dl");
+
+    let got_popup_direct =
+        wait_for_download_file(&dl1.join("popup-direct.bin"), popup_direct_payload.len()).await;
+    assert_eq!(got_popup_direct, popup_direct_payload);
+
+    let dl2_entries: Vec<_> = std::fs::read_dir(&dl2)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        dl2_entries.is_empty(),
+        "vc2 download_dir must not receive vc1 popup downloads: {dl2_entries:?}"
+    );
+    if pool_profile_dl.exists() {
+        let pool_entries: Vec<_> = std::fs::read_dir(&pool_profile_dl)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            pool_entries.is_empty(),
+            "pool_download_dir must be empty after popup download relocation, got {pool_entries:?}"
+        );
+    }
+
+    vc1.dispose().await.expect("dispose vc1");
+    vc2.dispose().await.expect("dispose vc2");
+    pool.shutdown().await.expect("shutdown pool");
+    support::assert_pgid_gone(pool_pid);
+}
+
+#[tokio::test]
+async fn live_firefox_virtual_context_same_tab_same_url_concurrent_download_isolation() {
+    let server = TestServer::start().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dl1 = tmp.path().join("v1-same-url-dl");
+    let dl2 = tmp.path().join("v2-zero-dl");
+    let ok_payload: Vec<u8> = (0..4096).map(|i| ((i * 5 + 3) % 251) as u8).collect();
+    let hold_payload: Vec<u8> = (0..4096).map(|i| ((i + 19) % 251) as u8).collect();
+
+    let pool = mimikyu_core::isolation::VirtualContextPool::launch(LaunchOptions {
+        engine: EngineKind::Firefox,
+        headless: true,
+        ..Default::default()
+    })
+    .await
+    .expect("launch firefox pool");
+    let pool_pid = pool.root_session().info().pid.expect("pool pid") as libc::pid_t;
+    let pool_profile_dl = pool
+        .root_session()
+        .info()
+        .profile_dir
+        .clone()
+        .unwrap()
+        .join("downloads");
+
+    let vc1 = pool
+        .create_labeled_context(
+            "same-url-v1",
+            ContextOptions {
+                download_dir: Some(dl1.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("vc1");
+    let vc2 = pool
+        .create_labeled_context(
+            "zero-byte-v2",
+            ContextOptions {
+                download_dir: Some(dl2.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("vc2");
+
+    vc1.session()
+        .navigate(&server.url("/download-same-url-concurrent-page"))
+        .await
+        .expect("nav vc1 /download-same-url-concurrent-page");
+    vc2.session()
+        .navigate(&server.url("/download-same-url-concurrent-page"))
+        .await
+        .expect("nav vc2 /download-same-url-concurrent-page");
+
+    let b1 = vc1.session().resolve_selector_box("#d1").await.unwrap();
+    let b2 = vc1.session().resolve_selector_box("#d2").await.unwrap();
+    let (x1, y1) = b1.center();
+    let (x2, y2) = b2.center();
+
+    // Start slow 4096B transfer (#d1), then 60ms later start second same-URL transfer (#d2) that aborts
+    vc1.session()
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: x1,
+            y: y1,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #d1");
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    vc1.session()
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: x2,
+            y: y2,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #d2");
+
+    let got_ok = wait_for_download_file(&dl1.join("ok.bin"), ok_payload.len()).await;
+    assert_eq!(got_ok, ok_payload, "first same-URL transfer ok.bin must succeed with 4096B");
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(
+        !dl1.join("fail.bin").exists(),
+        "aborted second same-URL transfer must not produce fail.bin"
+    );
+
+    // Also verify 0-byte download in vc2 relocates promptly even while vc1 has a slow .part download active
+    let b_hold = vc1.session().resolve_selector_box("#d-hold").await.unwrap();
+    let b_empty = vc2.session().resolve_selector_box("#d-empty").await.unwrap();
+    let (hx, hy) = b_hold.center();
+    let (ex, ey) = b_empty.center();
+
+    vc1.session()
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: hx,
+            y: hy,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #d-hold");
+    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    let empty_t0 = tokio::time::Instant::now();
+    vc2.session()
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: ex,
+            y: ey,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #d-empty");
+
+    let got_empty = tokio::time::timeout(
+        std::time::Duration::from_millis(900),
+        wait_for_download_file(&dl2.join("empty.bin"), 0),
+    )
+    .await
+    .expect("0-byte download must relocate promptly without stalling on unrelated .part file");
+    assert!(got_empty.is_empty());
+    let empty_elapsed = empty_t0.elapsed();
+    assert!(
+        empty_elapsed < std::time::Duration::from_millis(900),
+        "0-byte download took {empty_elapsed:?}, should not wait for 1200ms slow-hold.bin"
+    );
+
+    let got_hold = wait_for_download_file(&dl1.join("slow-hold.bin"), hold_payload.len()).await;
+    assert_eq!(got_hold, hold_payload);
+
+    let mut dl1_entries: Vec<_> = std::fs::read_dir(&dl1)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    dl1_entries.sort();
+    assert_eq!(
+        dl1_entries,
+        vec!["ok.bin".to_string(), "slow-hold.bin".to_string()],
+        "dl1 should contain only ok.bin and slow-hold.bin, got {dl1_entries:?}"
+    );
+    if pool_profile_dl.exists() {
+        let pool_entries: Vec<_> = std::fs::read_dir(&pool_profile_dl)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            pool_entries.is_empty(),
+            "pool_download_dir must be empty after relocation/cleanup, got {pool_entries:?}"
+        );
+    }
+
+    vc1.dispose().await.expect("dispose vc1");
+    vc2.dispose().await.expect("dispose vc2");
+    pool.shutdown().await.expect("shutdown pool");
+    support::assert_pgid_gone(pool_pid);
+}
+
+async fn assert_display_contents_snapshot_and_click(engine: EngineKind) {
+    let driver = driver_for(engine);
+    let session = driver
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            ..Default::default()
+        })
+        .await
+        .expect("launch");
+    let pid = session.info().pid.expect("pid") as libc::pid_t;
+
+    let html = r##"<!doctype html><html><body>
+        <button id="dc-btn" style="display: contents" onclick="document.title='dc-clicked'">DC Button</button>
+        <div><button id="wrap-btn">Wrapped Button</button></div>
+        <a id="dc-link" href="#ok" style="display: contents">DC Link</a>
+        <span id="page-indicator">Page 1 of 2</span>
+    </body></html>"##;
+    let url = format!(
+        "data:text/html,{}",
+        url::form_urlencoded::byte_serialize(html.as_bytes())
+            .collect::<String>()
+            .replace('+', "%20")
+    );
+    session.navigate(&url).await.expect("navigate");
+
+    let mut snap_state = mimikyu_core::snapshot::SnapshotState::default();
+    let snap = mimikyu_core::snapshot::SnapshotEngine::capture(
+        session.as_ref(),
+        &mut snap_state,
+        mimikyu_core::snapshot::SnapshotOptions::default(),
+    )
+    .await
+    .expect("snapshot");
+
+    assert!(
+        snap.text.contains("DC Button"),
+        "{engine}: missing display:contents button in snapshot:\n{}",
+        snap.text
+    );
+    assert!(
+        snap.text.contains("DC Link"),
+        "{engine}: missing display:contents link in snapshot:\n{}",
+        snap.text
+    );
+    assert!(
+        snap.text.contains("Page 1 of 2"),
+        "{engine}: missing inline span text in snapshot:\n{}",
+        snap.text
+    );
+
+    let dc_ref = snap
+        .ref_map
+        .iter()
+        .find(|(_, e)| e.name.as_deref() == Some("DC Button"))
+        .map(|(k, _)| k.clone())
+        .expect("DC Button ref");
+    let chokepoint = mimikyu_core::input::ChokepointInput::new(session.clone());
+    chokepoint
+        .click(
+            &mimikyu_core::input::InputTarget::Ref(dc_ref),
+            Some(&snap_state.active_ref_map),
+            &mimikyu_core::input::ClickOptions::default(),
+        )
+        .await
+        .expect("click display:contents button");
+    assert_eq!(session.title().await.unwrap(), "dc-clicked");
+
+    session.dispose().await.expect("dispose");
+    support::assert_pgid_gone(pid);
+}
+
+#[tokio::test]
+async fn live_display_contents_and_inline_text_parity_chromium() {
+    assert_display_contents_snapshot_and_click(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn live_display_contents_and_inline_text_parity_firefox() {
+    assert_display_contents_snapshot_and_click(EngineKind::Firefox).await;
+}
+
+#[tokio::test]
+async fn live_firefox_scrollbar_width_thin_does_not_falsely_occlude() {
+    let driver = driver_for(EngineKind::Firefox);
+    let session = driver
+        .launch(LaunchOptions {
+            engine: EngineKind::Firefox,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            ..Default::default()
+        })
+        .await
+        .expect("launch firefox");
+    let pid = session.info().pid.expect("pid") as libc::pid_t;
+
+    let html = r#"<!doctype html><html style="scrollbar-width: thin;"><body style="margin:0;height:3000px;">
+        <button id="thin-btn" style="position:fixed;top:120px;right:10px;width:6px;height:24px;padding:0;border:0;" onclick="document.title='thin-ok'">T</button>
+        <button id="b-gutter" style="position:fixed;top:160px;right:8px;width:4px;height:24px;padding:0;border:0;" onclick="document.title='gutter-clicked'">G</button>
+    </body></html>"#;
+    let url = format!(
+        "data:text/html,{}",
+        url::form_urlencoded::byte_serialize(html.as_bytes())
+            .collect::<String>()
+            .replace('+', "%20")
+    );
+    session.navigate(&url).await.expect("navigate thin page");
+
+    let chokepoint = mimikyu_core::input::ChokepointInput::new(session.clone());
+    chokepoint
+        .click(
+            &mimikyu_core::input::InputTarget::Selector("#thin-btn".into()),
+            None,
+            &mimikyu_core::input::ClickOptions::default(),
+        )
+        .await
+        .expect("click near thin scrollbar must not falsely fail occlusion");
+    assert_eq!(session.title().await.unwrap(), "thin-ok");
+
+    let gutter_err = chokepoint
+        .click(
+            &mimikyu_core::input::InputTarget::Selector("#b-gutter".into()),
+            None,
+            &mimikyu_core::input::ClickOptions::default(),
+        )
+        .await
+        .expect_err("element inside 12px thin scrollbar gutter (right:8px,width:4px) must be rejected as occluded");
+    assert!(
+        matches!(gutter_err, MimikyuError::ElementNotFound(_)),
+        "expected ElementNotFound for occluded gutter button, got {gutter_err:?}"
+    );
+
+    // scrollbar-width: thin on <body> does NOT shrink Firefox's 16px viewport root scrollbar
+    let body_thin_html = r#"<!doctype html><html><body style="margin:0;height:3000px;scrollbar-width:thin;">
+        <button id="body-thin-btn" style="position:fixed;top:120px;right:10px;width:6px;height:24px;padding:0;border:0;" onclick="document.title='body-thin-clicked'">B</button>
+    </body></html>"#;
+    let body_thin_url = format!(
+        "data:text/html,{}",
+        url::form_urlencoded::byte_serialize(body_thin_html.as_bytes())
+            .collect::<String>()
+            .replace('+', "%20")
+    );
+    session
+        .navigate(&body_thin_url)
+        .await
+        .expect("navigate body thin page");
+    let body_thin_err = chokepoint
+        .click(
+            &mimikyu_core::input::InputTarget::Selector("#body-thin-btn".into()),
+            None,
+            &mimikyu_core::input::ClickOptions::default(),
+        )
+        .await
+        .expect_err("body { scrollbar-width: thin } must preserve 16px root gutter and reject right:10px,width:6px");
+    assert!(
+        matches!(body_thin_err, MimikyuError::ElementNotFound(_)),
+        "expected ElementNotFound for body-thin occluded button, got {body_thin_err:?}"
+    );
+
+    session.dispose().await.expect("dispose");
+    support::assert_pgid_gone(pid);
+}
+
+async fn assert_new_context_rollback_on_invalid_timezone(engine: EngineKind) {
+    let pool = mimikyu_core::isolation::VirtualContextPool::launch(LaunchOptions {
+        engine,
+        headless: true,
+        ..Default::default()
+    })
+    .await
+    .expect("launch pool");
+    let pool_pid = pool.root_session().info().pid.expect("pool pid") as libc::pid_t;
+
+    let mut bad_prof = mimikyu_core::env_profile::PresetKind::Win11.to_env_profile(engine);
+    bad_prof.timezone = "Invalid/DoesNotExist".to_string();
+
+    let err = pool
+        .create_labeled_context(
+            "bad-tz",
+            ContextOptions {
+                env_profile: Some(bad_prof),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .expect("invalid timezone must fail new_context");
+    assert!(!err.to_string().is_empty());
+
+    // After failed context creation, no leaked extra tab/window or active context should remain
+    assert_eq!(pool.active_count(), 0);
+    assert_eq!(pool.root_session().list_tabs().await.unwrap().len(), 1);
+
+    pool.shutdown().await.expect("shutdown pool");
+    support::assert_pgid_gone(pool_pid);
+}
+
+#[tokio::test]
+async fn live_context_creation_rollback_on_invalid_timezone_chromium() {
+    assert_new_context_rollback_on_invalid_timezone(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn live_context_creation_rollback_on_invalid_timezone_firefox() {
+    assert_new_context_rollback_on_invalid_timezone(EngineKind::Firefox).await;
+}
+
+#[tokio::test]
+async fn live_firefox_virtual_context_download_after_aborted_and_completed_fetch() {
+    let server = TestServer::start().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dl1 = tmp.path().join("v1-fetch-poison-dl");
+    let expected_payload: Vec<u8> = (0..4096).map(|i| ((i * 9 + 5) % 251) as u8).collect();
+
+    let pool = mimikyu_core::isolation::VirtualContextPool::launch(LaunchOptions {
+        engine: EngineKind::Firefox,
+        headless: true,
+        ..Default::default()
+    })
+    .await
+    .expect("launch firefox pool");
+    let pool_pid = pool.root_session().info().pid.expect("pool pid") as libc::pid_t;
+    let pool_profile_dl = pool
+        .root_session()
+        .info()
+        .profile_dir
+        .clone()
+        .unwrap()
+        .join("downloads");
+
+    let vc1 = pool
+        .create_labeled_context(
+            "fetch-poison-v1",
+            ContextOptions {
+                download_dir: Some(dl1.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("vc1");
+
+    vc1.session()
+        .navigate(&server.url("/download-after-fetch-page"))
+        .await
+        .expect("nav /download-after-fetch-page");
+
+    // 1. Aborted fetch('/download/asset-poison.bin') before <a download="ok-after-abort.bin">
+    vc1.session()
+        .eval_isolated(
+            r#"(async () => {
+                const ac = new AbortController();
+                setTimeout(() => ac.abort(), 30);
+                try { await fetch('/download/asset-poison.bin', { signal: ac.signal }); } catch {}
+                return true;
+            })()"#,
+        )
+        .await
+        .expect("aborted fetch");
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+    let b_abort = vc1
+        .session()
+        .resolve_selector_box("#dl-after-abort")
+        .await
+        .unwrap();
+    let (ax, ay) = b_abort.center();
+    vc1.session()
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: ax,
+            y: ay,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #dl-after-abort");
+
+    let got_after_abort =
+        wait_for_download_file(&dl1.join("ok-after-abort.bin"), expected_payload.len()).await;
+    assert_eq!(got_after_abort, expected_payload);
+
+    // 2. Completed fetch() + completed XHR to same URL before <a download="ok-after-fetch.bin">
+    vc1.session()
+        .eval_isolated(
+            r#"(async () => {
+                const r = await fetch('/download/asset-poison.bin');
+                await r.arrayBuffer();
+                await new Promise((resolve, reject) => {
+                    const x = new XMLHttpRequest();
+                    x.open('GET', '/download/asset-poison.bin');
+                    x.responseType = 'arraybuffer';
+                    x.onload = () => resolve(true);
+                    x.onerror = () => reject(new Error('xhr error'));
+                    x.send();
+                });
+                return true;
+            })()"#,
+        )
+        .await
+        .expect("completed fetch + xhr");
+
+    let b_ok = vc1
+        .session()
+        .resolve_selector_box("#dl-after-ok")
+        .await
+        .unwrap();
+    let (ox, oy) = b_ok.center();
+    vc1.session()
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: ox,
+            y: oy,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #dl-after-ok");
+
+    let got_after_ok =
+        wait_for_download_file(&dl1.join("ok-after-fetch.bin"), expected_payload.len()).await;
+    assert_eq!(got_after_ok, expected_payload);
+
+    // 3. Completed fetch() to 0-byte URL before <a download="zero-after-fetch.bin">
+    vc1.session()
+        .eval_isolated(
+            "fetch('/download/zero-poison.bin').then(r => r.arrayBuffer()).then(() => true)",
+        )
+        .await
+        .expect("completed zero-byte fetch");
+    let b_zero = vc1
+        .session()
+        .resolve_selector_box("#dl-zero-after-ok")
+        .await
+        .unwrap();
+    let (zx, zy) = b_zero.center();
+    vc1.session()
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: zx,
+            y: zy,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #dl-zero-after-ok");
+
+    let got_zero = wait_for_download_file(&dl1.join("zero-after-fetch.bin"), 0).await;
+    assert!(got_zero.is_empty());
+
+    if pool_profile_dl.exists() {
+        let pool_entries: Vec<_> = std::fs::read_dir(&pool_profile_dl)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            pool_entries.is_empty(),
+            "pool_download_dir must be empty after relocation, got {pool_entries:?}"
+        );
+    }
+
+    vc1.dispose().await.expect("dispose vc1");
+    pool.shutdown().await.expect("shutdown pool");
+    support::assert_pgid_gone(pool_pid);
+}
+
+async fn assert_unpaired_utf16_surrogates_no_hang(engine: EngineKind) {
+    let driver = driver_for(engine);
+    let session = driver
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            ..Default::default()
+        })
+        .await
+        .expect("launch");
+    let pid = session.info().pid.expect("pid") as libc::pid_t;
+
+    session
+        .navigate("data:text/html,<div id='d'>ok</div>")
+        .await
+        .expect("nav");
+
+    let res = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let lone_hi = session.eval_isolated("'\\uD800'").await?;
+        let lone_lo = session.eval_isolated("'\\uDFFF'").await?;
+        let pair = session.eval_isolated("'\\uD83D\\uDE00'").await?;
+        let escaped = session.eval_isolated("'\\\\ud800'").await?;
+        session
+            .eval_isolated("document.title = 'hi\\uD800end'; document.getElementById('d').textContent = 'dom\\uDC00text'; true")
+            .await?;
+        let title = session.title().await?;
+        let dom = session
+            .eval_isolated("document.getElementById('d').textContent")
+            .await?;
+        Ok::<_, MimikyuError>((lone_hi, lone_lo, pair, escaped, title, dom))
+    })
+    .await
+    .expect("lone surrogate eval/title must not hang 30s")
+    .expect("lone surrogate evals must succeed");
+
+    assert_eq!(res.0, "\u{FFFD}");
+    assert_eq!(res.1, "\u{FFFD}");
+    assert_eq!(res.2, "😀");
+    assert_eq!(res.3, "\\ud800");
+    assert_eq!(res.4, "hi\u{FFFD}end");
+    assert_eq!(res.5, "dom\u{FFFD}text");
+
+    session.dispose().await.expect("dispose");
+    support::assert_pgid_gone(pid);
+}
+
+#[tokio::test]
+async fn live_unpaired_utf16_surrogates_do_not_hang_chromium() {
+    assert_unpaired_utf16_surrogates_no_hang(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn live_unpaired_utf16_surrogates_do_not_hang_firefox() {
+    assert_unpaired_utf16_surrogates_no_hang(EngineKind::Firefox).await;
+}
+
+async fn assert_iframe_selector_actions_parity(engine: EngineKind) {
+    let server = TestServer::start().await;
+    let server2 = TestServer::start().await;
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            extra_args: if engine == EngineKind::Chromium {
+                vec!["--site-per-process".to_string()]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        })
+        .await
+        .expect("launch");
+    let pid = session.info().pid.expect("pid") as libc::pid_t;
+
+    let xo_url = server2.localhost_url("/iframe-selector-sub");
+    session
+        .navigate(&server.url(&format!("/iframe-selector-host?xo={xo_url}")))
+        .await
+        .expect("navigate /iframe-selector-host");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let frames = session.list_frames().await.expect("list_frames");
+    let so_fid = frames
+        .iter()
+        .find(|f| !f.is_main && f.url.starts_with(&server.url("/iframe-selector-sub")))
+        .map(|f| f.frame_id.clone())
+        .expect("same-origin child frame");
+    let xo_fid = frames
+        .iter()
+        .find(|f| !f.is_main && f.url.starts_with(&xo_url))
+        .map(|f| f.frame_id.clone())
+        .expect("cross-origin child frame");
+
+    for (label, fid) in [("same-origin", &so_fid), ("cross-origin", &xo_fid)] {
+        let selected = session
+            .select_option(
+                None,
+                Some(fid),
+                Some("#sub-sel"),
+                mimikyu_core::driver::SelectBy::Value("b".to_string()),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{engine} ({label}) select_option failed: {e}"));
+        assert_eq!(selected, "b");
+        assert_eq!(
+            session
+                .eval_isolated_in_frame("document.getElementById('sub-sel').value", Some(fid))
+                .await
+                .unwrap(),
+            "b"
+        );
+
+        session
+            .clear_node_value(None, Some(fid), Some("#sub-inp"))
+            .await
+            .unwrap_or_else(|e| panic!("{engine} ({label}) clear_node_value failed: {e}"));
+        assert_eq!(
+            session
+                .eval_isolated_in_frame("document.getElementById('sub-inp').value", Some(fid))
+                .await
+                .unwrap(),
+            ""
+        );
+
+        session
+            .scroll_into_view(None, Some(fid), Some("#sub-bottom"))
+            .await
+            .unwrap_or_else(|e| panic!("{engine} ({label}) scroll_into_view failed: {e}"));
+        let sy = session
+            .eval_isolated_in_frame("window.scrollY", Some(fid))
+            .await
+            .unwrap()
+            .as_f64()
+            .unwrap_or(0.0);
+        assert!(
+            sy > 0.0,
+            "{engine} ({label}) scroll_into_view must scroll iframe (scrollY={sy})"
+        );
+    }
+
+    session.dispose().await.expect("dispose");
+    support::assert_pgid_gone(pid);
+}
+
+#[tokio::test]
+async fn live_iframe_selector_actions_parity_chromium() {
+    assert_iframe_selector_actions_parity(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn live_iframe_selector_actions_parity_firefox() {
+    assert_iframe_selector_actions_parity(EngineKind::Firefox).await;
+}
+
+#[tokio::test]
+async fn live_firefox_virtual_context_content_disposition_does_not_leak_to_subsequent_download() {
+    let server = TestServer::start().await;
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dl1 = tmp.path().join("vc-cd-reset");
+
+    let pool = mimikyu_core::isolation::VirtualContextPool::launch(LaunchOptions {
+        engine: EngineKind::Firefox,
+        headless: true,
+        ..Default::default()
+    })
+    .await
+    .expect("launch firefox pool");
+    let pool_pid = pool.root_session().info().pid.expect("pool pid") as libc::pid_t;
+
+    let vc1 = pool
+        .create_labeled_context(
+            "cd-reset-vc",
+            ContextOptions {
+                download_dir: Some(dl1.clone()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("vc1");
+
+    vc1.session()
+        .navigate(&server.url("/download-cd-reset-page"))
+        .await
+        .expect("nav /download-cd-reset-page");
+
+    // 1. Response 1 serves Content-Disposition: attachment; filename="first.bin"
+    let b1 = vc1
+        .session()
+        .resolve_selector_box("#dl-cd")
+        .await
+        .expect("box #dl-cd");
+    let (x1, y1) = b1.center();
+    vc1.session()
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: x1,
+            y: y1,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #dl-cd");
+    let got1 = wait_for_download_file(&dl1.join("first.bin"), 512).await;
+    assert_eq!(got1, vec![1u8; 512]);
+
+    // 2. Response 2 from same URL omits Content-Disposition; <a download="client-named.bin"> must win
+    let b2 = vc1
+        .session()
+        .resolve_selector_box("#dl-attr")
+        .await
+        .expect("box #dl-attr");
+    let (x2, y2) = b2.center();
+    vc1.session()
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: x2,
+            y: y2,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #dl-attr");
+    let got2 = wait_for_download_file(&dl1.join("client-named.bin"), 512).await;
+    assert_eq!(got2, vec![2u8; 512]);
+
+    // 3. Response 3 from same URL serves Content-Disposition: attachment; filename="third.bin"
+    let b3 = vc1
+        .session()
+        .resolve_selector_box("#dl-cd-3")
+        .await
+        .expect("box #dl-cd-3");
+    let (x3, y3) = b3.center();
+    vc1.session()
+        .dispatch_mouse(MouseEvent {
+            event_type: MouseEventType::Click,
+            x: x3,
+            y: y3,
+            button: MouseButton::Left,
+            click_count: 1,
+            modifiers: 0,
+        })
+        .await
+        .expect("click #dl-cd-3");
+    let got3 = wait_for_download_file(&dl1.join("third.bin"), 512).await;
+    assert_eq!(got3, vec![3u8; 512]);
+
+    let mut entries: Vec<String> = std::fs::read_dir(&dl1)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    assert_eq!(
+        entries,
+        vec!["client-named.bin", "first.bin", "third.bin"],
+        "unexpected downloaded files in vc1: {entries:?}"
+    );
+
+    vc1.dispose().await.expect("dispose vc1");
+    pool.shutdown().await.expect("shutdown pool");
+    support::assert_pgid_gone(pool_pid);
+}
+
+async fn assert_activate_tab_across_target_blank_popups(engine: EngineKind) {
+    let server = TestServer::start().await;
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            ..Default::default()
+        })
+        .await
+        .expect("launch");
+    let pid = session.info().pid.expect("pid") as libc::pid_t;
+    let root_tid = session.info().target_id.clone();
+
+    session
+        .navigate(&server.url("/target-blank-host"))
+        .await
+        .expect("navigate /target-blank-host");
+
+    for sel in ["#lnk-blank", "#lnk-noopener"] {
+        let b = session
+            .resolve_selector_box(sel)
+            .await
+            .unwrap_or_else(|e| panic!("{engine} resolve {sel}: {e}"));
+        let (x, y) = b.center();
+        session
+            .dispatch_mouse(MouseEvent {
+                event_type: MouseEventType::Click,
+                x,
+                y,
+                button: MouseButton::Left,
+                click_count: 1,
+                modifiers: 0,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("{engine} click {sel}: {e}"));
+    }
+
+    let mut blank_tid = None;
+    let mut noopener_tid = None;
+    for _ in 0..120 {
+        let tabs = session.list_tabs().await.expect("list_tabs");
+        blank_tid = tabs
+            .iter()
+            .find(|t| t.url.contains("/target-blank-child?tag=blank"))
+            .map(|t| t.target_id.clone());
+        noopener_tid = tabs
+            .iter()
+            .find(|t| t.url.contains("/target-blank-child?tag=noopener"))
+            .map(|t| t.target_id.clone());
+        if blank_tid.is_some() && noopener_tid.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let blank_tid = blank_tid.expect("blank popup tab present");
+    let noopener_tid = noopener_tid.expect("noopener popup tab present");
+
+    for target_tid in [&blank_tid, &noopener_tid, &root_tid, &blank_tid] {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            session.activate_tab(target_tid),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{engine}: activate_tab({target_tid}) timed out"))
+        .unwrap_or_else(|e| panic!("{engine}: activate_tab({target_tid}) failed: {e}"));
+
+        let tabs = session.list_tabs().await.expect("list_tabs after activate");
+        let active_ids: Vec<&str> = tabs
+            .iter()
+            .filter(|t| t.active)
+            .map(|t| t.target_id.as_str())
+            .collect();
+        assert_eq!(
+            active_ids,
+            vec![target_tid.as_str()],
+            "{engine}: expected only {target_tid} active, got {tabs:?}"
+        );
+    }
+
+    session.dispose().await.expect("dispose");
+    support::assert_pgid_gone(pid);
+}
+
+#[tokio::test]
+async fn live_activate_tab_across_target_blank_popups_chromium() {
+    assert_activate_tab_across_target_blank_popups(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn live_activate_tab_across_target_blank_popups_firefox() {
+    assert_activate_tab_across_target_blank_popups(EngineKind::Firefox).await;
+}
+
+async fn assert_instant_animations_popups_child_frames_and_oopif_toggle(engine: EngineKind) {
+    let server = TestServer::start().await;
+    let server2 = TestServer::start().await;
+    let xo_url = server2.localhost_url("/anim-xo-child");
+
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            main_world_eval: true,
+            extra_args: if engine == EngineKind::Chromium {
+                vec!["--site-per-process".to_string()]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        })
+        .await
+        .expect("launch");
+    let pid = session.info().pid.expect("pid") as libc::pid_t;
+
+    session
+        .navigate(&server.url(&format!("/anim-host?xo={xo_url}")))
+        .await
+        .expect("navigate /anim-host");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Open popup containing a child iframe
+    session
+        .eval_isolated("document.getElementById('open-pop').click()")
+        .await
+        .expect("click #open-pop");
+
+    for _ in 0..120 {
+        let loads = session
+            .eval_main_world("window.__popLoads")
+            .await
+            .ok()
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if loads >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    // Allow popup/OOPIF target setup to settle
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    let read_main_and_oopif = || async {
+        let main_style = session
+            .eval_isolated(
+                "({ animDur: getComputedStyle(document.getElementById('box')).animationDuration, transDur: getComputedStyle(document.getElementById('box')).transitionDuration, scrollBeh: getComputedStyle(document.documentElement).scrollBehavior })",
+            )
+            .await
+            .expect("read main anim");
+        let frames = session.list_frames().await.expect("list_frames");
+        let xo_fid = frames
+            .iter()
+            .find(|f| !f.is_main && f.url.contains("/anim-xo-child"))
+            .map(|f| f.frame_id.clone())
+            .expect("xo child frame present");
+        let oopif_style = session
+            .eval_isolated_in_frame(
+                "({ animDur: getComputedStyle(document.getElementById('box')).animationDuration, transDur: getComputedStyle(document.getElementById('box')).transitionDuration, scrollBeh: getComputedStyle(document.documentElement).scrollBehavior })",
+                Some(&xo_fid),
+            )
+            .await
+            .expect("read oopif anim");
+        (main_style, oopif_style)
+    };
+
+    let ask_popup = |tag: &str| {
+        let session = &session;
+        let tag_owned = tag.to_string();
+        async move {
+            session
+                .eval_main_world(&format!(
+                    "window.__askPop({})",
+                    serde_json::to_string(&tag_owned).unwrap()
+                ))
+                .await
+                .expect("askPop");
+            for _ in 0..100 {
+                let val = session
+                    .eval_main_world(&format!(
+                        "window.__animReplies[{}] || null",
+                        serde_json::to_string(&tag_owned).unwrap()
+                    ))
+                    .await
+                    .unwrap_or(serde_json::Value::Null);
+                if !val.is_null() {
+                    return val;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+            panic!("{engine}: timed out waiting for popup probe reply '{tag_owned}'");
+        }
+    };
+
+    let assert_durations = |label: &str, expected_anim: &str, expected_trans: &str, expected_scroll: &str, main_v: &serde_json::Value, oopif_v: &serde_json::Value, pop_reply: &serde_json::Value| {
+        for (scope, v) in [
+            ("main", main_v),
+            ("oopif", oopif_v),
+            ("popup", &pop_reply["pop"]),
+            ("popup_child", &pop_reply["child"]),
+        ] {
+            assert_eq!(
+                v["animDur"].as_str(),
+                Some(expected_anim),
+                "{engine} [{label}] {scope} animDur mismatch: {v:?}"
+            );
+            assert_eq!(
+                v["transDur"].as_str(),
+                Some(expected_trans),
+                "{engine} [{label}] {scope} transDur mismatch: {v:?}"
+            );
+            assert_eq!(
+                v["scrollBeh"].as_str(),
+                Some(expected_scroll),
+                "{engine} [{label}] {scope} scrollBeh mismatch: {v:?}"
+            );
+        }
+    };
+
+    // 1. Baseline (disabled)
+    let (m0, o0) = read_main_and_oopif().await;
+    let p0 = ask_popup("baseline").await;
+    assert_durations("baseline", "10s", "5s", "smooth", &m0, &o0, &p0);
+
+    // 2. Enable instant animations while main, OOPIF, popup, and popup child are already open
+    session
+        .set_instant_animations(true)
+        .await
+        .expect("enable instant animations");
+    let (m1, o1) = read_main_and_oopif().await;
+    let p1 = ask_popup("after_enable_live").await;
+    assert_durations("after_enable_live", "0s", "0s", "auto", &m1, &o1, &p1);
+
+    // 3. Reload main+OOPIF and reload popup+child while enabled
+    let prev_loads = session
+        .eval_main_world("window.__popLoads")
+        .await
+        .unwrap()
+        .as_u64()
+        .unwrap_or(1);
+    session
+        .eval_main_world("window.__reloadPop()")
+        .await
+        .expect("reload popup");
+    for _ in 0..120 {
+        let loads = session
+            .eval_main_world("window.__popLoads")
+            .await
+            .ok()
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if loads > prev_loads {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    session.reload().await.expect("reload main");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (m2, o2) = read_main_and_oopif().await;
+    let p2 = ask_popup("after_enable_reload").await;
+    assert_durations("after_enable_reload", "0s", "0s", "auto", &m2, &o2, &p2);
+
+    // 3b. Open a brand-new popup WHILE instant_animations is already enabled (popup document + child iframe must both be 0s)
+    let prev_loads_new_pop = session
+        .eval_main_world("window.__popLoads")
+        .await
+        .unwrap()
+        .as_u64()
+        .unwrap_or(2);
+    session
+        .eval_main_world(
+            "if (window.__pop && !window.__pop.closed) window.__pop.close(); window.__pop = window.open('/anim-popup', 'animpop2', 'width=400,height=300'); true",
+        )
+        .await
+        .expect("open fresh popup while instant_animations=true");
+    for _ in 0..120 {
+        let loads = session
+            .eval_main_world("window.__popLoads")
+            .await
+            .ok()
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if loads > prev_loads_new_pop {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (m2b, o2b) = read_main_and_oopif().await;
+    let p2b = ask_popup("new_popup_while_enabled").await;
+    assert_durations("new_popup_while_enabled", "0s", "0s", "auto", &m2b, &o2b, &p2b);
+
+    let prev_loads_new_pop_reload = session
+        .eval_main_world("window.__popLoads")
+        .await
+        .unwrap()
+        .as_u64()
+        .unwrap_or(3);
+    session
+        .eval_main_world("window.__reloadPop()")
+        .await
+        .expect("reload newly opened popup while instant_animations=true");
+    for _ in 0..120 {
+        let loads = session
+            .eval_main_world("window.__popLoads")
+            .await
+            .ok()
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if loads > prev_loads_new_pop_reload {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let p2c = ask_popup("new_popup_while_enabled_reload").await;
+    assert_durations("new_popup_while_enabled_reload", "0s", "0s", "auto", &m2b, &o2b, &p2c);
+
+    // 4. Disable instant animations (live check across main, OOPIF, popup, popup child)
+    session
+        .set_instant_animations(false)
+        .await
+        .expect("disable instant animations");
+    let (m3, o3) = read_main_and_oopif().await;
+    let p3 = ask_popup("after_disable_live").await;
+    assert_durations("after_disable_live", "10s", "5s", "smooth", &m3, &o3, &p3);
+
+    // 5. Reload main+OOPIF and reload popup+child while disabled (preload scripts must be removed)
+    let prev_loads2 = session
+        .eval_main_world("window.__popLoads")
+        .await
+        .unwrap()
+        .as_u64()
+        .unwrap_or(2);
+    session
+        .eval_main_world("window.__reloadPop()")
+        .await
+        .expect("reload popup after disable");
+    for _ in 0..120 {
+        let loads = session
+            .eval_main_world("window.__popLoads")
+            .await
+            .ok()
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if loads > prev_loads2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    session.reload().await.expect("reload main after disable");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (m4, o4) = read_main_and_oopif().await;
+    let p4 = ask_popup("after_disable_reload").await;
+    assert_durations("after_disable_reload", "10s", "5s", "smooth", &m4, &o4, &p4);
+
+    // 6. Open another fresh popup AFTER disable to ensure no stale popup/userContext preload script remains
+    let prev_loads3 = session
+        .eval_main_world("window.__popLoads")
+        .await
+        .unwrap()
+        .as_u64()
+        .unwrap_or(4);
+    session
+        .eval_main_world(
+            "if (window.__pop && !window.__pop.closed) window.__pop.close(); window.__pop = window.open('/anim-popup', 'animpop3', 'width=400,height=300'); true",
+        )
+        .await
+        .expect("open fresh popup after disable");
+    for _ in 0..120 {
+        let loads = session
+            .eval_main_world("window.__popLoads")
+            .await
+            .ok()
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        if loads > prev_loads3 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let p5 = ask_popup("new_popup_after_disable").await;
+    assert_durations("new_popup_after_disable", "10s", "5s", "smooth", &m4, &o4, &p5);
+
+    session.dispose().await.expect("dispose");
+    support::assert_pgid_gone(pid);
+}
+
+#[tokio::test]
+async fn live_instant_animations_popups_child_frames_and_oopif_toggle_chromium() {
+    assert_instant_animations_popups_child_frames_and_oopif_toggle(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn live_instant_animations_popups_child_frames_and_oopif_toggle_firefox() {
+    assert_instant_animations_popups_child_frames_and_oopif_toggle(EngineKind::Firefox).await;
+}
+
+async fn assert_instant_animations_virtual_context_popup_isolation(engine: EngineKind) {
+    let server = TestServer::start().await;
+    let server2 = TestServer::start().await;
+    let xo_url = server2.localhost_url("/anim-xo-child");
+
+    let root = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::VirtualContext,
+            main_world_eval: true,
+            extra_args: if engine == EngineKind::Chromium {
+                vec!["--site-per-process".to_string()]
+            } else {
+                Vec::new()
+            },
+            ..Default::default()
+        })
+        .await
+        .expect("launch virtual pool");
+    let pid = root.info().pid.expect("pid") as libc::pid_t;
+
+    let ctx_a = root
+        .new_context(ContextOptions {
+            main_world_eval: true,
+            instant_animations: true,
+            ..Default::default()
+        })
+        .await
+        .expect("new_context A");
+    let ctx_b = root
+        .new_context(ContextOptions {
+            main_world_eval: true,
+            instant_animations: false,
+            ..Default::default()
+        })
+        .await
+        .expect("new_context B");
+
+    for (label, s) in [("A", &ctx_a), ("B", &ctx_b)] {
+        s.navigate(&server.url(&format!("/anim-host?xo={xo_url}")))
+            .await
+            .unwrap_or_else(|e| panic!("{engine} ctx_{label} navigate: {e}"));
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        s.eval_isolated("document.getElementById('open-pop').click()")
+            .await
+            .unwrap_or_else(|e| panic!("{engine} ctx_{label} open-pop: {e}"));
+        for _ in 0..120 {
+            let loads = s
+                .eval_main_world("window.__popLoads")
+                .await
+                .ok()
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if loads >= 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    }
+
+    let read_ctx = |s: &std::sync::Arc<dyn mimikyu_core::driver::DriverSession>, tag: &str| {
+        let s = std::sync::Arc::clone(s);
+        let tag = tag.to_string();
+        async move {
+            let main_style = s
+                .eval_isolated(
+                    "({ animDur: getComputedStyle(document.getElementById('box')).animationDuration, transDur: getComputedStyle(document.getElementById('box')).transitionDuration, scrollBeh: getComputedStyle(document.documentElement).scrollBehavior })",
+                )
+                .await
+                .expect("read main anim");
+            s.eval_main_world(&format!(
+                "window.__askPop({})",
+                serde_json::to_string(&tag).unwrap()
+            ))
+            .await
+            .expect("askPop");
+            let mut pop_reply = serde_json::Value::Null;
+            for _ in 0..100 {
+                let val = s
+                    .eval_main_world(&format!(
+                        "window.__animReplies[{}] || null",
+                        serde_json::to_string(&tag).unwrap()
+                    ))
+                    .await
+                    .unwrap_or(serde_json::Value::Null);
+                if !val.is_null() {
+                    pop_reply = val;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            }
+            assert!(!pop_reply.is_null(), "{engine}: timed out waiting for ctx popup reply");
+            (main_style, pop_reply)
+        }
+    };
+
+    let (ma, pa) = read_ctx(&ctx_a, "vc_a").await;
+    let (mb, pb) = read_ctx(&ctx_b, "vc_b").await;
+    for (scope, v) in [
+        ("ctx_a.main", &ma),
+        ("ctx_a.pop", &pa["pop"]),
+        ("ctx_a.child", &pa["child"]),
+    ] {
+        assert_eq!(v["animDur"].as_str(), Some("0s"), "{engine} {scope}: {v:?}");
+        assert_eq!(v["transDur"].as_str(), Some("0s"), "{engine} {scope}: {v:?}");
+        assert_eq!(v["scrollBeh"].as_str(), Some("auto"), "{engine} {scope}: {v:?}");
+    }
+    for (scope, v) in [
+        ("ctx_b.main", &mb),
+        ("ctx_b.pop", &pb["pop"]),
+        ("ctx_b.child", &pb["child"]),
+    ] {
+        assert_eq!(v["animDur"].as_str(), Some("10s"), "{engine} {scope}: {v:?}");
+        assert_eq!(v["transDur"].as_str(), Some("5s"), "{engine} {scope}: {v:?}");
+        assert_eq!(v["scrollBeh"].as_str(), Some("smooth"), "{engine} {scope}: {v:?}");
+    }
+
+    // Toggle ctx_a off and verify ctx_a reverts + reload stays disabled while ctx_b remains unaffected
+    ctx_a
+        .set_instant_animations(false)
+        .await
+        .expect("ctx_a disable");
+    let (ma_off, pa_off) = read_ctx(&ctx_a, "vc_a_off").await;
+    for (scope, v) in [
+        ("ctx_a_off.main", &ma_off),
+        ("ctx_a_off.pop", &pa_off["pop"]),
+        ("ctx_a_off.child", &pa_off["child"]),
+    ] {
+        assert_eq!(v["animDur"].as_str(), Some("10s"), "{engine} {scope}: {v:?}");
+    }
+
+    ctx_a.dispose().await.expect("dispose ctx_a");
+    ctx_b.dispose().await.expect("dispose ctx_b");
+    root.dispose().await.expect("dispose root");
+    support::assert_pgid_gone(pid);
+}
+
+#[tokio::test]
+async fn live_instant_animations_virtual_context_popup_isolation_chromium() {
+    assert_instant_animations_virtual_context_popup_isolation(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn live_instant_animations_virtual_context_popup_isolation_firefox() {
+    assert_instant_animations_virtual_context_popup_isolation(EngineKind::Firefox).await;
+}

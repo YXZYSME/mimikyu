@@ -2147,3 +2147,168 @@ async fn live_fixed_right_edge_scrollbar_handling_chromium() {
 async fn live_fixed_right_edge_scrollbar_handling_firefox() {
     assert_fixed_right_edge_scrollbar_handling(EngineKind::Firefox).await;
 }
+
+#[tokio::test]
+async fn batch_extract_accepts_md_txt_aliases_and_open_validates_url_and_clears_refs() {
+    use mimikyu_core::input::{ActionBatcher, BatchAction};
+
+    let server = TestServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let dir_path = tmp.path().to_path_buf();
+
+    let session = driver_for(EngineKind::Chromium)
+        .launch(LaunchOptions {
+            engine: EngineKind::Chromium,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            ..Default::default()
+        })
+        .await
+        .expect("launch");
+    let pid = session.info().pid.expect("pid") as libc::pid_t;
+    let chokepoint = ChokepointInput::new(session.clone());
+    let mut snap_state = SnapshotState::default();
+
+    // 1. Open valid URL + snapshot + extract md/txt aliases
+    let ok_report = ActionBatcher::execute(
+        session.as_ref(),
+        &chokepoint,
+        &mut snap_state,
+        &[
+            BatchAction::Open {
+                url: server.url("/"),
+            },
+            BatchAction::Snapshot {
+                max_depth: None,
+                interactive_only: false,
+                diff: false,
+            },
+            BatchAction::Extract {
+                mode: "md".to_string(),
+            },
+            BatchAction::Extract {
+                mode: "txt".to_string(),
+            },
+        ],
+    )
+    .await
+    .expect("execute");
+    assert!(ok_report.ok, "batch md/txt failed: {:?}", ok_report.error);
+    assert!(!snap_state.active_ref_map.is_empty());
+
+    // 2. Direct BatchAction::Open clears stale active_ref_map
+    let open2 = ActionBatcher::execute(
+        session.as_ref(),
+        &chokepoint,
+        &mut snap_state,
+        &[BatchAction::Open {
+            url: "data:text/html,<h1>empty</h1>".to_string(),
+        }],
+    )
+    .await
+    .expect("open2");
+    assert!(open2.ok);
+    assert!(
+        snap_state.active_ref_map.is_empty(),
+        "BatchAction::Open must clear active_ref_map"
+    );
+
+    // 3. Direct BatchAction::Open rejects disallowed URL scheme
+    let bad_open = ActionBatcher::execute(
+        session.as_ref(),
+        &chokepoint,
+        &mut snap_state,
+        &[BatchAction::Open {
+            url: "file:///etc/passwd".to_string(),
+        }],
+    )
+    .await
+    .expect("bad_open report");
+    assert!(!bad_open.ok);
+
+    // 4. BatchAction::Upload rejects directory path
+    let bad_upload = ActionBatcher::execute(
+        session.as_ref(),
+        &chokepoint,
+        &mut snap_state,
+        &[BatchAction::Upload {
+            target: "input[type=file]".to_string(),
+            files: vec![dir_path],
+        }],
+    )
+    .await
+    .expect("bad_upload report");
+    assert!(!bad_upload.ok);
+
+    // 5. BatchAction::Scroll rejects non-finite deltas
+    let bad_scroll = ActionBatcher::execute(
+        session.as_ref(),
+        &chokepoint,
+        &mut snap_state,
+        &[BatchAction::Scroll {
+            dx: f64::NAN,
+            dy: 10.0,
+            target: None,
+            humanize: None,
+        }],
+    )
+    .await
+    .expect("bad_scroll report");
+    assert!(!bad_scroll.ok);
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid);
+}
+
+#[tokio::test]
+async fn humanized_scroll_handles_extreme_finite_deltas_without_infinity_overflow() {
+    use mimikyu_core::input::humanize::split_wheel_notches;
+    use rand::rngs::StdRng;
+    use rand::SeedableRng;
+
+    let mut rng = StdRng::seed_from_u64(99);
+    let notches = split_wheel_notches(f64::MAX, -f64::MAX, &mut rng);
+    assert!(notches.len() >= 2);
+    for (nx, ny, _) in &notches {
+        assert!(nx.is_finite() && ny.is_finite(), "non-finite notch ({nx}, {ny})");
+    }
+
+    let server = TestServer::start().await;
+    let session = driver_for(EngineKind::Chromium)
+        .launch(LaunchOptions {
+            engine: EngineKind::Chromium,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            ..Default::default()
+        })
+        .await
+        .expect("launch chromium");
+    let pid = session.info().pid.expect("pid") as libc::pid_t;
+
+    session
+        .navigate(&server.url("/edge-and-scroll"))
+        .await
+        .expect("navigate /edge-and-scroll");
+
+    let input = ChokepointInput::new(session.clone());
+    input
+        .scroll(
+            1.5e308,
+            0.0,
+            None,
+            None,
+            &ScrollOptions {
+                humanize: HumanizeConfig {
+                    enabled: true,
+                    seed: Some(7),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("humanized scroll with 1.5e308 must succeed without CDP -32602");
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid);
+}

@@ -3,9 +3,10 @@ pub mod tools;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::signal::unix::{signal, SignalKind};
 
+use crate::daemon::{read_bounded_line_bytes, BoundedLine};
 use crate::error::Result;
 use crate::session::SessionManager;
 
@@ -16,6 +17,7 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 const PROTOCOL_VERSION: &str = "2024-11-05";
+const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 fn jsonrpc_ok(id: Value, result: Value) -> Value {
     json!({
@@ -151,14 +153,39 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut line = String::new();
     let mut loop_err = None;
 
     loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
-            Ok(0) => break,
-            Ok(_) => {
+        match read_bounded_line_bytes(&mut reader, MAX_LINE_BYTES).await {
+            Ok(BoundedLine::Eof) => break,
+            Ok(BoundedLine::TooLong) => {
+                let resp = jsonrpc_err(
+                    Value::Null,
+                    INVALID_REQUEST,
+                    format!("Invalid Request: request exceeded {MAX_LINE_BYTES} bytes"),
+                );
+                if let Err(we) = write_json_line(&mut writer, &resp).await {
+                    loop_err = Some(we);
+                    break;
+                }
+                continue;
+            }
+            Ok(BoundedLine::Ok(bytes)) => {
+                let line = match std::str::from_utf8(&bytes) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        let resp = jsonrpc_err(
+                            Value::Null,
+                            PARSE_ERROR,
+                            format!("Parse error: invalid UTF-8: {e}"),
+                        );
+                        if let Err(we) = write_json_line(&mut writer, &resp).await {
+                            loop_err = Some(we);
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     continue;

@@ -51,7 +51,13 @@ pub async fn dispatch(req: &HarnessRequest, state: &HarnessState) -> HarnessResp
                 .query
                 .get("to")
                 .map(String::as_str)
-                .filter(|t| t.starts_with('/') && !t.starts_with("//"))
+                .filter(|t| {
+                    t.starts_with('/')
+                        && !t.starts_with("//")
+                        && !t.contains('\r')
+                        && !t.contains('\n')
+                        && !t.chars().any(|c| c.is_control())
+                })
                 .unwrap_or("/target");
             HarnessResponse {
                 status: 302,

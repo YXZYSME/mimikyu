@@ -498,7 +498,18 @@ async fn assert_eval_json_parity(engine: EngineKind) {
             serde_json::json!({"a": {"k": 1}, "b": {"k": 1}}),
         ),
         ("({x: -0})", serde_json::json!({"x": 0})),
+        ("({x: undefined, y: 1})", serde_json::json!({"y": 1})),
+        ("[1, undefined, 2]", serde_json::json!([1, null, 2])),
         ("Promise.resolve({answer: 42})", serde_json::json!({"answer": 42})),
+        ("new Response('ok')", serde_json::json!({})),
+        ("new Request('http://127.0.0.1/')", serde_json::json!({})),
+        ("new Headers({ 'x-a': '1' })", serde_json::json!({})),
+        ("new URL('http://127.0.0.1/a')", serde_json::json!({})),
+        ("new URLSearchParams('a=1')", serde_json::json!({})),
+        (
+            "({r: new Response('ok'), u: new URL('http://127.0.0.1/a')})",
+            serde_json::json!({"r": {}, "u": {}}),
+        ),
     ];
 
     let invalid_cases = [
@@ -525,6 +536,13 @@ async fn assert_eval_json_parity(engine: EngineKind) {
         "new Error('e')",
         "Promise.resolve(() => {})",
         "Promise.resolve(NaN)",
+        "new WeakMap()",
+        "new ArrayBuffer(8)",
+        "new Uint8Array(2)",
+        "new Blob(['ok'])",
+        "new DOMException('e')",
+        "({w: new WeakMap()})",
+        "document.body.style",
     ];
 
     for main_world in [false, true] {
@@ -551,16 +569,6 @@ async fn assert_eval_json_parity(engine: EngineKind) {
                 "{engine} main_world={main_world} expr={expr}: expected EvalFailed, got {res:?}"
             );
         }
-    }
-
-    if engine == EngineKind::Chromium {
-        assert_eq!(
-            session
-                .eval_isolated("new Response('ok')")
-                .await
-                .expect("Response eval on chromium"),
-            serde_json::json!({})
-        );
     }
 
     session.dispose().await.expect("dispose");
@@ -702,4 +710,296 @@ async fn live_oopif_extract_and_closed_shadow_chromium() {
 
     session.dispose().await.expect("dispose");
     assert_pgid_gone(pid as libc::pid_t);
+}
+
+async fn assert_extract_tables_handles_non_integer_and_oversized_spans(engine: EngineKind) {
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            ..Default::default()
+        })
+        .await
+        .expect("launch");
+    let pid = session.info().pid.expect("pid");
+
+    let html = r#"<!doctype html><html><body>
+        <table id="t1">
+          <thead><tr><th>ColA</th><th>ColB</th></tr></thead>
+          <tbody><tr><td>A1</td><td>B1</td></tr></tbody>
+        </table>
+        <table id="t2">
+          <tbody>
+            <tr><td colspan="1.5">X1</td><td rowspan="1e400">Y1</td></tr>
+            <tr><td>X2</td><td>Y2</td></tr>
+          </tbody>
+        </table>
+    </body></html>"#;
+    let data_url = format!(
+        "data:text/html,{}",
+        url::form_urlencoded::byte_serialize(html.as_bytes())
+            .collect::<String>()
+            .replace('+', "%20")
+    );
+    session.navigate(&data_url).await.expect("navigate data");
+
+    let res = extract_tables(session.as_ref(), &ExtractOptions::default())
+        .await
+        .expect("extract_tables");
+    assert_eq!(
+        res.tables.len(),
+        2,
+        "{engine}: malformed colspan/rowspan in #t2 must not wipe #t1 or #t2: {:?}",
+        res.tables
+    );
+    assert_eq!(res.tables[0].id.as_deref(), Some("t1"));
+    assert_eq!(res.tables[0].headers, vec!["ColA", "ColB"]);
+    assert_eq!(res.tables[0].rows, vec![vec!["A1", "B1"]]);
+    assert_eq!(res.tables[1].id.as_deref(), Some("t2"));
+    assert_eq!(res.tables[1].rows[0], vec!["X1", "Y1"]);
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn extract_tables_handles_non_integer_and_oversized_spans_chromium() {
+    assert_extract_tables_handles_non_integer_and_oversized_spans(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn extract_tables_handles_non_integer_and_oversized_spans_firefox() {
+    assert_extract_tables_handles_non_integer_and_oversized_spans(EngineKind::Firefox).await;
+}
+
+#[tokio::test]
+async fn extract_closed_shadow_respects_hidden_hosts_and_selector_chromium() {
+    let session = driver_for(EngineKind::Chromium)
+        .launch(LaunchOptions {
+            engine: EngineKind::Chromium,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            ..Default::default()
+        })
+        .await
+        .expect("launch chromium");
+    let pid = session.info().pid.expect("pid");
+
+    let html = r#"<!doctype html><html><body>
+        <div id="scoped-sec">
+            <div id="scoped-closed-host"></div>
+        </div>
+        <div id="outside-sec">
+            <div id="outside-closed-host"></div>
+        </div>
+        <div id="closed-disp-none" style="display:none"></div>
+        <div id="closed-attr-hidden" hidden></div>
+        <div id="closed-aria-hidden" aria-hidden="true"></div>
+        <div id="hidden-ancestor" style="display:none"><div id="closed-nested-hidden"></div></div>
+        <script>
+            const populate = (id, tag) => {
+                const sr = document.getElementById(id).attachShadow({ mode: 'closed' });
+                sr.innerHTML = `<p>${tag}Para</p><a href="https://example.com/${tag}">${tag}Link</a><table><thead><tr><th>H</th></tr></thead><tbody><tr><td>${tag}Cell</td></tr></tbody></table>`;
+            };
+            populate('scoped-closed-host', 'ScopedClosed');
+            populate('outside-closed-host', 'OutsideClosed');
+            populate('closed-disp-none', 'HiddenDisp');
+            populate('closed-attr-hidden', 'HiddenAttr');
+            populate('closed-aria-hidden', 'HiddenAria');
+            populate('closed-nested-hidden', 'HiddenNest');
+        </script>
+    </body></html>"#;
+    let data_url = format!(
+        "data:text/html,{}",
+        url::form_urlencoded::byte_serialize(html.as_bytes())
+            .collect::<String>()
+            .replace('+', "%20")
+    );
+    session.navigate(&data_url).await.expect("navigate data");
+
+    // 1. Default extract_* must include visible closed shadow hosts and exclude all hidden closed shadow hosts
+    let md = extract_markdown(session.as_ref(), &ExtractOptions::default())
+        .await
+        .expect("extract_markdown");
+    let txt = extract_text(session.as_ref(), &ExtractOptions::default())
+        .await
+        .expect("extract_text");
+    let links = extract_links(session.as_ref(), &ExtractOptions::default())
+        .await
+        .expect("extract_links");
+    let tables = extract_tables(session.as_ref(), &ExtractOptions::default())
+        .await
+        .expect("extract_tables");
+
+    assert!(md.markdown.contains("ScopedClosedPara"));
+    assert!(txt.text.contains("ScopedClosedPara"));
+    assert!(links.links.iter().any(|l| l.text == "ScopedClosedLink"));
+    assert!(tables
+        .tables
+        .iter()
+        .any(|t| t.rows.iter().any(|r| r.iter().any(|c| c == "ScopedClosedCell"))));
+
+    for hidden_tag in ["HiddenDisp", "HiddenAttr", "HiddenAria", "HiddenNest"] {
+        assert!(
+            !md.markdown.contains(hidden_tag),
+            "markdown leaked hidden closed shadow {hidden_tag}: {}",
+            md.markdown
+        );
+        assert!(
+            !txt.text.contains(hidden_tag),
+            "text leaked hidden closed shadow {hidden_tag}: {}",
+            txt.text
+        );
+        assert!(
+            !links.links.iter().any(|l| l.text.contains(hidden_tag)),
+            "links leaked hidden closed shadow {hidden_tag}: {:?}",
+            links.links
+        );
+        assert!(
+            !tables
+                .tables
+                .iter()
+                .any(|t| t.rows.iter().any(|r| r.iter().any(|c| c.contains(hidden_tag)))),
+            "tables leaked hidden closed shadow {hidden_tag}: {:?}",
+            tables.tables
+        );
+    }
+
+    // 2. ExtractOptions::selector must include closed shadow DOM inside selector and exclude outside
+    let scoped_opts = ExtractOptions {
+        selector: Some("#scoped-sec".to_string()),
+        include_shadow_dom: true,
+        ..Default::default()
+    };
+    let smd = extract_markdown(session.as_ref(), &scoped_opts)
+        .await
+        .expect("scoped markdown");
+    let stxt = extract_text(session.as_ref(), &scoped_opts)
+        .await
+        .expect("scoped text");
+    let slinks = extract_links(session.as_ref(), &scoped_opts)
+        .await
+        .expect("scoped links");
+    let stables = extract_tables(session.as_ref(), &scoped_opts)
+        .await
+        .expect("scoped tables");
+
+    assert!(smd.markdown.contains("ScopedClosedPara"), "{}", smd.markdown);
+    assert!(!smd.markdown.contains("OutsideClosedPara"), "{}", smd.markdown);
+    assert!(stxt.text.contains("ScopedClosedPara"), "{}", stxt.text);
+    assert!(!stxt.text.contains("OutsideClosedPara"), "{}", stxt.text);
+    assert!(slinks.links.iter().any(|l| l.text == "ScopedClosedLink"));
+    assert!(!slinks.links.iter().any(|l| l.text == "OutsideClosedLink"));
+    assert!(stables
+        .tables
+        .iter()
+        .any(|t| t.rows.iter().any(|r| r.iter().any(|c| c == "ScopedClosedCell"))));
+    assert!(!stables
+        .tables
+        .iter()
+        .any(|t| t.rows.iter().any(|r| r.iter().any(|c| c == "OutsideClosedCell"))));
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+async fn assert_extract_tables_nested_aria_tables_do_not_leak(engine: EngineKind) {
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            ..Default::default()
+        })
+        .await
+        .expect("launch");
+    let pid = session.info().pid.expect("pid");
+
+    let html = r#"<!doctype html><html><body>
+        <div id="outer-aria" role="table" aria-label="OuterARIA">
+            <div role="row">
+                <div role="cell">OuterVal1</div>
+                <div role="cell">
+                    <div id="inner-grid" role="grid" aria-label="InnerGrid">
+                        <div role="row"><div role="columnheader">InCol</div></div>
+                        <div role="row"><div role="gridcell">InnerSecretCell</div></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        <div id="aria-with-html" role="table" aria-label="AriaWithHtml">
+            <div role="row">
+                <div role="cell">AriaLeft</div>
+                <div role="cell">
+                    <table id="nested-html-in-aria">
+                        <tr><td>HtmlInner1</td><td>HtmlInner2</td></tr>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </body></html>"#;
+    let data_url = format!(
+        "data:text/html,{}",
+        url::form_urlencoded::byte_serialize(html.as_bytes())
+            .collect::<String>()
+            .replace('+', "%20")
+    );
+    session.navigate(&data_url).await.expect("navigate data");
+
+    let res = extract_tables(session.as_ref(), &ExtractOptions::default())
+        .await
+        .expect("extract_tables");
+
+    let outer = res
+        .tables
+        .iter()
+        .find(|t| t.id.as_deref() == Some("outer-aria"))
+        .expect("outer-aria present");
+    assert_eq!(
+        outer.row_count, 1,
+        "{engine}: nested ARIA grid leaked rows into outer-aria: {outer:?}"
+    );
+    assert_eq!(
+        outer.rows[0].len(),
+        2,
+        "{engine}: nested ARIA grid leaked cells into outer-aria row: {outer:?}"
+    );
+    assert_eq!(outer.rows[0][0], "OuterVal1");
+
+    let inner = res
+        .tables
+        .iter()
+        .find(|t| t.id.as_deref() == Some("inner-grid"))
+        .expect("inner-grid present");
+    assert_eq!(inner.headers, vec!["InCol"]);
+    assert_eq!(inner.rows, vec![vec!["InnerSecretCell"]]);
+
+    let aria_with_html = res
+        .tables
+        .iter()
+        .find(|t| t.id.as_deref() == Some("aria-with-html"))
+        .expect("aria-with-html present");
+    assert_eq!(aria_with_html.row_count, 1);
+    assert_eq!(aria_with_html.rows[0].len(), 2);
+
+    let nested_html = res
+        .tables
+        .iter()
+        .find(|t| t.id.as_deref() == Some("nested-html-in-aria"))
+        .expect("nested-html-in-aria present");
+    assert_eq!(nested_html.rows, vec![vec!["HtmlInner1", "HtmlInner2"]]);
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn extract_tables_nested_aria_tables_do_not_leak_chromium() {
+    assert_extract_tables_nested_aria_tables_do_not_leak(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn extract_tables_nested_aria_tables_do_not_leak_firefox() {
+    assert_extract_tables_nested_aria_tables_do_not_leak(EngineKind::Firefox).await;
 }

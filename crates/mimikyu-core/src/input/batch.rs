@@ -69,7 +69,7 @@ pub enum BatchAction {
         timeout_ms: Option<u64>,
         #[serde(default)]
         network_quiet_ms: Option<u64>,
-        #[serde(default)]
+        #[serde(default, alias = "stable_target")]
         target: Option<String>,
     },
     WaitSelector {
@@ -225,7 +225,9 @@ impl ActionBatcher {
     ) -> Result<Option<Value>> {
         match action {
             BatchAction::Open { url } => {
-                let nav = session.navigate(url).await?;
+                let valid_url = crate::session::validate_nav_url(url)?;
+                snapshot_state.active_ref_map.clear();
+                let nav = session.navigate(&valid_url).await?;
                 Ok(Some(serde_json::to_value(nav)?))
             }
             BatchAction::Click {
@@ -310,6 +312,25 @@ impl ActionBatcher {
                 Ok(Some(serde_json::json!({ "selected": selected })))
             }
             BatchAction::Upload { target, files } => {
+                if files.is_empty() {
+                    return Err(MimikyuError::InvalidConfig(
+                        "batch upload action requires at least one file".to_string(),
+                    ));
+                }
+                for path in files {
+                    let meta = std::fs::metadata(path).map_err(|e| {
+                        MimikyuError::InvalidConfig(format!(
+                            "upload file '{}' is not accessible: {e}",
+                            path.display()
+                        ))
+                    })?;
+                    if !meta.is_file() {
+                        return Err(MimikyuError::InvalidConfig(format!(
+                            "upload path '{}' is not a regular file",
+                            path.display()
+                        )));
+                    }
+                }
                 let tgt = InputTarget::parse(target);
                 chokepoint
                     .set_input_files(&tgt, Some(&snapshot_state.active_ref_map), files.clone(), 0)
@@ -322,6 +343,11 @@ impl ActionBatcher {
                 target,
                 humanize,
             } => {
+                if !dx.is_finite() || !dy.is_finite() {
+                    return Err(MimikyuError::InvalidConfig(
+                        "scroll deltas must be finite numbers".to_string(),
+                    ));
+                }
                 let tgt = target.as_deref().map(InputTarget::parse);
                 let opts = ScrollOptions {
                     humanize: HumanizeConfig {
@@ -409,16 +435,20 @@ impl ActionBatcher {
                 Ok(Some(serde_json::to_value(snap)?))
             }
             BatchAction::Extract { mode } => {
+                let parsed_mode: crate::session::ExtractMode = mode.parse()?;
                 let opts = ExtractOptions::default();
-                let val = match mode.trim().to_ascii_lowercase().as_str() {
-                    "markdown" => serde_json::to_value(extract_markdown(session, &opts).await?)?,
-                    "text" => serde_json::to_value(extract_text(session, &opts).await?)?,
-                    "links" => serde_json::to_value(extract_links(session, &opts).await?)?,
-                    "tables" => serde_json::to_value(extract_tables(session, &opts).await?)?,
-                    other => {
-                        return Err(MimikyuError::InvalidConfig(format!(
-                            "unknown extract mode '{other}' (expected markdown|text|links|tables)"
-                        )));
+                let val = match parsed_mode {
+                    crate::session::ExtractMode::Markdown => {
+                        serde_json::to_value(extract_markdown(session, &opts).await?)?
+                    }
+                    crate::session::ExtractMode::Text => {
+                        serde_json::to_value(extract_text(session, &opts).await?)?
+                    }
+                    crate::session::ExtractMode::Links => {
+                        serde_json::to_value(extract_links(session, &opts).await?)?
+                    }
+                    crate::session::ExtractMode::Tables => {
+                        serde_json::to_value(extract_tables(session, &opts).await?)?
                     }
                 };
                 Ok(Some(val))

@@ -273,6 +273,9 @@ async fn read_http_head(
     let mut tmp = [0u8; 2048];
     loop {
         if let Some(pos) = find_subslice(buf, b"\r\n\r\n") {
+            if pos > max_header_bytes {
+                return HeadRead::TooLarge;
+            }
             return HeadRead::Ok(pos);
         }
         if buf.len() > max_header_bytes {
@@ -332,15 +335,17 @@ async fn serve_connection(
         let mut lines = header_text.split("\r\n");
         let req_line = lines.next().unwrap_or("");
         let mut parts = req_line.split_whitespace();
-        let Some(method_raw) = parts.next() else {
+        let (Some(method_raw), Some(raw_target_raw), Some(version_raw), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
             let _ = write_simple_error(&mut stream, 400, "Bad Request").await;
             break;
         };
-        let Some(raw_target_raw) = parts.next() else {
+        if !matches!(version_raw, "HTTP/1.0" | "HTTP/1.1") {
             let _ = write_simple_error(&mut stream, 400, "Bad Request").await;
             break;
-        };
-        let version = parts.next().unwrap_or("HTTP/1.1").to_string();
+        }
+        let version = version_raw.to_string();
         let method = method_raw.to_ascii_uppercase();
         let raw_target = raw_target_raw.to_string();
 
@@ -364,14 +369,6 @@ async fn serve_connection(
         }
 
         if headers
-            .get("expect")
-            .is_some_and(|v| v.to_ascii_lowercase().contains("100-continue"))
-            && stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await.is_err()
-        {
-            break;
-        }
-
-        if headers
             .get("transfer-encoding")
             .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
         {
@@ -392,6 +389,14 @@ async fn serve_connection(
 
         if content_len > cfg.max_body_bytes {
             let _ = write_simple_error(&mut stream, 413, "Payload Too Large").await;
+            break;
+        }
+
+        if headers
+            .get("expect")
+            .is_some_and(|v| v.to_ascii_lowercase().contains("100-continue"))
+            && stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await.is_err()
+        {
             break;
         }
 

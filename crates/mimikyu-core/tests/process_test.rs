@@ -411,3 +411,65 @@ sleep 10
         assert!(dump.contains(var), "expected {var} in dump:\n{dump}");
     }
 }
+
+#[tokio::test]
+async fn firefox_persistent_profile_clears_stale_env_prefs_on_relaunch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let prof_dir = tmp.path().join("ff-sticky");
+    std::fs::create_dir_all(&prof_dir).unwrap();
+
+    let win_prof = mimikyu_core::env_profile::PresetKind::Win11.to_env_profile(EngineKind::Firefox);
+    let win_ua = win_prof.user_agent.clone();
+    assert!(win_ua.contains("Windows NT"));
+
+    // Launch 1: persistent profile with Win11 preset (writes general.useragent.override -> prefs.js on close)
+    let drv = driver_for(EngineKind::Firefox);
+    let s1 = drv
+        .launch(LaunchOptions {
+            engine: EngineKind::Firefox,
+            headless: true,
+            profile_mode: ProfileMode::Persistent(prof_dir.clone()),
+            env_profile: Some(win_prof),
+            ..Default::default()
+        })
+        .await
+        .expect("launch 1");
+    let pid1 = s1.info().pid.expect("pid1") as libc::pid_t;
+    s1.navigate("data:text/html,<h1>sticky1</h1>")
+        .await
+        .expect("nav1");
+    let ua1 = s1
+        .eval_isolated("navigator.userAgent")
+        .await
+        .expect("ua1");
+    assert_eq!(ua1.as_str(), Some(win_ua.as_str()));
+    s1.dispose().await.expect("dispose s1");
+    assert_pgid_gone(pid1);
+
+    // Launch 2: same persistent profile WITHOUT env_profile -> must NOT retain Win11 UA in prefs.js
+    let s2 = drv
+        .launch(LaunchOptions {
+            engine: EngineKind::Firefox,
+            headless: true,
+            profile_mode: ProfileMode::Persistent(prof_dir.clone()),
+            env_profile: None,
+            ..Default::default()
+        })
+        .await
+        .expect("launch 2");
+    let pid2 = s2.info().pid.expect("pid2") as libc::pid_t;
+    s2.navigate("data:text/html,<h1>sticky2</h1>")
+        .await
+        .expect("nav2");
+    let ua2 = s2
+        .eval_isolated("navigator.userAgent")
+        .await
+        .expect("ua2");
+    let ua2_str = ua2.as_str().unwrap_or("");
+    assert!(
+        !ua2_str.contains("Windows NT"),
+        "persistent Firefox profile leaked stale general.useragent.override: {ua2_str:?}"
+    );
+    s2.dispose().await.expect("dispose s2");
+    assert_pgid_gone(pid2);
+}

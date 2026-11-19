@@ -6,11 +6,12 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use tempfile::{Builder, NamedTempFile, TempDir};
 
-use crate::driver::{now_ms, Cookie, DriverSession, StorageState};
+use crate::driver::{now_ms, Cookie, DriverSession, OriginStorage, StorageState};
 use crate::error::{MimikyuError, Result};
 
 pub const LOCK_FILE_NAME: &str = ".mimikyu.lock";
 pub const SESSION_COOKIES_FILE: &str = ".mimikyu.session_cookies.json";
+pub const SESSION_ORIGINS_FILE: &str = ".mimikyu.session_origins.json";
 
 /// Cross-process advisory `flock` lock protecting a persistent profile directory.
 pub struct ProfileLock {
@@ -378,10 +379,16 @@ pub fn load_storage_state(path: &Path) -> Result<StorageState> {
     let bytes = fs::read(path)?;
     let state: StorageState = serde_json::from_slice(&bytes)?;
     for c in &state.cookies {
-        if c.name.trim().is_empty() {
+        if c.name.trim().is_empty() || c.name.chars().any(char::is_control) {
             return Err(MimikyuError::InvalidConfig(
-                "storage state contains a cookie with empty name".to_string(),
+                "storage state contains a cookie with empty or invalid name".to_string(),
             ));
+        }
+        if c.domain.trim().is_empty() || c.domain.chars().any(char::is_control) {
+            return Err(MimikyuError::InvalidConfig(format!(
+                "cookie '{}' has empty or invalid domain",
+                c.name
+            )));
         }
         if let Some(exp) = c.expires
             && !exp.is_finite()
@@ -399,7 +406,12 @@ pub fn load_storage_state(path: &Path) -> Result<StorageState> {
 /// Removes the sidecar file if no session cookies remain.
 pub fn save_session_cookies(profile_dir: &Path, cookies: &[Cookie]) -> Result<()> {
     let path = profile_dir.join(SESSION_COOKIES_FILE);
-    let session_cookies: Vec<&Cookie> = cookies.iter().filter(|c| c.expires.is_none()).collect();
+    let session_cookies: Vec<&Cookie> = cookies
+        .iter()
+        .filter(|c| {
+            c.expires.is_none() && !c.name.trim().is_empty() && !c.domain.trim().is_empty()
+        })
+        .collect();
     if session_cookies.is_empty() {
         match fs::remove_file(&path) {
             Ok(()) => return Ok(()),
@@ -435,9 +447,9 @@ pub fn load_session_cookies(profile_dir: &Path) -> Result<Vec<Cookie>> {
     };
     let cookies: Vec<Cookie> = serde_json::from_slice(&bytes)?;
     for c in &cookies {
-        if c.name.trim().is_empty() {
+        if c.name.trim().is_empty() || c.domain.trim().is_empty() {
             return Err(MimikyuError::InvalidConfig(
-                "session cookies file contains a cookie with empty name".to_string(),
+                "session cookies file contains a cookie with empty name or domain".to_string(),
             ));
         }
         if let Some(exp) = c.expires
@@ -452,8 +464,85 @@ pub fn load_session_cookies(profile_dir: &Path) -> Result<Vec<Cookie>> {
     Ok(cookies)
 }
 
+/// Persist pending per-origin `localStorage`/`sessionStorage` entries atomically with `0o600` permissions.
+/// Removes the sidecar file if no pending origins remain.
+pub fn save_session_origins(profile_dir: &Path, origins: &[OriginStorage]) -> Result<()> {
+    let path = profile_dir.join(SESSION_ORIGINS_FILE);
+    let pending: Vec<&OriginStorage> = origins
+        .iter()
+        .filter(|o| {
+            let orig = o.origin.trim();
+            !orig.is_empty()
+                && orig != "null"
+                && (!o.local_storage.is_empty() || !o.session_storage.is_empty())
+        })
+        .collect();
+    if pending.is_empty() {
+        match fs::remove_file(&path) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(MimikyuError::Io(e)),
+        }
+    }
+
+    fs::create_dir_all(profile_dir)?;
+    let json_bytes = serde_json::to_vec_pretty(&pending)?;
+    let mut tmp = NamedTempFile::new_in(profile_dir)?;
+    tmp.write_all(&json_bytes)?;
+    tmp.as_file().flush()?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(tmp.path(), perms)?;
+    }
+
+    tmp.persist(&path).map_err(|e| MimikyuError::Io(e.error))?;
+    Ok(())
+}
+
+/// Load and validate persisted pending per-origin storage for a persistent profile directory.
+pub fn load_session_origins(profile_dir: &Path) -> Result<Vec<OriginStorage>> {
+    let path = profile_dir.join(SESSION_ORIGINS_FILE);
+    let bytes = match fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(MimikyuError::Io(e)),
+    };
+    let origins: Vec<OriginStorage> = serde_json::from_slice(&bytes)?;
+    for o in &origins {
+        if o.origin.trim().is_empty() {
+            return Err(MimikyuError::InvalidConfig(
+                "session origins file contains an entry with empty origin".to_string(),
+            ));
+        }
+    }
+    Ok(origins)
+}
+
+/// Merge incoming per-origin storage entries into `existing`, updating matching origins in place.
+pub fn merge_origin_storage(existing: &mut Vec<OriginStorage>, incoming: Vec<OriginStorage>) {
+    for inc in incoming {
+        let orig = inc.origin.trim();
+        if orig.is_empty()
+            || orig == "null"
+            || (inc.local_storage.is_empty() && inc.session_storage.is_empty())
+        {
+            continue;
+        }
+        if let Some(found) = existing.iter_mut().find(|o| o.origin == inc.origin) {
+            found.local_storage.extend(inc.local_storage);
+            found.session_storage.extend(inc.session_storage);
+        } else {
+            existing.push(inc);
+        }
+    }
+}
+
 pub async fn export_storage_state(session: &dyn DriverSession, path: &Path) -> Result<StorageState> {
-    let state = session.storage_state().await?;
+    let mut state = session.storage_state().await?;
+    state.cookies.retain(|c| !c.name.trim().is_empty());
     save_storage_state(path, &state)?;
     Ok(state)
 }
@@ -634,12 +723,84 @@ mod tests {
         assert!(!path.exists());
         assert!(load_session_cookies(dir.path()).unwrap().is_empty());
 
-        // Validation rejects empty cookie name
+        // Validation rejects empty cookie name and empty cookie domain
         fs::write(
             &path,
             r#"[{"name":" ","value":"v","domain":"127.0.0.1","path":"/","expires":null,"http_only":false,"secure":false,"same_site":null}]"#,
         )
         .unwrap();
         assert!(load_session_cookies(dir.path()).is_err());
+
+        let state_file = dir.path().join("bad_domain_state.json");
+        fs::write(
+            &state_file,
+            r#"{"cookies":[{"name":"c1","value":"v1","domain":"","path":"/","expires":null,"http_only":false,"secure":false,"same_site":null}],"origins":[]}"#,
+        )
+        .unwrap();
+        assert!(
+            load_storage_state(&state_file).is_err(),
+            "load_storage_state must reject cookie with empty domain"
+        );
+    }
+
+    #[test]
+    fn session_origins_atomic_save_merge_validate_and_remove() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_session_origins(dir.path()).unwrap().is_empty());
+
+        let mut ls1 = BTreeMap::new();
+        ls1.insert("k1".to_string(), "v1".to_string());
+        let mut ss1 = BTreeMap::new();
+        ss1.insert("s1".to_string(), "sv1".to_string());
+
+        let mut origins = vec![OriginStorage {
+            origin: "http://127.0.0.1:8080".to_string(),
+            local_storage: ls1,
+            session_storage: ss1,
+        }];
+        save_session_origins(dir.path(), &origins).unwrap();
+        let path = dir.path().join(SESSION_ORIGINS_FILE);
+        assert!(path.exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+
+        let mut ls2 = BTreeMap::new();
+        ls2.insert("k2".to_string(), "v2".to_string());
+        merge_origin_storage(
+            &mut origins,
+            vec![
+                OriginStorage {
+                    origin: "http://127.0.0.1:8080".to_string(),
+                    local_storage: ls2,
+                    session_storage: BTreeMap::new(),
+                },
+                OriginStorage {
+                    origin: "null".to_string(),
+                    local_storage: BTreeMap::from([("bad".into(), "x".into())]),
+                    session_storage: BTreeMap::new(),
+                },
+            ],
+        );
+        save_session_origins(dir.path(), &origins).unwrap();
+        let loaded = load_session_origins(dir.path()).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].local_storage.get("k1").map(String::as_str), Some("v1"));
+        assert_eq!(loaded[0].local_storage.get("k2").map(String::as_str), Some("v2"));
+        assert_eq!(loaded[0].session_storage.get("s1").map(String::as_str), Some("sv1"));
+
+        save_session_origins(dir.path(), &[]).unwrap();
+        assert!(!path.exists());
+        assert!(load_session_origins(dir.path()).unwrap().is_empty());
+
+        fs::write(
+            &path,
+            r#"[{"origin":" ","local_storage":{"a":"b"},"session_storage":{}}]"#,
+        )
+        .unwrap();
+        assert!(load_session_origins(dir.path()).is_err());
     }
 }

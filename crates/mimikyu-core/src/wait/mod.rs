@@ -1,16 +1,42 @@
 pub mod conditions;
 pub mod idle;
 
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
+use tokio::time::Instant;
 
 use crate::driver::DriverSession;
-use crate::error::Result;
+use crate::error::{MimikyuError, Result};
 use crate::snapshot::RefMap;
 
 pub const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
+pub const MAX_WAIT_TIMEOUT_MS: u64 = 3_600_000;
 pub const DEFAULT_POLL_INTERVAL_MS: u64 = 25;
 pub const DEFAULT_NETWORK_QUIET_MS: u64 = 250;
 pub const DEFAULT_BBOX_STABLE_FRAMES: u32 = 2;
+
+pub(crate) fn compute_wait_deadline(
+    timeout_ms: u64,
+    poll_interval_ms: u64,
+) -> Result<(Instant, Duration)> {
+    if timeout_ms > MAX_WAIT_TIMEOUT_MS {
+        return Err(MimikyuError::InvalidConfig(format!(
+            "wait timeout_ms {timeout_ms} exceeds maximum {MAX_WAIT_TIMEOUT_MS}ms"
+        )));
+    }
+    if poll_interval_ms > MAX_WAIT_TIMEOUT_MS {
+        return Err(MimikyuError::InvalidConfig(format!(
+            "wait poll_interval_ms {poll_interval_ms} exceeds maximum {MAX_WAIT_TIMEOUT_MS}ms"
+        )));
+    }
+    let dur = Duration::from_millis(timeout_ms);
+    let deadline = Instant::now().checked_add(dur).ok_or_else(|| {
+        MimikyuError::InvalidConfig(format!("wait timeout_ms {timeout_ms} overflows Instant"))
+    })?;
+    let poll = Duration::from_millis(poll_interval_ms.max(5));
+    Ok((deadline, poll))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WaitOptions {
