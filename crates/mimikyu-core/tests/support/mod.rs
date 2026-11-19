@@ -1,10 +1,10 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -132,7 +132,8 @@ impl TestServer {
                     }
 
                     if (method, path) == ("GET", "/download/popup-slow.bin") {
-                        let payload: Vec<u8> = (0..4096).map(|i| ((i * 3 + 11) % 251) as u8).collect();
+                        let payload: Vec<u8> =
+                            (0..4096).map(|i| ((i * 3 + 11) % 251) as u8).collect();
                         let hdr = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"popup-slow.bin\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             payload.len()
@@ -181,7 +182,8 @@ impl TestServer {
                     }
 
                     if (method, path) == ("GET", "/download/asset-poison.bin") {
-                        let payload: Vec<u8> = (0..4096).map(|i| ((i * 9 + 5) % 251) as u8).collect();
+                        let payload: Vec<u8> =
+                            (0..4096).map(|i| ((i * 9 + 5) % 251) as u8).collect();
                         let hdr = format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             payload.len()
@@ -3819,7 +3821,8 @@ impl LocalHttpProxy {
         let addr = listener.local_addr().unwrap();
         let hits = Arc::new(Mutex::new(Vec::new()));
         let hits_clone = Arc::clone(&hits);
-        let expected_auth = auth.map(|(u, p)| format!("Basic {}", BASE64.encode(format!("{u}:{p}"))));
+        let expected_auth =
+            auth.map(|(u, p)| format!("Basic {}", BASE64.encode(format!("{u}:{p}"))));
 
         let task = tokio::spawn(async move {
             loop {
@@ -3903,7 +3906,8 @@ impl LocalHttpProxy {
                     let mut out = format!("{method} {path_q} {version}\r\n");
                     for h in rest_headers {
                         let l = h.to_ascii_lowercase();
-                        if l.starts_with("proxy-authorization:") || l.starts_with("proxy-connection:")
+                        if l.starts_with("proxy-authorization:")
+                            || l.starts_with("proxy-connection:")
                         {
                             continue;
                         }
@@ -4021,7 +4025,10 @@ impl LocalSocks5Proxy {
                     }
 
                     let mut req = [0u8; 4];
-                    if client.read_exact(&mut req).await.is_err() || req[0] != 0x05 || req[1] != 0x01 {
+                    if client.read_exact(&mut req).await.is_err()
+                        || req[0] != 0x05
+                        || req[1] != 0x01
+                    {
                         return;
                     }
                     let host = match req[3] {
@@ -4119,10 +4126,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 #[allow(dead_code)]
-async fn read_http_head_from_buf(
-    stream: &mut TcpStream,
-    buf: &mut Vec<u8>,
-) -> Option<usize> {
+async fn read_http_head_from_buf(stream: &mut TcpStream, buf: &mut Vec<u8>) -> Option<usize> {
     if let Some(pos) = find_subslice(buf, b"\r\n\r\n") {
         return Some(pos);
     }
@@ -4340,8 +4344,7 @@ impl KeepAliveTestServer {
                             }
                         };
 
-                        if stream.write_all(&resp).await.is_err() || stream.flush().await.is_err()
-                        {
+                        if stream.write_all(&resp).await.is_err() || stream.flush().await.is_err() {
                             break;
                         }
                     }

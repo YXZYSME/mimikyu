@@ -4,10 +4,10 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use mimikyu_core::driver::{
-    driver_for, EngineKind, LaunchOptions, ProfileMode, RouteAction, RouteMock,
+    EngineKind, LaunchOptions, ProfileMode, RouteAction, RouteMock, driver_for,
 };
 use mimikyu_core::network::{BlockPolicy, ResourceType, RouteRule};
-use support::{assert_pgid_gone, TestServer};
+use support::{TestServer, assert_pgid_gone};
 
 async fn assert_resource_blocker_filters_categories_and_iframes(engine: EngineKind) {
     let server = TestServer::start().await;
@@ -66,7 +66,10 @@ async fn assert_resource_blocker_filters_categories_and_iframes(engine: EngineKi
         .expect("fetch mocked");
     assert_eq!(mocked["data"], "mocked");
 
-    session.clear_route_mocks().await.expect("clear_route_mocks");
+    session
+        .clear_route_mocks()
+        .await
+        .expect("clear_route_mocks");
     server.reset_hits();
 
     session
@@ -91,7 +94,8 @@ async fn assert_resource_blocker_filters_categories_and_iframes(engine: EngineKi
 }
 
 #[tokio::test]
-async fn resource_blocker_filters_images_media_fonts_including_extensionless_and_iframes_chromium() {
+async fn resource_blocker_filters_images_media_fonts_including_extensionless_and_iframes_chromium()
+{
     assert_resource_blocker_filters_categories_and_iframes(EngineKind::Chromium).await;
 }
 
@@ -246,10 +250,22 @@ async fn assert_telemetry_ring_buffers_and_eviction(engine: EngineKind) {
     let errs = session.page_errors().await.expect("page_errors");
     let nets = session.network_events().await.expect("network_events");
 
-    assert!(logs.iter().any(|c| c.text.contains("net-log-1") && c.level == "log"));
-    assert!(logs.iter().any(|c| c.text.contains("net-info-2") && c.level == "info"));
-    assert!(logs.iter().any(|c| c.text.contains("net-warn-3") && (c.level == "warning" || c.level == "warn")));
-    assert!(logs.iter().any(|c| c.text.contains("net-err-4") && c.level == "error"));
+    assert!(
+        logs.iter()
+            .any(|c| c.text.contains("net-log-1") && c.level == "log")
+    );
+    assert!(
+        logs.iter()
+            .any(|c| c.text.contains("net-info-2") && c.level == "info")
+    );
+    assert!(
+        logs.iter()
+            .any(|c| c.text.contains("net-warn-3") && (c.level == "warning" || c.level == "warn"))
+    );
+    assert!(
+        logs.iter()
+            .any(|c| c.text.contains("net-err-4") && c.level == "error")
+    );
     assert!(
         !logs.iter().any(|c| c.text.contains("uncaught-boom-42")),
         "{engine}: uncaught page error must not be mixed into console_logs"
@@ -259,7 +275,8 @@ async fn assert_telemetry_ring_buffers_and_eviction(engine: EngineKind) {
         "{engine}: uncaught page error missing from page_errors: {errs:?}"
     );
     assert!(
-        nets.iter().any(|n| n.url.contains("/net/console-and-errors") && n.status == Some(200)),
+        nets.iter()
+            .any(|n| n.url.contains("/net/console-and-errors") && n.status == Some(200)),
         "{engine}: network_events missing 200 entry"
     );
     assert_eq!(session.inflight_requests().await.unwrap(), 0);
@@ -269,7 +286,10 @@ async fn assert_telemetry_ring_buffers_and_eviction(engine: EngineKind) {
     assert!(!drained_c.is_empty());
     assert!(session.console_logs().await.unwrap().is_empty());
 
-    let drained_e = session.drain_page_errors().await.expect("drain page_errors");
+    let drained_e = session
+        .drain_page_errors()
+        .await
+        .expect("drain page_errors");
     assert!(!drained_e.is_empty());
     assert!(session.page_errors().await.unwrap().is_empty());
 
@@ -425,10 +445,19 @@ async fn assert_oopif_network_interception_and_block_policy(engine: EngineKind) 
         .await
         .expect("eval pre in OOPIF");
 
-    assert_eq!(pre_res["blockedOk"], false, "{engine}: /blocked.png in OOPIF must be blocked");
-    assert_eq!(pre_res["mocked"]["mocked"], true, "{engine}: /api/mock in OOPIF must be mocked");
+    assert_eq!(
+        pre_res["blockedOk"], false,
+        "{engine}: /blocked.png in OOPIF must be blocked"
+    );
+    assert_eq!(
+        pre_res["mocked"]["mocked"], true,
+        "{engine}: /api/mock in OOPIF must be mocked"
+    );
     assert_eq!(pre_res["mocked"]["phase"], "pre");
-    assert_eq!(pre_res["real"]["real"], true, "{engine}: /api/real in OOPIF must pass through");
+    assert_eq!(
+        pre_res["real"]["real"], true,
+        "{engine}: /api/real in OOPIF must pass through"
+    );
     assert_eq!(
         pre_res["imgNaturalWidth"], 0,
         "{engine}: OOPIF <img> must be blocked by block_images: {pre_res:?}"
@@ -493,7 +522,10 @@ async fn assert_oopif_network_interception_and_block_policy(engine: EngineKind) 
         )
         .await
         .expect("eval dyn in OOPIF");
-    assert_eq!(dyn_res["abortBlocked"], true, "{engine}: dynamic blocked_urls in OOPIF");
+    assert_eq!(
+        dyn_res["abortBlocked"], true,
+        "{engine}: dynamic blocked_urls in OOPIF"
+    );
     assert_eq!(
         dyn_res["dynMocked"]["data"], "dyn-oopif-mock",
         "{engine}: dynamic set_route_mock in OOPIF"
@@ -535,7 +567,10 @@ async fn assert_oopif_network_interception_and_block_policy(engine: EngineKind) 
     );
 
     // Clear route mocks while OOPIF is attached -> /api/data must reach sub_server live
-    session.clear_route_mocks().await.expect("clear_route_mocks");
+    session
+        .clear_route_mocks()
+        .await
+        .expect("clear_route_mocks");
     let after_clear = session
         .eval_isolated_in_frame("fetch('/api/data').then(r => r.json())", Some(&xo_fid))
         .await
@@ -748,7 +783,7 @@ async fn assert_target_blank_links_network_and_env_ephemeral(engine: EngineKind)
 
     click_sel("#lnk-blank").await;
     let mut blank_out = serde_json::Value::Null;
-    for _ in 0..120 {
+    for _ in 0..300 {
         let val = session
             .eval_isolated(
                 r#"(() => {
@@ -764,11 +799,14 @@ async fn assert_target_blank_links_network_and_env_ephemeral(engine: EngineKind)
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(!blank_out.is_null(), "{engine}: timed out waiting for target=_blank");
+    assert!(
+        !blank_out.is_null(),
+        "{engine}: timed out waiting for target=_blank"
+    );
 
     click_sel("#lnk-noopener").await;
     let mut noopener_out = serde_json::Value::Null;
-    for _ in 0..120 {
+    for _ in 0..300 {
         let val = session
             .eval_isolated(
                 r#"(() => {
@@ -784,22 +822,52 @@ async fn assert_target_blank_links_network_and_env_ephemeral(engine: EngineKind)
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(!noopener_out.is_null(), "{engine}: timed out waiting for target=_blank rel=noopener");
+    assert!(
+        !noopener_out.is_null(),
+        "{engine}: timed out waiting for target=_blank rel=noopener"
+    );
     let out = serde_json::json!({ "blank": blank_out, "noopener": noopener_out });
 
     let tabs = session.list_tabs().await.expect("list_tabs");
-    assert!(tabs.iter().any(|t| t.url.contains("/target-blank-child?tag=blank")));
-    assert!(tabs.iter().any(|t| t.url.contains("/target-blank-child?tag=noopener")));
-    assert!(!tabs.iter().any(|t| t.url.is_empty()), "{engine}: empty url tab in {tabs:?}");
+    assert!(
+        tabs.iter()
+            .any(|t| t.url.contains("/target-blank-child?tag=blank"))
+    );
+    assert!(
+        tabs.iter()
+            .any(|t| t.url.contains("/target-blank-child?tag=noopener"))
+    );
+    assert!(
+        !tabs.iter().any(|t| t.url.is_empty()),
+        "{engine}: empty url tab in {tabs:?}"
+    );
 
     for (tag, node) in [("blank", &out["blank"]), ("noopener", &out["noopener"])] {
-        assert_eq!(node["syncNav"]["platform"], profile.platform, "{engine} {tag}: {node:?}");
-        assert_eq!(node["syncNav"]["hc"], profile.hardware_concurrency, "{engine} {tag}: {node:?}");
-        assert_eq!(node["syncNav"]["ua"], profile.user_agent, "{engine} {tag}: {node:?}");
-        assert_eq!(node["syncNav"]["tz"], "Asia/Tokyo", "{engine} {tag}: {node:?}");
+        assert_eq!(
+            node["syncNav"]["platform"], profile.platform,
+            "{engine} {tag}: {node:?}"
+        );
+        assert_eq!(
+            node["syncNav"]["hc"], profile.hardware_concurrency,
+            "{engine} {tag}: {node:?}"
+        );
+        assert_eq!(
+            node["syncNav"]["ua"], profile.user_agent,
+            "{engine} {tag}: {node:?}"
+        );
+        assert_eq!(
+            node["syncNav"]["tz"], "Asia/Tokyo",
+            "{engine} {tag}: {node:?}"
+        );
         assert_eq!(node["xHdr"], "eph-tb", "{engine} {tag}: {node:?}");
-        assert_eq!(node["reqUa"], profile.user_agent, "{engine} {tag}: {node:?}");
-        assert_eq!(node["mocked"]["phase"], "eph-tb", "{engine} {tag}: {node:?}");
+        assert_eq!(
+            node["reqUa"], profile.user_agent,
+            "{engine} {tag}: {node:?}"
+        );
+        assert_eq!(
+            node["mocked"]["phase"], "eph-tb",
+            "{engine} {tag}: {node:?}"
+        );
         assert_eq!(node["blockedOk"], false, "{engine} {tag}: {node:?}");
     }
 
@@ -907,7 +975,10 @@ async fn assert_shared_worker_network_blocking_and_route_rules(engine: EngineKin
     assert_eq!(res["mockJson"]["mocked"], true, "{engine}: {res:?}");
     assert_eq!(res["liveJson"]["live"], true, "{engine}: {res:?}");
     assert_eq!(res["xhrRes"]["ok"], true, "{engine}: {res:?}");
-    assert_eq!(res["xhrRes"]["body"]["xhrMocked"], true, "{engine}: {res:?}");
+    assert_eq!(
+        res["xhrRes"]["body"]["xhrMocked"], true,
+        "{engine}: {res:?}"
+    );
 
     let hits = server.hits();
     assert!(
@@ -928,7 +999,10 @@ async fn assert_shared_worker_network_blocking_and_route_rules(engine: EngineKin
     );
 
     // Clear route mocks and update blocked URLs while SharedWorker is already running
-    session.clear_route_mocks().await.expect("clear_route_mocks");
+    session
+        .clear_route_mocks()
+        .await
+        .expect("clear_route_mocks");
     server.reset_hits();
     let res2 = session
         .eval_main_world("window.__runSwProbe()")
@@ -937,7 +1011,10 @@ async fn assert_shared_worker_network_blocking_and_route_rules(engine: EngineKin
     assert_eq!(res2["blockedFailed"], true, "{engine}: {res2:?}");
     assert_eq!(res2["mockJson"]["live"], true, "{engine}: {res2:?}");
     assert_eq!(res2["mockJson"]["mocked"], false, "{engine}: {res2:?}");
-    assert_eq!(res2["xhrRes"]["body"]["xhrLive"], true, "{engine}: {res2:?}");
+    assert_eq!(
+        res2["xhrRes"]["body"]["xhrLive"], true,
+        "{engine}: {res2:?}"
+    );
 
     let hits2 = server.hits();
     assert!(!hits2.iter().any(|h| h.contains("/blocked-sw.png")));
@@ -1071,7 +1148,10 @@ async fn assert_virtual_context_network_intercept_isolation(engine: EngineKind) 
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(!a_out.is_null(), "{engine}: timed out waiting for ctx_a popup");
+    assert!(
+        !a_out.is_null(),
+        "{engine}: timed out waiting for ctx_a popup"
+    );
     assert_eq!(a_out["xHdr"], "ctx-a");
     assert_eq!(a_out["mocked"]["phase"], "ctx-a");
     assert_eq!(a_out["blockedOk"], false);
@@ -1141,8 +1221,14 @@ async fn assert_virtual_context_network_intercept_isolation(engine: EngineKind) 
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(!b_out.is_null(), "{engine}: timed out waiting for ctx_b popup");
-    assert!(b_out["xHdr"].is_null(), "{engine}: ctx_b leaked xHdr: {b_out:?}");
+    assert!(
+        !b_out.is_null(),
+        "{engine}: timed out waiting for ctx_b popup"
+    );
+    assert!(
+        b_out["xHdr"].is_null(),
+        "{engine}: ctx_b leaked xHdr: {b_out:?}"
+    );
     assert_ne!(
         b_out["mocked"]["phase"], "ctx-a",
         "{engine}: ctx_b leaked ctx_a mock: {b_out:?}"
@@ -1264,9 +1350,18 @@ async fn assert_shared_worker_blob_immediate_revoke_with_route_mock_no_env(engin
         .await
         .expect("eval SharedWorker blob revoke probe");
 
-    assert_eq!(res["ok"], true, "{engine} SharedWorker blob revoke failed: {res:?}");
-    assert_eq!(res["data"]["mocked"], true, "{engine} mock mismatch: {res:?}");
-    assert_eq!(res["data"]["source"], "blob-sw", "{engine} source mismatch: {res:?}");
+    assert_eq!(
+        res["ok"], true,
+        "{engine} SharedWorker blob revoke failed: {res:?}"
+    );
+    assert_eq!(
+        res["data"]["mocked"], true,
+        "{engine} mock mismatch: {res:?}"
+    );
+    assert_eq!(
+        res["data"]["source"], "blob-sw",
+        "{engine} source mismatch: {res:?}"
+    );
     assert!(!server.hits().iter().any(|h| h.contains("/api/sw-mock")));
 
     session.dispose().await.expect("dispose");

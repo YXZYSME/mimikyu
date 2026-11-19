@@ -3,8 +3,8 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -233,11 +233,26 @@ fn cli_boundary_validation_and_json_error_envelopes() {
 
     let bad_cases: &[&[&str]] = &[
         &["--engine", "safari", "doctor", "--json"],
-        &["--no-daemon", "session", "new", "--viewport", "0x720", "--json"],
+        &[
+            "--no-daemon",
+            "session",
+            "new",
+            "--viewport",
+            "0x720",
+            "--json",
+        ],
         &["--no-daemon", "snapshot", "--max-depth", "-1", "--json"],
         &["--no-daemon", "wait", "--json"],
         &["--no-daemon", "batch", "--json"],
-        &["--no-daemon", "batch", "--file", "/tmp/a", "--ops", "[]", "--json"],
+        &[
+            "--no-daemon",
+            "batch",
+            "--file",
+            "/tmp/a",
+            "--ops",
+            "[]",
+            "--json",
+        ],
         &["--no-daemon", "eval", "1+1", "--json"],
         &["bench", "--iterations", "0", "--json"],
         &["bench", "--iterations", "-1", "--json"],
@@ -262,7 +277,10 @@ fn cli_boundary_validation_and_json_error_envelopes() {
             args
         );
         let val: Value = serde_json::from_str(stdout_s.trim()).unwrap_or_else(|e| {
-            panic!("expected JSON error envelope for {:?}, got stdout={stdout_s:?} err={e}", args)
+            panic!(
+                "expected JSON error envelope for {:?}, got stdout={stdout_s:?} err={e}",
+                args
+            )
         });
         assert_eq!(val["ok"], false);
         assert!(val["error"].as_str().is_some_and(|s| !s.is_empty()));
@@ -280,7 +298,9 @@ fn cli_daemon_auto_spawn_concurrent_and_foreground_idle_timeout() {
     let mut handles = Vec::new();
     for _ in 0..3 {
         let sd = state_conc.clone();
-        handles.push(thread::spawn(move || run_cli(&sd, &["session", "list", "--json"])));
+        handles.push(thread::spawn(move || {
+            run_cli(&sd, &["session", "list", "--json"])
+        }));
     }
     for h in handles {
         let out = h.join().unwrap();
@@ -383,7 +403,10 @@ fn cli_end_to_end_session_page_eval_batch_and_teardown() {
     assert!(snap_val["data"]["ref_count"].as_u64().unwrap_or(0) > 0);
 
     // eval undefined -> {"value": null, "main_world": false}
-    let out_undef = run_cli(&state_dir, &["--session", "c1", "eval", "undefined", "--json"]);
+    let out_undef = run_cli(
+        &state_dir,
+        &["--session", "c1", "eval", "undefined", "--json"],
+    );
     assert!(out_undef.status.success());
     let undef_val: Value = serde_json::from_slice(&out_undef.stdout).unwrap();
     assert!(undef_val["data"]["value"].is_null());
@@ -459,7 +482,11 @@ fn cli_end_to_end_session_page_eval_batch_and_teardown() {
         "screenshot failed: {}",
         String::from_utf8_lossy(&out_shot.stdout)
     );
-    assert!(fs::read(&shot_path).unwrap().starts_with(b"\x89PNG\r\n\x1a\n"));
+    assert!(
+        fs::read(&shot_path)
+            .unwrap()
+            .starts_with(b"\x89PNG\r\n\x1a\n")
+    );
 
     // close session and stop daemon
     let out_close = run_cli(&state_dir, &["close", "c1", "--json"]);
@@ -512,7 +539,11 @@ fn cli_mcp_stdio_roundtrip_and_eof_cleanup() {
     let stdout_s = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout_s.contains("Content-Length:"));
     let lines: Vec<&str> = stdout_s.lines().filter(|l| !l.trim().is_empty()).collect();
-    assert_eq!(lines.len(), 2, "expected 2 JSON-RPC responses, got {lines:?}");
+    assert_eq!(
+        lines.len(),
+        2,
+        "expected 2 JSON-RPC responses, got {lines:?}"
+    );
 
     let init: Value = serde_json::from_str(lines[0]).unwrap();
     assert_eq!(init["id"], 1);
@@ -534,7 +565,10 @@ fn cli_daemon_idle_timeout_zero_and_status_no_dir_create() {
     let st_missing_val: Value = serde_json::from_slice(&st_missing.stdout).unwrap();
     assert_eq!(st_missing_val["ok"], true);
     assert_eq!(st_missing_val["data"]["running"], false);
-    assert!(!missing_dir.exists(), "daemon status must not create state_dir");
+    assert!(
+        !missing_dir.exists(),
+        "daemon status must not create state_dir"
+    );
 
     let state_dir = tmp.path().join("idle_zero_state");
     let _guard = DaemonCleanupGuard {
@@ -592,21 +626,62 @@ fn cli_daemon_resolves_relative_screenshot_and_export_paths_against_client_cwd()
             .unwrap()
     };
 
-    assert!(run_in_b(&["--session", "cwd_s", "session", "new", "--ephemeral", "--json"]).status.success());
-    assert!(run_in_b(&["--session", "cwd_s", "open", &srv.url("/"), "--json"]).status.success());
+    assert!(
+        run_in_b(&[
+            "--session",
+            "cwd_s",
+            "session",
+            "new",
+            "--ephemeral",
+            "--json"
+        ])
+        .status
+        .success()
+    );
+    assert!(
+        run_in_b(&["--session", "cwd_s", "open", &srv.url("/"), "--json"])
+            .status
+            .success()
+    );
 
     let shot_out = run_in_b(&["--session", "cwd_s", "screenshot", "./shot.png", "--json"]);
-    assert!(shot_out.status.success(), "{}", String::from_utf8_lossy(&shot_out.stdout));
+    assert!(
+        shot_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shot_out.stdout)
+    );
     assert!(dir_b.join("shot.png").is_file());
     assert!(!dir_a.join("shot.png").exists());
 
-    let exp_out = run_in_b(&["--session", "cwd_s", "session", "export", "./state.json", "--json"]);
-    assert!(exp_out.status.success(), "{}", String::from_utf8_lossy(&exp_out.stdout));
+    let exp_out = run_in_b(&[
+        "--session",
+        "cwd_s",
+        "session",
+        "export",
+        "./state.json",
+        "--json",
+    ]);
+    assert!(
+        exp_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&exp_out.stdout)
+    );
     assert!(dir_b.join("state.json").is_file());
     assert!(!dir_a.join("state.json").exists());
 
-    let imp_out = run_in_b(&["--session", "cwd_s", "session", "import", "./state.json", "--json"]);
-    assert!(imp_out.status.success(), "{}", String::from_utf8_lossy(&imp_out.stdout));
+    let imp_out = run_in_b(&[
+        "--session",
+        "cwd_s",
+        "session",
+        "import",
+        "./state.json",
+        "--json",
+    ]);
+    assert!(
+        imp_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&imp_out.stdout)
+    );
 
     assert!(run_in_b(&["close", "cwd_s", "--json"]).status.success());
     let _ = run_cli(&state_dir, &["daemon", "stop", "--json"]);
@@ -637,7 +712,15 @@ fn cli_daemon_resolves_relative_profile_path_against_client_cwd() {
         .current_dir(&dir_b)
         .args(["--state-dir"])
         .arg(&state_dir)
-        .args(["--session", "rp", "session", "new", "--profile", "./rel_prof", "--json"])
+        .args([
+            "--session",
+            "rp",
+            "session",
+            "new",
+            "--profile",
+            "./rel_prof",
+            "--json",
+        ])
         .output()
         .unwrap();
     assert!(
@@ -648,7 +731,11 @@ fn cli_daemon_resolves_relative_profile_path_against_client_cwd() {
     assert!(dir_b.join("rel_prof").is_dir());
     assert!(!dir_a.join("rel_prof").exists());
 
-    assert!(run_cli(&state_dir, &["close", "rp", "--json"]).status.success());
+    assert!(
+        run_cli(&state_dir, &["close", "rp", "--json"])
+            .status
+            .success()
+    );
     let _ = run_cli(&state_dir, &["daemon", "stop", "--json"]);
 }
 
@@ -667,34 +754,66 @@ fn cli_profile_export_nonexistent_fails_without_creating_profile_and_timeout_is_
         &state_dir,
         &["profile", "export", "nonexistent_prof", &out_str, "--json"],
     );
-    assert!(!exp.status.success(), "export of nonexistent profile must fail");
+    assert!(
+        !exp.status.success(),
+        "export of nonexistent profile must fail"
+    );
     let exp_val: Value = serde_json::from_slice(&exp.stdout).unwrap();
     assert_eq!(exp_val["ok"], false);
     assert!(!state_dir.join("profiles").join("nonexistent_prof").exists());
     assert!(!out_file.exists());
 
     assert!(
-        run_cli(&state_dir, &["--session", "tmo", "session", "new", "--ephemeral", "--json"])
-            .status
-            .success()
+        run_cli(
+            &state_dir,
+            &[
+                "--session",
+                "tmo",
+                "session",
+                "new",
+                "--ephemeral",
+                "--json"
+            ]
+        )
+        .status
+        .success()
     );
     assert!(
-        run_cli(&state_dir, &["--session", "tmo", "open", &srv.url("/"), "--json"])
-            .status
-            .success()
+        run_cli(
+            &state_dir,
+            &["--session", "tmo", "open", &srv.url("/"), "--json"]
+        )
+        .status
+        .success()
     );
     let wait_out = run_cli(
         &state_dir,
-        &["--session", "tmo", "wait", "--text", "NEVER_THERE", "--timeout-ms", "150", "--json"],
+        &[
+            "--session",
+            "tmo",
+            "wait",
+            "--text",
+            "NEVER_THERE",
+            "--timeout-ms",
+            "150",
+            "--json",
+        ],
     );
     assert!(!wait_out.status.success());
     let wait_val: Value = serde_json::from_slice(&wait_out.stdout).unwrap();
     assert_eq!(wait_val["ok"], false);
     let err_msg = wait_val["error"].as_str().unwrap_or("");
     assert!(err_msg.contains("150ms"), "unexpected error: {err_msg}");
-    assert!(!err_msg.contains("after 0ms:"), "double-prefixed timeout: {err_msg}");
+    assert!(
+        !err_msg.contains("after 0ms:"),
+        "double-prefixed timeout: {err_msg}"
+    );
 
-    assert!(run_cli(&state_dir, &["close", "tmo", "--json"]).status.success());
+    assert!(
+        run_cli(&state_dir, &["close", "tmo", "--json"])
+            .status
+            .success()
+    );
     let _ = run_cli(&state_dir, &["daemon", "stop", "--json"]);
 }
 
@@ -710,7 +829,13 @@ fn cli_profile_import_prevalidates_and_batch_wait_idle_honors_stable_target() {
     let missing_file = tmp.path().join("does_not_exist.json");
     let imp_missing = run_cli(
         &state_dir,
-        &["profile", "import", "bad_missing", missing_file.to_str().unwrap(), "--json"],
+        &[
+            "profile",
+            "import",
+            "bad_missing",
+            missing_file.to_str().unwrap(),
+            "--json",
+        ],
     );
     assert!(!imp_missing.status.success());
     assert!(!state_dir.join("profiles").join("bad_missing").exists());
@@ -719,15 +844,24 @@ fn cli_profile_import_prevalidates_and_batch_wait_idle_honors_stable_target() {
     fs::write(&bad_json, b"{not valid json").unwrap();
     let imp_bad = run_cli(
         &state_dir,
-        &["profile", "import", "bad_json", bad_json.to_str().unwrap(), "--json"],
+        &[
+            "profile",
+            "import",
+            "bad_json",
+            bad_json.to_str().unwrap(),
+            "--json",
+        ],
     );
     assert!(!imp_bad.status.success());
     assert!(!state_dir.join("profiles").join("bad_json").exists());
 
     assert!(
-        run_cli(&state_dir, &["--session", "bw", "session", "new", "--ephemeral", "--json"])
-            .status
-            .success()
+        run_cli(
+            &state_dir,
+            &["--session", "bw", "session", "new", "--ephemeral", "--json"]
+        )
+        .status
+        .success()
     );
     let ok_ops = format!(
         r##"[{{"op":"open","url":{}}},{{"op":"wait","idle":true,"stable_target":"#out"}}]"##,
@@ -743,14 +877,19 @@ fn cli_profile_import_prevalidates_and_batch_wait_idle_honors_stable_target() {
         String::from_utf8_lossy(&batch_ok.stdout)
     );
 
-    let bad_ops = r##"[{"op":"wait","idle":true,"stable_target":"#nonexistent-xyz","timeout_ms":100}]"##;
+    let bad_ops =
+        r##"[{"op":"wait","idle":true,"stable_target":"#nonexistent-xyz","timeout_ms":100}]"##;
     let batch_bad = run_cli(
         &state_dir,
         &["--session", "bw", "batch", "--ops", bad_ops, "--json"],
     );
     assert!(!batch_bad.status.success());
 
-    assert!(run_cli(&state_dir, &["close", "bw", "--json"]).status.success());
+    assert!(
+        run_cli(&state_dir, &["close", "bw", "--json"])
+            .status
+            .success()
+    );
     let _ = run_cli(&state_dir, &["daemon", "stop", "--json"]);
 }
 
@@ -767,7 +906,16 @@ fn cli_daemon_concurrent_commands_during_stop_and_idle_timeout_firefox() {
         for sid in ["ff1", "ff2"] {
             let snew = run_cli(
                 &state_dir,
-                &["--engine", "firefox", "--session", sid, "session", "new", "--ephemeral", "--json"],
+                &[
+                    "--engine",
+                    "firefox",
+                    "--session",
+                    sid,
+                    "session",
+                    "new",
+                    "--ephemeral",
+                    "--json",
+                ],
             );
             assert!(
                 snew.status.success(),
@@ -816,15 +964,42 @@ fn cli_daemon_concurrent_commands_during_stop_and_idle_timeout_firefox() {
     let _idle_guard = DaemonCleanupGuard {
         state_dir: idle_state.clone(),
     };
-    let dstart = run_cli(&idle_state, &["--engine", "firefox", "daemon", "--idle-timeout", "1", "--json"]);
-    assert!(dstart.status.success(), "{}", String::from_utf8_lossy(&dstart.stdout));
+    let dstart = run_cli(
+        &idle_state,
+        &[
+            "--engine",
+            "firefox",
+            "daemon",
+            "--idle-timeout",
+            "1",
+            "--json",
+        ],
+    );
+    assert!(
+        dstart.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dstart.stdout)
+    );
 
     for sid in ["ffi1", "ffi2", "ffi3"] {
         let snew = run_cli(
             &idle_state,
-            &["--engine", "firefox", "--session", sid, "session", "new", "--ephemeral", "--json"],
+            &[
+                "--engine",
+                "firefox",
+                "--session",
+                sid,
+                "session",
+                "new",
+                "--ephemeral",
+                "--json",
+            ],
         );
-        assert!(snew.status.success(), "{}", String::from_utf8_lossy(&snew.stdout));
+        assert!(
+            snew.status.success(),
+            "{}",
+            String::from_utf8_lossy(&snew.stdout)
+        );
     }
 
     thread::sleep(Duration::from_millis(1150));
@@ -928,7 +1103,9 @@ fn cli_profile_import_persists_origins_chromium_and_firefox_and_rejects_empty_co
 
         let imp = run_cli(
             &state_dir,
-            &["--engine", engine, "profile", "import", &prof_name, &state_str, "--json"],
+            &[
+                "--engine", engine, "profile", "import", &prof_name, &state_str, "--json",
+            ],
         );
         assert!(
             imp.status.success(),
@@ -968,7 +1145,13 @@ fn cli_profile_import_persists_origins_chromium_and_firefox_and_rejects_empty_co
 
         let ls_out = run_cli(
             &state_dir,
-            &["--session", &sid, "eval", "localStorage.getItem('ls_key')", "--json"],
+            &[
+                "--session",
+                &sid,
+                "eval",
+                "localStorage.getItem('ls_key')",
+                "--json",
+            ],
         );
         assert!(ls_out.status.success());
         let ls_val: Value = serde_json::from_slice(&ls_out.stdout).unwrap();
@@ -979,7 +1162,13 @@ fn cli_profile_import_persists_origins_chromium_and_firefox_and_rejects_empty_co
 
         let ss_out = run_cli(
             &state_dir,
-            &["--session", &sid, "eval", "sessionStorage.getItem('ss_key')", "--json"],
+            &[
+                "--session",
+                &sid,
+                "eval",
+                "sessionStorage.getItem('ss_key')",
+                "--json",
+            ],
         );
         assert!(ss_out.status.success());
         let ss_val: Value = serde_json::from_slice(&ss_out.stdout).unwrap();
@@ -1021,13 +1210,20 @@ fn cli_daemon_stop_terminates_daemon_with_sigstop_wedged_browser_child() {
     }
     impl Drop for WedgedCleanupGuard {
         fn drop(&mut self) {
-            if let Some(bpid) = self.browser_pid {
-                let pgid_arg = format!("-{bpid}");
-                let _ = Command::new("kill").args(["-CONT", &pgid_arg]).output();
-                let _ = Command::new("kill").args(["-KILL", &pgid_arg]).output();
+            if let Some(bpid) = self.browser_pid
+                && bpid > 0
+            {
+                unsafe {
+                    libc::kill(-(bpid as libc::pid_t), libc::SIGCONT);
+                    libc::kill(-(bpid as libc::pid_t), libc::SIGKILL);
+                }
             }
-            if let Some(dpid) = self.daemon_pid {
-                let _ = Command::new("kill").args(["-KILL", &dpid.to_string()]).output();
+            if let Some(dpid) = self.daemon_pid
+                && dpid > 0
+            {
+                unsafe {
+                    libc::kill(dpid as libc::pid_t, libc::SIGKILL);
+                }
             }
             let _ = Command::new(bin())
                 .args(["--state-dir"])
@@ -1041,10 +1237,11 @@ fn cli_daemon_stop_terminates_daemon_with_sigstop_wedged_browser_child() {
         if pgid <= 0 {
             return false;
         }
-        Command::new("kill")
-            .args(["-0", &format!("-{pgid}")])
-            .output()
-            .is_ok_and(|o| o.status.success())
+        let rc = unsafe { libc::kill(-(pgid as libc::pid_t), 0) };
+        if rc == 0 {
+            return true;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1058,7 +1255,16 @@ fn cli_daemon_stop_terminates_daemon_with_sigstop_wedged_browser_child() {
 
         let snew = run_cli(
             &state_dir,
-            &["--engine", engine, "--session", "w1", "session", "new", "--ephemeral", "--json"],
+            &[
+                "--engine",
+                engine,
+                "--session",
+                "w1",
+                "session",
+                "new",
+                "--ephemeral",
+                "--json",
+            ],
         );
         assert!(
             snew.status.success(),
@@ -1077,14 +1283,16 @@ fn cli_daemon_stop_terminates_daemon_with_sigstop_wedged_browser_child() {
         guard.daemon_pid = Some(daemon_pid);
 
         // Freeze the browser process group with SIGSTOP so graceful cookies/dispose hangs.
-        let stop_sig = Command::new("kill")
-            .args(["-STOP", &format!("-{browser_pid}")])
-            .output()
-            .expect("send SIGSTOP to browser pgid");
         assert!(
-            stop_sig.status.success(),
-            "{engine} SIGSTOP on browser pgid failed: {}",
-            String::from_utf8_lossy(&stop_sig.stderr)
+            browser_pid > 0,
+            "{engine} expected positive browser pid, got {browser_pid}"
+        );
+        let stop_rc = unsafe { libc::kill(-(browser_pid as libc::pid_t), libc::SIGSTOP) };
+        assert_eq!(
+            stop_rc,
+            0,
+            "{engine} SIGSTOP on browser pgid {browser_pid} failed: {}",
+            std::io::Error::last_os_error()
         );
 
         let stop_out = run_cli(&state_dir, &["daemon", "stop", "--json"]);
@@ -1103,6 +1311,10 @@ fn cli_daemon_stop_terminates_daemon_with_sigstop_wedged_browser_child() {
             !mimikyu_core::daemon::is_pid_alive(daemon_pid),
             "{engine} daemon pid {daemon_pid} must not remain alive"
         );
+        let reap_deadline = Instant::now() + Duration::from_millis(500);
+        while pgid_alive(browser_pid) && Instant::now() < reap_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             !pgid_alive(browser_pid),
             "{engine} browser pgid {browser_pid} must not remain orphaned"
@@ -1183,16 +1395,29 @@ fn cli_accepts_hyphen_values_and_hyphen_state_dir_daemon_roundtrip() {
     let snew = run_rel(
         rel_work,
         false,
-        &["--engine", "chromium", "session", "new", "--virtual", "--json"],
+        &[
+            "--engine",
+            "chromium",
+            "session",
+            "new",
+            "--virtual",
+            "--json",
+        ],
     );
     assert!(
         snew.status.success(),
         "session new failed: {}",
         String::from_utf8_lossy(&snew.stdout)
     );
-    assert!(run_rel(rel_work, false, &["open", &srv.url("/page-50pct"), "--json"])
+    assert!(
+        run_rel(
+            rel_work,
+            false,
+            &["open", &srv.url("/page-50pct"), "--json"]
+        )
         .status
-        .success());
+        .success()
+    );
 
     let fill_out = run_rel(rel_work, false, &["fill", "#name", "-100", "--json"]);
     assert!(
@@ -1267,7 +1492,14 @@ fn cli_accepts_hyphen_values_and_hyphen_state_dir_daemon_roundtrip() {
     let wait_sel_out = run_rel(
         rel_work,
         false,
-        &["wait", "--selector", "-nonexistent", "--timeout-ms", "100", "--json"],
+        &[
+            "wait",
+            "--selector",
+            "-nonexistent",
+            "--timeout-ms",
+            "100",
+            "--json",
+        ],
     );
     // Invalid CSS selector or missing selector returns JSON error envelope, NOT clap argument rejection
     let wait_sel_s = String::from_utf8_lossy(&wait_sel_out.stdout);
@@ -1281,7 +1513,9 @@ fn cli_accepts_hyphen_values_and_hyphen_state_dir_daemon_roundtrip() {
         "wait --selector -nonexistent should reach wait engine, not clap: {wait_sel_v:?}"
     );
 
-    assert!(run_rel(rel_work, false, &["daemon", "stop", "--json"])
-        .status
-        .success());
+    assert!(
+        run_rel(rel_work, false, &["daemon", "stop", "--json"])
+            .status
+            .success()
+    );
 }
