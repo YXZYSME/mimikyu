@@ -178,6 +178,7 @@ jobs:
           sh -n ./install.sh
           bash -n ./install.sh
           ./install.sh --help >/dev/null
+          ./install.sh --dry-run
           ./install.sh --repo "${{ github.repository }}" --dry-run
 
           SMOKE_BIN_DIR="$RUNNER_TEMP/mimikyu-install-smoke"

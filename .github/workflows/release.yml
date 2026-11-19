@@ -160,8 +160,9 @@ jobs:
           SHA_LINUX_X86_64=$(awk '$2 == "mimikyu-x86_64-unknown-linux-gnu.tar.gz" {print $1}' release-assets/SHA256SUMS)
 
           sed \
-            -e "s#<owner>/mimikyu#${REPO_SLUG}#g" \
+            -e "s#YXZYSME/mimikyu#${REPO_SLUG}#g" \
             -e "s#version \"[^\"]*\"#version \"${REL_VER}\"#g" \
+            -e "s#/releases/download/v[^/]*/#/releases/download/v${REL_VER}/#g" \
             -e "s#PLACEHOLDER_SHA256_DARWIN_ARM64#${SHA_DARWIN_ARM64}#g" \
             -e "s#PLACEHOLDER_SHA256_DARWIN_X86_64#${SHA_DARWIN_X86_64}#g" \
             -e "s#PLACEHOLDER_SHA256_LINUX_ARM64#${SHA_LINUX_ARM64}#g" \
@@ -183,7 +184,7 @@ jobs:
           REL_VER="${TAG_NAME#v}"
           awk -v ver="$REL_VER" '
             $0 ~ "^## \\[" ver "\\] - " { in_sec = 1; next }
-            in_sec && $0 ~ "^## \\[" { exit 0 }
+            in_sec && ($0 ~ "^## \\[" || $0 ~ "^\\[[^]]+\\]: ") { exit 0 }
             in_sec { print }
           ' CHANGELOG.md > "$RUNNER_TEMP/RELEASE_NOTES.md"
 

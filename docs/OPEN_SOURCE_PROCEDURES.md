@@ -6,19 +6,20 @@ This runbook provides the repository owner and maintainers with concrete, copy-p
 
 ## 1. Pre-Launch Checklist & `gh repo create` Procedure
 
-### Step 1.1: Replace Repository Owner Placeholders
+### Step 1.1: Verify Repository Owner & Metadata Configuration
 
-Before pushing to GitHub, set your GitHub username or organization handle (`<owner>`, e.g. `octocat`) across the repository's governance and packaging templates:
+All repository metadata, governance rules, and packaging manifests are wired to [`YXZYSME/mimikyu`](https://github.com/YXZYSME/mimikyu):
 
-1. **`.github/CODEOWNERS`**: Replace `@<your-github-username>` with `@<owner>` (or `@<org>/core-maintainers`) and uncomment the ownership rules.
-2. **`.github/ISSUE_TEMPLATE/config.yml`**: Replace `OWNER` in `https://github.com/OWNER/mimikyu/...` with `<owner>`.
-3. **`Cargo.toml`, `install.sh`, `packaging/homebrew/mimikyu.rb`, `README.md`, `CONTRIBUTING.md`**: Replace `<owner>` placeholder URLs with `<owner>`.
+1. **`.github/CODEOWNERS`**: Default and critical-subsystem ownership configured for `@YXZYSME`.
+2. **`.github/ISSUE_TEMPLATE/config.yml`**: Security advisory and Discussions links point to `https://github.com/YXZYSME/mimikyu/...`.
+3. **`Cargo.toml`, `crates/*/Cargo.toml`, `install.sh`, `packaging/homebrew/mimikyu.rb`, `README.md`, `CONTRIBUTING.md`, `RELEASE.md`, `SECURITY.md`, `CHANGELOG.md`**: Configured for `https://github.com/YXZYSME/mimikyu`.
 
 Verify zero local machine paths, personal usernames, or secrets exist anywhere in tracked history or working tree:
 
 ```bash
 git status
-./scripts/check-version-sync.sh
+./install.sh --dry-run
+./scripts/check-version-sync.sh --tag v0.1.0
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
@@ -28,7 +29,7 @@ cargo test --workspace
 Authenticate with `gh auth status`, then create the repository, set discovery topics, enable Discussions, and disable unused legacy surfaces (Wikis/Projects):
 
 ```bash
-OWNER="<your-github-username-or-org>"
+OWNER="YXZYSME"
 
 # 1. Create public repository from local checkout and push `main`
 gh repo create "${OWNER}/mimikyu" \
@@ -322,20 +323,20 @@ Once `vX.Y.Z` is live on GitHub Releases, users upgrade seamlessly across all su
 
 - **One-line POSIX install**:
   ```bash
-  curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh
   ```
 - **In-place verified atomic update** (compares `mimikyu --version` against latest release tag, verifies `SHA256SUMS`, and atomically swaps the binary):
   ```bash
-  curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | sh -s -- --update
+  curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- --update
   ```
 - **Attestation-verified / pinned CI install**:
   ```bash
-  curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | sh -s -- --version v0.1.0 --verify-attestation
+  curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- --version v0.1.0 --verify-attestation
   ```
 - **Cargo (`binstall` / `--git` / source)**:
   ```bash
   cargo binstall mimikyu-cli
-  cargo install --git https://github.com/<owner>/mimikyu --tag v0.1.0 mimikyu-cli
+  cargo install --git https://github.com/YXZYSME/mimikyu --tag v0.1.0 mimikyu-cli
   ```
 
 ---

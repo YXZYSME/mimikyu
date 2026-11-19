@@ -129,22 +129,22 @@ Once `release.yml` publishes `vX.Y.Z`, users upgrade safely across supported cha
 
 ```sh
 # Atomically upgrade if a newer GitHub Release tag is available
-curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | sh -s -- --update
+curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- --update
 
 # Pin a specific version and verify both SHA-256 + GitHub SLSA Artifact Attestation
-curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | \
+curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | \
   sh -s -- --version v0.1.1 --verify-attestation
 ```
 
 Security guarantees enforced by `install.sh`:
 - Downloads both `mimikyu-<target>.tar.gz` and `SHA256SUMS` into a private temporary directory (`mktemp -d`).
 - **Verifies the 64-character SHA-256 digest before extracting** (`shasum -a 256` / `sha256sum`), aborting immediately on any mismatch.
-- Optionally verifies cryptographic SLSA provenance via `gh attestation verify` when `--verify-attestation` is passed.
+- Optionally verifies cryptographic SLSA provenance via `gh attestation verify --repo YXZYSME/mimikyu` when `--verify-attestation` is passed.
 - Stages the binary in the destination directory and swaps it into place via atomic POSIX `mv`.
 
 ### Homebrew Tap (`packaging/homebrew/mimikyu.rb`)
 
-Copy the rendered `mimikyu.rb` asset attached to the GitHub Release into `Formula/mimikyu.rb` in your `homebrew-tap` repository, allowing users to run:
+Copy the rendered `mimikyu.rb` asset attached to the GitHub Release into `Formula/mimikyu.rb` in your `homebrew-tap` repository (`YXZYSME/homebrew-tap`), allowing users to run:
 
 ```sh
 brew update && brew upgrade mimikyu
@@ -157,7 +157,7 @@ brew update && brew upgrade mimikyu
 cargo binstall mimikyu-cli
 
 # Build from tagged git source
-cargo install --locked --git https://github.com/<owner>/mimikyu --tag v0.1.1 mimikyu-cli
+cargo install --locked --git https://github.com/YXZYSME/mimikyu --tag v0.1.1 mimikyu-cli
 ```
 
 ---

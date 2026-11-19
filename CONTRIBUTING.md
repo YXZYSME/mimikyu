@@ -30,7 +30,7 @@ Welcome, traveler, to the **Haunted Rag Workshop**! Whether you are fixing a sub
 ### Clone, Build & Check Your Environment
 
 ```bash
-git clone https://github.com/<owner>/mimikyu.git
+git clone https://github.com/YXZYSME/mimikyu.git
 cd mimikyu
 
 # Build release binary and run browser discovery diagnostics

@@ -3,15 +3,15 @@
 # Compatible with POSIX /bin/sh and macOS Bash 3.2+.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | sh
-#   curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | sh -s -- --update
+#   curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- --update
 #   ./install.sh --from-source --bin-dir ~/.local/bin
 
 set -eu
 
 BINARY_NAME="mimikyu"
-DEFAULT_REPO_PLACEHOLDER="<owner>/mimikyu"
-REPO="${MIMIKYU_REPO:-$DEFAULT_REPO_PLACEHOLDER}"
+DEFAULT_REPO="YXZYSME/mimikyu"
+REPO="${MIMIKYU_REPO:-$DEFAULT_REPO}"
 REPO_EXPLICIT=0
 if [ -n "${MIMIKYU_REPO:-}" ]; then
   REPO_EXPLICIT=1
@@ -66,7 +66,7 @@ OPTIONS:
                                 and upgrade atomically if a newer release is available
     --bin-dir, --prefix <DIR>   Target directory for the mimikyu binary
                                 [default: $MIMIKYU_INSTALL_DIR or $HOME/.local/bin]
-    --repo <owner/name>         GitHub repository slug [default: $MIMIKYU_REPO or <owner>/mimikyu]
+    --repo <OWNER/NAME>         GitHub repository slug [default: $MIMIKYU_REPO or YXZYSME/mimikyu]
     --target <TRIPLE>           Override target triple (e.g. aarch64-apple-darwin,
                                 x86_64-apple-darwin, x86_64-unknown-linux-gnu,
                                 aarch64-unknown-linux-gnu)
@@ -80,19 +80,19 @@ OPTIONS:
 
 ENVIRONMENT VARIABLES:
     MIMIKYU_INSTALL_DIR         Default installation directory (overridden by --bin-dir/--prefix)
-    MIMIKYU_REPO                Default GitHub owner/name slug (overridden by --repo)
+    MIMIKYU_REPO                Default GitHub OWNER/NAME slug (overridden by --repo)
     MIMIKYU_TARGET              Default Rust target triple (overridden by --target)
     GITHUB_TOKEN / GH_TOKEN     Optional GitHub token used when querying the Releases API
 
 EXAMPLES:
     # Install latest prebuilt release (verifies SHA256SUMS before extraction)
-    curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | sh
+    curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh
 
     # Atomically update an existing installation if a newer release exists
-    curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | sh -s -- --update
+    curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- --update
 
     # Pin an exact version and verify SLSA build provenance with GitHub CLI
-    ./install.sh --repo <owner>/mimikyu --version v0.1.0 --verify-attestation
+    ./install.sh --version v0.1.0 --verify-attestation
 
     # Build and install directly from a local repository clone
     ./install.sh --from-source --bin-dir "$HOME/.local/bin"
@@ -134,7 +134,7 @@ parse_args() {
         shift
         ;;
       --repo)
-        [ $# -ge 2 ] || die "--repo requires an <owner/name> argument"
+        [ $# -ge 2 ] || die "--repo requires an OWNER/NAME argument"
         REPO="$2"
         REPO_EXPLICIT=1
         shift 2
@@ -216,11 +216,11 @@ try_autodetect_git_repo() {
 validate_repo_slug() {
   case "$REPO" in
     ""|*"<"*|*">"*|*" "*)
-      die "GitHub repository placeholder '$REPO' has not been configured yet. Pass --repo <owner/mimikyu>, set MIMIKYU_REPO=<owner/mimikyu>, or install locally with --from-source."
+      die "GitHub repository placeholder '$REPO' is invalid. Pass --repo OWNER/NAME (default: YXZYSME/mimikyu), set MIMIKYU_REPO=OWNER/NAME, or install locally with --from-source."
       ;;
   esac
   if ! printf '%s\n' "$REPO" | grep -Eq '^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$'; then
-    die "invalid --repo '$REPO' (expected GitHub slug in '<owner>/<name>' format)"
+    die "invalid --repo '$REPO' (expected GitHub slug in 'OWNER/NAME' format, e.g. 'YXZYSME/mimikyu')"
   fi
 }
 

@@ -204,6 +204,9 @@ rewrite_homebrew_formula() {
       sub(/"[^"]*"/, "\"" ver "\"")
       replaced = 1
     }
+    $0 ~ /\/releases\/download\/v[^\/]+\// {
+      sub(/\/releases\/download\/v[^\/]+\//, "/releases/download/v" ver "/")
+    }
     { print }
   ' "$in_file" > "$out_file"
 }

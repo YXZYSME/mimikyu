@@ -11,8 +11,9 @@
 #      - `x86_64-unknown-linux-gnu`  (Linux x86_64)
 #   2. The `publish` job computes `SHA256SUMS` across all 4 tarballs and renders a
 #      production-ready `mimikyu.rb` release asset by substituting:
-#      - `<owner>/mimikyu`                     -> `${GITHUB_REPOSITORY}`
+#      - `YXZYSME/mimikyu`                     -> `${GITHUB_REPOSITORY}`
 #      - `version "0.1.0"`                     -> `version "${RELEASE_VERSION}"`
+#      - `/releases/download/v0.1.0/`          -> `/releases/download/v${RELEASE_VERSION}/`
 #      - `PLACEHOLDER_SHA256_DARWIN_ARM64`     -> SHA-256 of `mimikyu-aarch64-apple-darwin.tar.gz`
 #      - `PLACEHOLDER_SHA256_DARWIN_X86_64`    -> SHA-256 of `mimikyu-x86_64-apple-darwin.tar.gz`
 #      - `PLACEHOLDER_SHA256_LINUX_ARM64`      -> SHA-256 of `mimikyu-aarch64-unknown-linux-gnu.tar.gz`
@@ -22,32 +23,32 @@
 #      repository secrets to push automatically).
 #
 # Users then install & upgrade via:
-#   brew tap <owner>/tap
+#   brew tap YXZYSME/tap
 #   brew install mimikyu
 #   brew upgrade mimikyu
 
 class Mimikyu < Formula
   desc "Fast Rust agentic browser runtime, isolation layer, and CLI/Daemon/MCP toolkit"
-  homepage "https://github.com/<owner>/mimikyu"
+  homepage "https://github.com/YXZYSME/mimikyu"
   version "0.1.0"
   license any_of: ["MIT", "Apache-2.0"]
 
   on_macos do
     if Hardware::CPU.arm?
-      url "https://github.com/<owner>/mimikyu/releases/download/v#{version}/mimikyu-aarch64-apple-darwin.tar.gz"
+      url "https://github.com/YXZYSME/mimikyu/releases/download/v0.1.0/mimikyu-aarch64-apple-darwin.tar.gz"
       sha256 "PLACEHOLDER_SHA256_DARWIN_ARM64"
     else
-      url "https://github.com/<owner>/mimikyu/releases/download/v#{version}/mimikyu-x86_64-apple-darwin.tar.gz"
+      url "https://github.com/YXZYSME/mimikyu/releases/download/v0.1.0/mimikyu-x86_64-apple-darwin.tar.gz"
       sha256 "PLACEHOLDER_SHA256_DARWIN_X86_64"
     end
   end
 
   on_linux do
     if Hardware::CPU.arm?
-      url "https://github.com/<owner>/mimikyu/releases/download/v#{version}/mimikyu-aarch64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/YXZYSME/mimikyu/releases/download/v0.1.0/mimikyu-aarch64-unknown-linux-gnu.tar.gz"
       sha256 "PLACEHOLDER_SHA256_LINUX_ARM64"
     else
-      url "https://github.com/<owner>/mimikyu/releases/download/v#{version}/mimikyu-x86_64-unknown-linux-gnu.tar.gz"
+      url "https://github.com/YXZYSME/mimikyu/releases/download/v0.1.0/mimikyu-x86_64-unknown-linux-gnu.tar.gz"
       sha256 "PLACEHOLDER_SHA256_LINUX_X86_64"
     end
   end

@@ -4,6 +4,7 @@
 
 <br />
 
+[![CI](https://github.com/YXZYSME/mimikyu/actions/workflows/ci.yml/badge.svg)](https://github.com/YXZYSME/mimikyu/actions/workflows/ci.yml)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B%20(2024)-f5b841?style=flat-square&labelColor=180d2e)](Cargo.toml)
 [![Engines: CDP + BiDi](https://img.shields.io/badge/engines-Chromium%20CDP%20%2B%20Firefox%20BiDi-4ce0b3?style=flat-square&labelColor=180d2e)](ARCHITECTURE.md)
 [![MCP Server: 31 Tools](https://img.shields.io/badge/MCP%202024--11--05-31%20tools-9d80eb?style=flat-square&labelColor=180d2e)](#mcp-server-configuration)
@@ -13,7 +14,7 @@
 
 **High-speed native Rust agentic browser runtime, two-tier session/profile isolation layer, warm Unix-socket daemon, and 31-tool MCP control plane driving local Chromium (CDP) and Firefox (W3C WebDriver BiDi).**
 
-[Install](#installation--updating) · [Quickstart](#quickstart--cli-examples) · [MCP (31 Tools)](#mcp-server-configuration) · [Benchmarks](#reproducible-local-benchmark-suite) · [Architecture](ARCHITECTURE.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
+[Install](#installation--updating) · [Releases](https://github.com/YXZYSME/mimikyu/releases) · [Quickstart](#quickstart--cli-examples) · [MCP (31 Tools)](#mcp-server-configuration) · [Benchmarks](#reproducible-local-benchmark-suite) · [Architecture](ARCHITECTURE.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
 
 </div>
 
@@ -49,36 +50,33 @@
 
 ## Installation & Updating
 
-> [!NOTE]
-> Replace `<owner>` below with your GitHub organization or username once published (see [`docs/OPEN_SOURCE_PROCEDURES.md`](docs/OPEN_SOURCE_PROCEDURES.md) for the launch checklist). On a local clone, `--from-source` and `cargo install --path` work immediately offline.
-
 ### One-Line POSIX Installer (macOS & Linux)
 
-Downloads the prebuilt release archive (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, or `aarch64-unknown-linux-gnu`), **verifies its SHA-256 checksum against `SHA256SUMS`** before extraction, and installs atomically to `~/.local/bin` (or `$MIMIKYU_INSTALL_DIR`):
+Downloads the prebuilt [GitHub Release](https://github.com/YXZYSME/mimikyu/releases) archive (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, or `aarch64-unknown-linux-gnu`), **verifies its SHA-256 checksum against `SHA256SUMS`** before extraction, and installs atomically to `~/.local/bin` (or `$MIMIKYU_INSTALL_DIR`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh
 ```
 
 ### Updating, Pinning Versions & Uninstalling
 
 ```bash
 # Check installed version against the latest GitHub Release and upgrade atomically
-curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | sh -s -- --update
+curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- --update
 
 # Pin an exact SemVer tag, custom install directory, or GitHub build provenance attestation check
-curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | sh -s -- \
+curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- \
   --version v0.1.0 --bin-dir ~/.local/bin --verify-attestation
 
 # Cleanly remove the installed binary
-curl -fsSL https://raw.githubusercontent.com/<owner>/mimikyu/main/install.sh | sh -s -- --uninstall
+curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- --uninstall
 ```
 
 ### Rust / Cargo & `cargo-binstall`
 
 ```bash
 # Install directly from Git with Cargo (Rust 1.88+)
-cargo install --git https://github.com/<owner>/mimikyu mimikyu-cli
+cargo install --git https://github.com/YXZYSME/mimikyu mimikyu-cli
 
 # Fast prebuilt binary install via cargo-binstall
 cargo binstall mimikyu-cli

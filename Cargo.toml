@@ -8,13 +8,14 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.88"
 description = "Fast browser automation, session/profile isolation, and environment consistency control plane for AI agents"
+homepage = "https://github.com/YXZYSME/mimikyu"
+repository = "https://github.com/YXZYSME/mimikyu"
 readme = "README.md"
 keywords = ["browser", "automation", "mcp", "cdp", "webdriver-bidi"]
 categories = ["command-line-utilities", "development-tools::testing", "web-programming", "asynchronous"]
-# Set `repository = "https://github.com/<owner>/mimikyu"` before publishing to crates.io.
 
 [workspace.metadata.binstall]
-pkg-url = "{ repo }/releases/download/v{ version }/mimikyu-{ target }{ archive-suffix }"
+pkg-url = "https://github.com/YXZYSME/mimikyu/releases/download/v{ version }/mimikyu-{ target }{ archive-suffix }"
 bin-dir = "{ bin }{ binary-ext }"
 pkg-fmt = "tgz"
 

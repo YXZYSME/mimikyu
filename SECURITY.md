@@ -22,8 +22,8 @@ Only the latest minor release track receives security patches and advisories:
 
 Please report security vulnerabilities privately through **GitHub Private Vulnerability Reporting**:
 
-1. Navigate to the repository's **Security** tab on GitHub.
-2. Click **Advisories** -> **Report a vulnerability** (`/security/advisories/new`).
+1. Navigate to the [`YXZYSME/mimikyu` Security tab](https://github.com/YXZYSME/mimikyu/security) on GitHub.
+2. Click **Advisories** -> [**Report a vulnerability**](https://github.com/YXZYSME/mimikyu/security/advisories/new).
 3. Include as much of the following detail as possible:
    - **Affected version & target** (`mimikyu --version` and `mimikyu doctor --json`, redacting any personal host paths).
    - **Affected subsystem** (e.g., `daemon/`, `env_profile/proxy_relay.rs`, `driver/cdp.rs`, `driver/bidi.rs`, `mcp/`, `isolation/`, `install.sh`).

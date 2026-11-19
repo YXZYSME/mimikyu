@@ -41,3 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Isolated-World Evaluation by Default**: `mimikyu eval` executes JavaScript inside an isolated execution world unless `--main-world` is explicitly requested.
 - **macOS Zero-Spawn Firefox Probe & Crash Suppression**: Reads `application.ini` and `Contents/Info.plist` directly from disk (avoiding `firefox --version` exit races on macOS) and launches Firefox with `MOZ_CRASHREPORTER_DISABLE=1`, `MOZ_CRASHREPORTER=0`, and `MOZ_CRASHREPORTER_NO_REPORT=1`.
 - **Deterministic Process-Group Reaping**: Isolates every spawned browser in its own POSIX process group (`setpgid(0, 0)`) with graceful protocol close followed by deterministic process-group cleanup on shutdown, signal, or `Drop`.
+
+[Unreleased]: https://github.com/YXZYSME/mimikyu/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/YXZYSME/mimikyu/releases/tag/v0.1.0
