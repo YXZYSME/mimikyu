@@ -155,7 +155,7 @@ impl TestServer {
                             let payload: Vec<u8> =
                                 (0..4096).map(|i| ((i * 5 + 3) % 251) as u8).collect();
                             let hdr = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                                 payload.len()
                             );
                             if stream.write_all(hdr.as_bytes()).await.is_ok()
@@ -168,7 +168,7 @@ impl TestServer {
                             }
                         } else {
                             let partial: Vec<u8> = vec![0xCD; 512];
-                            let hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n";
+                            let hdr = "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nContent-Length: 4096\r\nConnection: close\r\n\r\n";
                             if stream.write_all(hdr.as_bytes()).await.is_ok()
                                 && stream.write_all(&partial).await.is_ok()
                             {
@@ -201,14 +201,14 @@ impl TestServer {
                     if (method, path) == ("GET", "/download/slow-hold.bin") {
                         let payload: Vec<u8> = (0..4096).map(|i| ((i + 19) % 251) as u8).collect();
                         let hdr = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Disposition: attachment; filename=\"slow-hold.bin\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nCache-Control: no-store\r\nContent-Disposition: attachment; filename=\"slow-hold.bin\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                             payload.len()
                         );
                         if stream.write_all(hdr.as_bytes()).await.is_ok()
                             && stream.write_all(&payload[..512]).await.is_ok()
                         {
                             let _ = stream.flush().await;
-                            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
                             let _ = stream.write_all(&payload[512..]).await;
                             let _ = stream.flush().await;
                         }

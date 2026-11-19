@@ -372,7 +372,11 @@ struct BidiConnection {
     recent_content_disposition: Mutex<HashMap<(String, String), String>>,
     download_transfers_by_req_id: Mutex<HashMap<String, DownloadTransferState>>,
     pending_download_req_ids: Mutex<HashMap<(String, String), VecDeque<PendingDownloadReq>>>,
-    download_ends_by_nav: Mutex<HashMap<String, (DownloadEndStatus, std::time::Instant)>>,
+    download_ends_by_dl_id: Mutex<HashMap<String, DownloadEndEntry>>,
+    download_ends_by_nav: Mutex<HashMap<String, DownloadEndEntry>>,
+    download_ends_by_file: Mutex<HashMap<String, DownloadEndEntry>>,
+    active_download_nav_counts: Arc<Mutex<HashMap<String, usize>>>,
+    active_same_url_counts: Arc<Mutex<HashMap<(String, String), usize>>>,
     download_end_supported: AtomicBool,
     process: AsyncMutex<Option<ProcessGuard>>,
     _root_proxy_relay: Mutex<Option<ProxyRelay>>,
@@ -384,6 +388,18 @@ struct BidiConnection {
 enum DownloadEndStatus {
     Complete,
     Canceled,
+}
+
+#[derive(Clone, Debug)]
+struct DownloadEndEntry {
+    status: DownloadEndStatus,
+    filename: Option<String>,
+    recorded_at: std::time::Instant,
+}
+
+struct DownloadWillBeginMeta {
+    dl_id: Option<String>,
+    nav_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -523,7 +539,11 @@ impl BidiConnection {
             recent_content_disposition: Mutex::new(HashMap::new()),
             download_transfers_by_req_id: Mutex::new(HashMap::new()),
             pending_download_req_ids: Mutex::new(HashMap::new()),
+            download_ends_by_dl_id: Mutex::new(HashMap::new()),
             download_ends_by_nav: Mutex::new(HashMap::new()),
+            download_ends_by_file: Mutex::new(HashMap::new()),
+            active_download_nav_counts: Arc::new(Mutex::new(HashMap::new())),
+            active_same_url_counts: Arc::new(Mutex::new(HashMap::new())),
             download_end_supported: AtomicBool::new(false),
             process: AsyncMutex::new(Some(process)),
             _root_proxy_relay: Mutex::new(root_proxy_relay),
@@ -849,6 +869,11 @@ impl BidiConnection {
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string();
+                        let dl_id = params
+                            .get("download")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(ToString::to_string);
                         let nav_id = params
                             .get("navigation")
                             .and_then(|v| v.as_str())
@@ -858,7 +883,7 @@ impl BidiConnection {
                             cid,
                             suggested,
                             &url_str,
-                            nav_id,
+                            DownloadWillBeginMeta { dl_id, nav_id },
                             dest_dir.clone(),
                         );
                     }
@@ -866,25 +891,63 @@ impl BidiConnection {
                 }
 
                 if method == "browsingContext.downloadEnd" {
-                    if let Some(nav_id) = params
-                        .get("navigation")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                    {
-                        let status = match params.get("status").and_then(|v| v.as_str()) {
-                            Some("complete") => Some(DownloadEndStatus::Complete),
-                            Some("canceled") => Some(DownloadEndStatus::Canceled),
-                            _ => None,
+                    let status = match params.get("status").and_then(|v| v.as_str()) {
+                        Some("complete") => Some(DownloadEndStatus::Complete),
+                        Some("canceled") => Some(DownloadEndStatus::Canceled),
+                        _ => None,
+                    };
+                    if let Some(st) = status {
+                        let now = std::time::Instant::now();
+                        let filename = params
+                            .get("filepath")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .and_then(|fp| {
+                                std::path::Path::new(fp)
+                                    .file_name()
+                                    .and_then(|n| n.to_str())
+                                    .filter(|n| !n.is_empty())
+                                    .map(ToString::to_string)
+                            });
+                        let entry = DownloadEndEntry {
+                            status: st,
+                            filename: filename.clone(),
+                            recorded_at: now,
                         };
-                        if let Some(st) = status {
-                            let now = std::time::Instant::now();
-                            let mut ends = self.download_ends_by_nav.lock();
+                        if let Some(dl_id) = params
+                            .get("download")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                        {
+                            let mut ends = self.download_ends_by_dl_id.lock();
                             if ends.len() >= 512 {
-                                ends.retain(|_, (_, ts)| {
-                                    now.duration_since(*ts) < Duration::from_secs(120)
+                                ends.retain(|_, e| {
+                                    now.duration_since(e.recorded_at) < Duration::from_secs(120)
                                 });
                             }
-                            ends.insert(nav_id.to_string(), (st, now));
+                            ends.insert(dl_id.to_string(), entry.clone());
+                        }
+                        if let Some(ref fname) = filename {
+                            let mut ends = self.download_ends_by_file.lock();
+                            if ends.len() >= 512 {
+                                ends.retain(|_, e| {
+                                    now.duration_since(e.recorded_at) < Duration::from_secs(120)
+                                });
+                            }
+                            ends.insert(fname.clone(), entry.clone());
+                        }
+                        if let Some(nav_id) = params
+                            .get("navigation")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                        {
+                            let mut ends = self.download_ends_by_nav.lock();
+                            if ends.len() >= 512 {
+                                ends.retain(|_, e| {
+                                    now.duration_since(e.recorded_at) < Duration::from_secs(120)
+                                });
+                            }
+                            ends.insert(nav_id.to_string(), entry);
                         }
                     }
                     return;
@@ -1079,7 +1142,7 @@ impl BidiConnection {
                 let is_subresource_dest = !destination.is_empty()
                     && !matches!(
                         destination.to_ascii_lowercase().as_str(),
-                        "document" | "iframe" | "frame" | "embed" | "object"
+                        "document" | "iframe" | "frame" | "embed" | "object" | "download"
                     );
                 if !is_navigation && (is_fetch_or_xhr || is_subresource_dest) {
                     return;
@@ -1198,12 +1261,43 @@ impl BidiConnection {
         }
     }
 
+    fn resolve_download_end_status(
+        &self,
+        dl_id: Option<&str>,
+        nav_id: Option<&str>,
+        safe_suggested: &str,
+        saw_shared_nav: bool,
+    ) -> Option<DownloadEndStatus> {
+        if let Some(did) = dl_id
+            && let Some(entry) = self.download_ends_by_dl_id.lock().get(did)
+        {
+            return Some(entry.status);
+        }
+        if let Some(entry) = self.download_ends_by_file.lock().get(safe_suggested) {
+            return Some(entry.status);
+        }
+        if let Some(nid) = nav_id
+            && let Some(entry) = self.download_ends_by_nav.lock().get(nid).cloned()
+        {
+            if let Some(ref fnm) = entry.filename
+                && fnm != safe_suggested
+            {
+                return None;
+            }
+            if entry.status == DownloadEndStatus::Canceled && dl_id.is_none() && saw_shared_nav {
+                return None;
+            }
+            return Some(entry.status);
+        }
+        None
+    }
+
     fn spawn_isolated_download_relocation(
         self: &Arc<Self>,
         cid: &str,
         suggested: &str,
         url: &str,
-        nav_id: Option<String>,
+        meta: DownloadWillBeginMeta,
         dest_dir: PathBuf,
     ) {
         let safe_suggested = std::path::Path::new(suggested)
@@ -1215,8 +1309,27 @@ impl BidiConnection {
             return;
         }
 
+        // Clear any leftover file-keyed downloadEnd from an earlier sequential download of the same name.
+        self.download_ends_by_file.lock().remove(&safe_suggested);
+
+        let DownloadWillBeginMeta { dl_id, nav_id } = meta;
         let norm_url = normalize_download_url(url);
         let key = (cid.to_string(), norm_url.clone());
+        let mut saw_concurrent_same_url = {
+            let mut counts = self.active_same_url_counts.lock();
+            let c = counts.entry(key.clone()).or_insert(0);
+            *c += 1;
+            *c > 1
+        };
+        let mut saw_shared_nav = if let Some(ref nid) = nav_id {
+            let mut counts = self.active_download_nav_counts.lock();
+            let c = counts.entry(nid.clone()).or_insert(0);
+            *c += 1;
+            *c > 1
+        } else {
+            false
+        };
+
         let bound_req_id: Option<String> = loop {
             let now = std::time::Instant::now();
             let cand_req_id = {
@@ -1288,6 +1401,8 @@ impl BidiConnection {
 
         let pool_dir = self.pool_download_dir.clone();
         let active_set = Arc::clone(&self.active_pool_downloads);
+        let same_url_counts = Arc::clone(&self.active_same_url_counts);
+        let nav_counts = Arc::clone(&self.active_download_nav_counts);
         let weak_conn = Arc::downgrade(self);
         let ctx_owned = cid.to_string();
         let is_http_url =
@@ -1295,6 +1410,7 @@ impl BidiConnection {
 
         tokio::spawn(async move {
             const ZERO_BYTE_FALLBACK_SETTLE: Duration = Duration::from_millis(250);
+            const DOWNLOAD_END_SAFETY_FALLBACK: Duration = Duration::from_millis(3000);
             let src = pool_dir.join(&safe_suggested);
             let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
             let mut prev_len: Option<u64> = None;
@@ -1312,15 +1428,30 @@ impl BidiConnection {
                     break;
                 }
 
+                if same_url_counts.lock().get(&key).copied().unwrap_or(0) > 1 {
+                    saw_concurrent_same_url = true;
+                }
+                if let Some(ref nid) = nav_id
+                    && nav_counts.lock().get(nid).copied().unwrap_or(0) > 1
+                {
+                    saw_shared_nav = true;
+                }
+
                 let transfer_state = bound_req_id.as_deref().and_then(|rid| {
                     conn_opt
                         .as_ref()
                         .and_then(|conn| conn.download_transfers_by_req_id.lock().get(rid).cloned())
                 });
-                let download_end_status = nav_id.as_deref().and_then(|nid| {
-                    conn_opt
-                        .as_ref()
-                        .and_then(|conn| conn.download_ends_by_nav.lock().get(nid).map(|(st, _)| *st))
+                let download_end_supported = conn_opt
+                    .as_ref()
+                    .is_some_and(|conn| conn.download_end_supported.load(Ordering::Relaxed));
+                let download_end_status = conn_opt.as_ref().and_then(|conn| {
+                    conn.resolve_download_end_status(
+                        dl_id.as_deref(),
+                        nav_id.as_deref(),
+                        &safe_suggested,
+                        saw_shared_nav,
+                    )
                 });
                 let download_end_complete =
                     download_end_status == Some(DownloadEndStatus::Complete);
@@ -1342,19 +1473,71 @@ impl BidiConnection {
                     stable_ticks = 0;
                 }
 
-                if matches!(
+                let src_non_empty =
+                    std::fs::metadata(&src).is_ok_and(|m| m.is_file() && m.len() > 0);
+                let canceled_by_end = download_end_status == Some(DownloadEndStatus::Canceled);
+                let failed_by_req = matches!(
                     transfer_state.as_ref().map(|s| s.status),
                     Some(DownloadTransferStatus::Failed)
-                ) || download_end_status == Some(DownloadEndStatus::Canceled)
+                );
+
+                if !download_end_complete
+                    && !src_non_empty
+                    && (canceled_by_end
+                        || (failed_by_req
+                            && !(saw_concurrent_same_url
+                                && download_end_supported
+                                && dl_id.is_some())))
                 {
-                    for _ in 0..10 {
+                    let max_part_ticks = if saw_concurrent_same_url && !canceled_by_end {
+                        200usize
+                    } else {
+                        60usize
+                    };
+                    for _ in 0..max_part_ticks {
                         if !has_any_part_file(&pool_dir) {
+                            break;
+                        }
+                        if std::fs::metadata(&src).is_ok_and(|m| m.is_file() && m.len() > 0) {
                             break;
                         }
                         tokio::time::sleep(Duration::from_millis(15)).await;
                     }
+                    if !canceled_by_end
+                        && download_end_supported
+                        && (dl_id.is_some() || (nav_id.is_some() && !saw_shared_nav))
+                    {
+                        for _ in 0..15 {
+                            let end_now = weak_conn.upgrade().and_then(|conn| {
+                                conn.resolve_download_end_status(
+                                    dl_id.as_deref(),
+                                    nav_id.as_deref(),
+                                    &safe_suggested,
+                                    saw_shared_nav,
+                                )
+                            });
+                            if end_now.is_some() {
+                                break;
+                            }
+                            tokio::time::sleep(Duration::from_millis(15)).await;
+                        }
+                    }
+                    let grew_non_zero =
+                        std::fs::metadata(&src).is_ok_and(|m| m.is_file() && m.len() > 0);
+                    let completed_now = weak_conn.upgrade().and_then(|conn| {
+                        conn.resolve_download_end_status(
+                            dl_id.as_deref(),
+                            nav_id.as_deref(),
+                            &safe_suggested,
+                            saw_shared_nav,
+                        )
+                    }) == Some(DownloadEndStatus::Complete);
+                    if grew_non_zero || completed_now {
+                        continue;
+                    }
                     if let Ok(meta) = std::fs::metadata(&src)
                         && meta.is_file()
+                        && meta.len() == 0
                     {
                         let _ = std::fs::remove_file(&src);
                     }
@@ -1381,9 +1564,6 @@ impl BidiConnection {
                     let expected_len = transfer_state.as_ref().and_then(|s| s.content_length);
                     let known_non_empty = expected_len.is_some_and(|cl| cl > 0)
                         || transfer_state.as_ref().is_some_and(|s| s.body_non_empty);
-                    let download_end_supported = conn_opt
-                        .as_ref()
-                        .is_some_and(|conn| conn.download_end_supported.load(Ordering::Relaxed));
 
                     let ready = if len > 0 {
                         zero_settle_since = None;
@@ -1398,7 +1578,10 @@ impl BidiConnection {
                                     || (bound_req_id.is_some()
                                         && stable_ticks >= 4
                                         && !own_part_exists))
-                        } else if !is_http_url || transfer_state.is_none() {
+                        } else if !is_http_url
+                            || transfer_state.is_none()
+                            || (saw_concurrent_same_url && failed_by_req)
+                        {
                             !has_part && stable_ticks >= 2 && !req_pending
                         } else {
                             false
@@ -1430,6 +1613,13 @@ impl BidiConnection {
                             if !part_blocking && !req_pending {
                                 if zero_finalized {
                                     stable_ticks >= 1
+                                } else if download_end_supported {
+                                    // Wait for `browsingContext.downloadEnd` (matched via `download`,
+                                    // `filepath`, or `navigation`) or `.part` inode replacement rather than
+                                    // stealing Firefox's pre-move 0-byte placeholder under CI CPU load.
+                                    let since = zero_settle_since
+                                        .get_or_insert_with(tokio::time::Instant::now);
+                                    stable_ticks >= 5 && since.elapsed() >= DOWNLOAD_END_SAFETY_FALLBACK
                                 } else {
                                     let since = zero_settle_since
                                         .get_or_insert_with(tokio::time::Instant::now);
@@ -1446,11 +1636,10 @@ impl BidiConnection {
                         {
                             if zero_finalized {
                                 stable_ticks >= 1
-                            } else if is_http_url && download_end_supported && nav_id.is_some() {
-                                // When Content-Length is absent on Firefox 145+ (`downloadEnd` supported),
-                                // wait for `downloadEnd` or `.part` inode swap rather than timer-guessing.
-                                zero_settle_since = None;
-                                false
+                            } else if is_http_url && download_end_supported {
+                                let since =
+                                    zero_settle_since.get_or_insert_with(tokio::time::Instant::now);
+                                stable_ticks >= 5 && since.elapsed() >= DOWNLOAD_END_SAFETY_FALLBACK
                             } else {
                                 let settle = if is_http_url && expected_len.is_none() {
                                     Duration::from_millis(1000)
@@ -1494,11 +1683,42 @@ impl BidiConnection {
                 }
                 tokio::time::sleep(Duration::from_millis(15)).await;
             }
+
+            {
+                let mut counts = same_url_counts.lock();
+                if let Some(c) = counts.get_mut(&key) {
+                    *c = c.saturating_sub(1);
+                    if *c == 0 {
+                        counts.remove(&key);
+                    }
+                }
+            }
+            let nav_remaining = if let Some(ref nid) = nav_id {
+                let mut counts = nav_counts.lock();
+                if let Some(c) = counts.get_mut(nid) {
+                    *c = c.saturating_sub(1);
+                    let rem = *c;
+                    if rem == 0 {
+                        counts.remove(nid);
+                    }
+                    rem
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
             if let Some(conn) = weak_conn.upgrade() {
                 if let Some(ref rid) = bound_req_id {
                     conn.download_transfers_by_req_id.lock().remove(rid);
                 }
-                if let Some(ref nid) = nav_id {
+                if let Some(ref did) = dl_id {
+                    conn.download_ends_by_dl_id.lock().remove(did);
+                }
+                conn.download_ends_by_file.lock().remove(&safe_suggested);
+                if let Some(ref nid) = nav_id
+                    && nav_remaining == 0
+                {
                     conn.download_ends_by_nav.lock().remove(nid);
                 }
             }
@@ -7193,7 +7413,11 @@ mod tests {
             recent_content_disposition: Mutex::new(HashMap::new()),
             download_transfers_by_req_id: Mutex::new(HashMap::new()),
             pending_download_req_ids: Mutex::new(HashMap::new()),
+            download_ends_by_dl_id: Mutex::new(HashMap::new()),
             download_ends_by_nav: Mutex::new(HashMap::new()),
+            download_ends_by_file: Mutex::new(HashMap::new()),
+            active_download_nav_counts: Arc::new(Mutex::new(HashMap::new())),
+            active_same_url_counts: Arc::new(Mutex::new(HashMap::new())),
             download_end_supported: AtomicBool::new(false),
             process: AsyncMutex::new(None),
             _root_proxy_relay: Mutex::new(None),
@@ -7632,5 +7856,231 @@ mod tests {
         let relocated = std::fs::read(dest_dir.join("chunked4k.bin")).expect("read chunked4k.bin");
         assert_eq!(relocated.len(), 4096);
         assert_eq!(relocated, payload);
+    }
+
+    #[tokio::test]
+    async fn anchor_download_null_navigation_waits_for_late_finalization_without_leaking_pool_file() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool_dir = tmp.path().join("pool");
+        let dest_dir = tmp.path().join("dest");
+        std::fs::create_dir_all(&pool_dir).unwrap();
+
+        let conn = make_test_conn(pool_dir.clone());
+        conn.download_end_supported.store(true, Ordering::SeqCst);
+        let st = make_test_ctx_state(Some("uc-null-nav"), Some(dest_dir.clone()));
+        conn.contexts
+            .write()
+            .insert("cid-null-nav".into(), Arc::clone(&st));
+        conn.user_contexts
+            .write()
+            .insert("uc-null-nav".into(), Arc::clone(&st));
+
+        // Simulate `<a download="empty.bin">` (`navigation: null`, `Content-Length: 0`) where
+        // Firefox creates the 0-byte placeholder immediately, network.responseCompleted arrives
+        // in <1ms, and DownloadLegacySaver takes >350ms under 3-vCPU CI contention before opening/moving `.part`.
+        let url = "http://127.0.0.1:9999/download/empty.bin";
+        conn.record_download_network_event(
+            "network.beforeRequestSent",
+            Some("cid-null-nav"),
+            &json!({ "request": { "request": "r-empty", "url": url }, "navigation": Value::Null }),
+        );
+        conn.record_download_network_event(
+            "network.responseCompleted",
+            Some("cid-null-nav"),
+            &json!({
+                "request": { "request": "r-empty", "url": url },
+                "response": {
+                    "headers": [{ "name": "Content-Length", "value": { "type": "string", "value": "0" } }]
+                }
+            }),
+        );
+
+        let placeholder = pool_dir.join("empty.bin");
+        std::fs::write(&placeholder, b"").unwrap();
+        conn.handle_incoming(
+            &json!({
+                "type": "event",
+                "method": "browsingContext.downloadWillBegin",
+                "params": {
+                    "context": "cid-null-nav",
+                    "download": "dl-uuid-empty",
+                    "navigation": Value::Null,
+                    "url": url,
+                    "suggestedFilename": "empty.bin"
+                }
+            })
+            .to_string(),
+        );
+
+        // At 360ms (> old 250ms ZERO_BYTE_FALLBACK_SETTLE), placeholder must NOT be stolen early.
+        tokio::time::sleep(Duration::from_millis(360)).await;
+        assert!(
+            !dest_dir.join("empty.bin").exists(),
+            "must not steal unfinalized 0-byte placeholder before DownloadLegacySaver completes"
+        );
+
+        // Now Firefox's DownloadLegacySaver creates `.part`, moves onto `empty.bin`, and emits downloadEnd (`navigation: null`).
+        let late_part = pool_dir.join("late99.bin.part");
+        std::fs::write(&late_part, b"").unwrap();
+        std::fs::rename(&late_part, &placeholder).unwrap();
+        conn.handle_incoming(
+            &json!({
+                "type": "event",
+                "method": "browsingContext.downloadEnd",
+                "params": {
+                    "context": "cid-null-nav",
+                    "download": "dl-uuid-empty",
+                    "navigation": Value::Null,
+                    "status": "complete",
+                    "filepath": placeholder.to_string_lossy(),
+                    "url": url
+                }
+            })
+            .to_string(),
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !dest_dir.join("empty.bin").exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert!(dest_dir.join("empty.bin").exists(), "empty.bin must relocate once finalized");
+        assert!(
+            !placeholder.exists(),
+            "pool_download_dir must not retain empty.bin after late finalization"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_same_url_swapped_download_will_begin_and_shared_nav_preserve_ok_download() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let pool_dir = tmp.path().join("pool");
+        let dest_dir = tmp.path().join("dest");
+        std::fs::create_dir_all(&pool_dir).unwrap();
+
+        let conn = make_test_conn(pool_dir.clone());
+        conn.download_end_supported.store(true, Ordering::SeqCst);
+        let st = make_test_ctx_state(Some("uc-same"), Some(dest_dir.clone()));
+        conn.contexts
+            .write()
+            .insert("cid-same".into(), Arc::clone(&st));
+        conn.user_contexts
+            .write()
+            .insert("uc-same".into(), Arc::clone(&st));
+
+        let url = "http://127.0.0.1:9999/download/flaky-same.bin";
+        conn.record_download_network_event(
+            "network.beforeRequestSent",
+            Some("cid-same"),
+            &json!({ "request": { "request": "r-ok", "url": url }, "navigation": Value::Null }),
+        );
+        conn.record_download_network_event(
+            "network.beforeRequestSent",
+            Some("cid-same"),
+            &json!({ "request": { "request": "r-fail", "url": url }, "navigation": Value::Null }),
+        );
+
+        let ok_placeholder = pool_dir.join("ok.bin");
+        let fail_placeholder = pool_dir.join("fail.bin");
+        let ok_part = pool_dir.join("okpart12.bin.part");
+        std::fs::write(&ok_placeholder, b"").unwrap();
+        std::fs::write(&fail_placeholder, b"").unwrap();
+        std::fs::write(&ok_part, vec![0x11u8; 512]).unwrap();
+
+        // Worst-case race: `fail.bin` downloadWillBegin fires BEFORE `ok.bin`, swapping bound_req_ids,
+        // AND both report the same shared navigation ID `"shared-nav"`.
+        conn.handle_incoming(
+            &json!({
+                "type": "event",
+                "method": "browsingContext.downloadWillBegin",
+                "params": {
+                    "context": "cid-same",
+                    "download": "dl-fail",
+                    "navigation": "shared-nav",
+                    "url": url,
+                    "suggestedFilename": "fail.bin"
+                }
+            })
+            .to_string(),
+        );
+        conn.handle_incoming(
+            &json!({
+                "type": "event",
+                "method": "browsingContext.downloadWillBegin",
+                "params": {
+                    "context": "cid-same",
+                    "download": "dl-ok",
+                    "navigation": "shared-nav",
+                    "url": url,
+                    "suggestedFilename": "ok.bin"
+                }
+            })
+            .to_string(),
+        );
+
+        // `r-fail` aborts and `dl-fail` emits `downloadEnd(canceled)`.
+        conn.record_download_network_event(
+            "network.fetchError",
+            Some("cid-same"),
+            &json!({ "request": { "request": "r-fail", "url": url }, "errorText": "NS_ERROR_NET_PARTIAL_TRANSFER" }),
+        );
+        conn.handle_incoming(
+            &json!({
+                "type": "event",
+                "method": "browsingContext.downloadEnd",
+                "params": {
+                    "context": "cid-same",
+                    "download": "dl-fail",
+                    "navigation": "shared-nav",
+                    "status": "canceled",
+                    "url": url
+                }
+            })
+            .to_string(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        // Now `r-ok` completes 4096B into `ok.bin` and emits `downloadEnd(complete)`.
+        let ok_bytes = vec![0x5Au8; 4096];
+        std::fs::write(&ok_part, &ok_bytes).unwrap();
+        std::fs::rename(&ok_part, &ok_placeholder).unwrap();
+        conn.record_download_network_event(
+            "network.responseCompleted",
+            Some("cid-same"),
+            &json!({
+                "request": { "request": "r-ok", "url": url },
+                "response": {
+                    "headers": [{ "name": "Content-Length", "value": { "type": "string", "value": "4096" } }]
+                }
+            }),
+        );
+        conn.handle_incoming(
+            &json!({
+                "type": "event",
+                "method": "browsingContext.downloadEnd",
+                "params": {
+                    "context": "cid-same",
+                    "download": "dl-ok",
+                    "navigation": "shared-nav",
+                    "status": "complete",
+                    "filepath": ok_placeholder.to_string_lossy(),
+                    "url": url
+                }
+            })
+            .to_string(),
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !dest_dir.join("ok.bin").exists() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert_eq!(
+            std::fs::read(dest_dir.join("ok.bin")).expect("ok.bin relocated"),
+            ok_bytes
+        );
+        assert!(
+            !dest_dir.join("fail.bin").exists(),
+            "aborted fail.bin must never relocate"
+        );
+        assert!(!fail_placeholder.exists(), "fail.bin placeholder cleaned up");
     }
 }

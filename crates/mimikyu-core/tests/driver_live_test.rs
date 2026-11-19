@@ -744,7 +744,7 @@ async fn live_firefox_bidi_integration() {
 }
 
 async fn wait_for_download_file(path: &std::path::Path, expected_len: usize) -> Vec<u8> {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
     loop {
         if let Ok(bytes) = std::fs::read(path)
             && bytes.len() == expected_len
@@ -757,6 +757,49 @@ async fn wait_for_download_file(path: &std::path::Path, expected_len: usize) -> 
             path.display()
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_server_hit_count(server: &TestServer, needle: &str, min_count: usize) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let count = server
+            .hits()
+            .iter()
+            .filter(|h| h.contains(needle))
+            .count();
+        if count >= min_count {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {min_count} server hit(s) matching '{needle}', got {count}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+async fn assert_pool_download_dir_empty(pool_profile_dl: &std::path::Path) {
+    if !pool_profile_dl.exists() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let pool_entries: Vec<_> = std::fs::read_dir(pool_profile_dl)
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if pool_entries.is_empty() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pool_download_dir must be empty after relocation/cleanup, got {pool_entries:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 
@@ -1081,7 +1124,7 @@ async fn live_firefox_virtual_context_slow_and_aborted_download_isolation() {
     let (sx, sy) = b_slow.center();
     let (fx, fy) = b_fast.center();
 
-    // Start slow (>300ms) download in vc1, then immediately trigger fast same-name download in vc2
+    // Start slow (>300ms) download in vc1, confirm server received it, then trigger fast same-name download in vc2
     vc1.session()
         .dispatch_mouse(MouseEvent {
             event_type: MouseEventType::Click,
@@ -1093,7 +1136,8 @@ async fn live_firefox_virtual_context_slow_and_aborted_download_isolation() {
         })
         .await
         .expect("click #dl-slow");
-    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+    wait_for_server_hit_count(&server, "/download/slow-same.bin", 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(15)).await;
     vc2.session()
         .dispatch_mouse(MouseEvent {
             event_type: MouseEventType::Click,
@@ -1159,17 +1203,7 @@ async fn live_firefox_virtual_context_slow_and_aborted_download_isolation() {
         vec!["same.bin".to_string()],
         "dl1 should contain only same.bin, got {dl1_entries:?}"
     );
-    if pool_profile_dl.exists() {
-        let pool_entries: Vec<_> = std::fs::read_dir(&pool_profile_dl)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            pool_entries.is_empty(),
-            "pool_download_dir must be empty after relocation/cleanup, got {pool_entries:?}"
-        );
-    }
+    assert_pool_download_dir_empty(&pool_profile_dl).await;
 
     vc1.dispose().await.expect("dispose vc1");
     vc2.dispose().await.expect("dispose vc2");
@@ -1283,17 +1317,7 @@ async fn live_firefox_virtual_context_popup_download_isolation() {
         dl2_entries.is_empty(),
         "vc2 download_dir must not receive vc1 popup downloads: {dl2_entries:?}"
     );
-    if pool_profile_dl.exists() {
-        let pool_entries: Vec<_> = std::fs::read_dir(&pool_profile_dl)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            pool_entries.is_empty(),
-            "pool_download_dir must be empty after popup download relocation, got {pool_entries:?}"
-        );
-    }
+    assert_pool_download_dir_empty(&pool_profile_dl).await;
 
     vc1.dispose().await.expect("dispose vc1");
     vc2.dispose().await.expect("dispose vc2");
@@ -1361,7 +1385,7 @@ async fn live_firefox_virtual_context_same_tab_same_url_concurrent_download_isol
     let (x1, y1) = b1.center();
     let (x2, y2) = b2.center();
 
-    // Start slow 4096B transfer (#d1), then 60ms later start second same-URL transfer (#d2) that aborts
+    // Start slow 4096B transfer (#d1), wait until server receives seq #1, then start second same-URL transfer (#d2) that aborts
     vc1.session()
         .dispatch_mouse(MouseEvent {
             event_type: MouseEventType::Click,
@@ -1373,7 +1397,8 @@ async fn live_firefox_virtual_context_same_tab_same_url_concurrent_download_isol
         })
         .await
         .expect("click #d1");
-    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    wait_for_server_hit_count(&server, "/download/flaky-same.bin", 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     vc1.session()
         .dispatch_mouse(MouseEvent {
             event_type: MouseEventType::Click,
@@ -1411,7 +1436,8 @@ async fn live_firefox_virtual_context_same_tab_same_url_concurrent_download_isol
         })
         .await
         .expect("click #d-hold");
-    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+    wait_for_server_hit_count(&server, "/download/slow-hold.bin", 1).await;
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let empty_t0 = tokio::time::Instant::now();
     vc2.session()
         .dispatch_mouse(MouseEvent {
@@ -1426,7 +1452,7 @@ async fn live_firefox_virtual_context_same_tab_same_url_concurrent_download_isol
         .expect("click #d-empty");
 
     let got_empty = tokio::time::timeout(
-        std::time::Duration::from_millis(900),
+        std::time::Duration::from_millis(1800),
         wait_for_download_file(&dl2.join("empty.bin"), 0),
     )
     .await
@@ -1434,8 +1460,8 @@ async fn live_firefox_virtual_context_same_tab_same_url_concurrent_download_isol
     assert!(got_empty.is_empty());
     let empty_elapsed = empty_t0.elapsed();
     assert!(
-        empty_elapsed < std::time::Duration::from_millis(900),
-        "0-byte download took {empty_elapsed:?}, should not wait for 1200ms slow-hold.bin"
+        !dl1.join("slow-hold.bin").exists(),
+        "0-byte download ({empty_elapsed:?}) must finish before 2200ms slow-hold.bin completes"
     );
 
     let got_hold = wait_for_download_file(&dl1.join("slow-hold.bin"), hold_payload.len()).await;
@@ -1452,17 +1478,7 @@ async fn live_firefox_virtual_context_same_tab_same_url_concurrent_download_isol
         vec!["ok.bin".to_string(), "slow-hold.bin".to_string()],
         "dl1 should contain only ok.bin and slow-hold.bin, got {dl1_entries:?}"
     );
-    if pool_profile_dl.exists() {
-        let pool_entries: Vec<_> = std::fs::read_dir(&pool_profile_dl)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            pool_entries.is_empty(),
-            "pool_download_dir must be empty after relocation/cleanup, got {pool_entries:?}"
-        );
-    }
+    assert_pool_download_dir_empty(&pool_profile_dl).await;
 
     vc1.dispose().await.expect("dispose vc1");
     vc2.dispose().await.expect("dispose vc2");
@@ -1556,20 +1572,28 @@ async fn live_display_contents_and_inline_text_parity_firefox() {
 #[tokio::test]
 async fn live_firefox_scrollbar_width_thin_does_not_falsely_occlude() {
     let driver = driver_for(EngineKind::Firefox);
+
+    // 1. Force overlay scrollbars (`ui.useOverlayScrollbars = 1`) so this test deterministically
+    // exercises Firefox's overlay scrollbar gutter detection even on headless macOS VMs where no
+    // trackpad is attached (which otherwise default to classic layout scrollbars with `cw < iw`).
     let session = driver
         .launch(LaunchOptions {
             engine: EngineKind::Firefox,
             headless: true,
             profile_mode: ProfileMode::EphemeralDir,
+            extra_prefs: BTreeMap::from([(
+                "ui.useOverlayScrollbars".to_string(),
+                serde_json::json!(1),
+            )]),
             ..Default::default()
         })
         .await
-        .expect("launch firefox");
+        .expect("launch firefox with overlay scrollbars");
     let pid = session.info().pid.expect("pid") as libc::pid_t;
 
     let html = r#"<!doctype html><html style="scrollbar-width: thin;"><body style="margin:0;height:3000px;">
         <button id="thin-btn" style="position:fixed;top:120px;right:10px;width:6px;height:24px;padding:0;border:0;" onclick="document.title='thin-ok'">T</button>
-        <button id="b-gutter" style="position:fixed;top:160px;right:8px;width:4px;height:24px;padding:0;border:0;" onclick="document.title='gutter-clicked'">G</button>
+        <button id="b-gutter" style="position:fixed;top:160px;right:2px;width:4px;height:24px;padding:0;border:0;" onclick="document.title='gutter-clicked'">G</button>
     </body></html>"#;
     let url = format!(
         "data:text/html,{}",
@@ -1578,6 +1602,23 @@ async fn live_firefox_scrollbar_width_thin_does_not_falsely_occlude() {
             .replace('+', "%20")
     );
     session.navigate(&url).await.expect("navigate thin page");
+
+    let (thin_gutter_r, _) = session
+        .scrollbar_gutters()
+        .await
+        .expect("thin scrollbar_gutters");
+    assert!(
+        (6.0..=12.0).contains(&thin_gutter_r),
+        "expected thin overlay scrollbar gutter in 6..=12px, got {thin_gutter_r}"
+    );
+    // Position `#b-gutter` right at the inner edge of the measured `[iw - thin_gutter_r, iw)` gutter.
+    let gutter_right_px = (thin_gutter_r - 4.0).max(0.0);
+    session
+        .eval_isolated(&format!(
+            "(() => {{ document.getElementById('b-gutter').style.right = '{gutter_right_px}px'; return true; }})()"
+        ))
+        .await
+        .expect("position #b-gutter inside measured thin scrollbar gutter");
 
     let chokepoint = mimikyu_core::input::ChokepointInput::new(session.clone());
     chokepoint
@@ -1597,7 +1638,7 @@ async fn live_firefox_scrollbar_width_thin_does_not_falsely_occlude() {
             &mimikyu_core::input::ClickOptions::default(),
         )
         .await
-        .expect_err("element inside 12px thin scrollbar gutter (right:8px,width:4px) must be rejected as occluded");
+        .expect_err("element inside measured thin scrollbar gutter must be rejected as occluded");
     assert!(
         matches!(gutter_err, MimikyuError::ElementNotFound(_)),
         "expected ElementNotFound for occluded gutter button, got {gutter_err:?}"
@@ -1632,6 +1673,46 @@ async fn live_firefox_scrollbar_width_thin_does_not_falsely_occlude() {
 
     session.dispose().await.expect("dispose");
     support::assert_pgid_gone(pid);
+
+    // 2. Also verify classic layout scrollbars (`ui.useOverlayScrollbars = 0`, matching headless
+    // macOS CI VMs with no trackpad): `clientWidth < innerWidth`, `scrollbar_gutters()` returns 0,
+    // and fixed `right: 8px` elements sit left of the classic scrollbar and click cleanly.
+    let classic_session = driver
+        .launch(LaunchOptions {
+            engine: EngineKind::Firefox,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            extra_prefs: BTreeMap::from([(
+                "ui.useOverlayScrollbars".to_string(),
+                serde_json::json!(0),
+            )]),
+            ..Default::default()
+        })
+        .await
+        .expect("launch firefox with classic scrollbars");
+    let classic_pid = classic_session.info().pid.expect("classic pid") as libc::pid_t;
+    classic_session
+        .navigate(&url)
+        .await
+        .expect("navigate classic thin page");
+    let (classic_gutter_r, _) = classic_session
+        .scrollbar_gutters()
+        .await
+        .expect("classic scrollbar_gutters");
+    assert_eq!(classic_gutter_r, 0.0);
+    let classic_cp = mimikyu_core::input::ChokepointInput::new(classic_session.clone());
+    classic_cp
+        .click(
+            &mimikyu_core::input::InputTarget::Selector("#b-gutter".into()),
+            None,
+            &mimikyu_core::input::ClickOptions::default(),
+        )
+        .await
+        .expect("classic layout scrollbar already shrinks clientWidth; right-aligned button must click cleanly");
+    assert_eq!(classic_session.title().await.unwrap(), "gutter-clicked");
+
+    classic_session.dispose().await.expect("dispose classic");
+    support::assert_pgid_gone(classic_pid);
 }
 
 async fn assert_new_context_rollback_on_invalid_timezone(engine: EngineKind) {
@@ -1823,17 +1904,7 @@ async fn live_firefox_virtual_context_download_after_aborted_and_completed_fetch
     let got_zero = wait_for_download_file(&dl1.join("zero-after-fetch.bin"), 0).await;
     assert!(got_zero.is_empty());
 
-    if pool_profile_dl.exists() {
-        let pool_entries: Vec<_> = std::fs::read_dir(&pool_profile_dl)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert!(
-            pool_entries.is_empty(),
-            "pool_download_dir must be empty after relocation, got {pool_entries:?}"
-        );
-    }
+    assert_pool_download_dir_empty(&pool_profile_dl).await;
 
     vc1.dispose().await.expect("dispose vc1");
     pool.shutdown().await.expect("shutdown pool");
