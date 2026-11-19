@@ -1,0 +1,31 @@
+# ============================================================================
+# Mimikyu Code Ownership Configuration
+# ============================================================================
+# ACTION REQUIRED BEFORE PUBLIC LAUNCH (see docs/OPEN_SOURCE_PROCEDURES.md):
+# Replace `@<your-github-username>` below with your actual GitHub handle (or
+# team handle `@<org>/core-maintainers`) and uncomment the ownership rules.
+#
+# Lines remain commented until configured so GitHub does not report invalid
+# placeholder syntax before your username is set.
+# ============================================================================
+
+# Default owner for everything in the repository
+# *                                              @<your-github-username>
+
+# Core protocol drivers, isolation, and process/security boundaries
+# /crates/mimikyu-core/src/driver/               @<your-github-username>
+# /crates/mimikyu-core/src/isolation/            @<your-github-username>
+# /crates/mimikyu-core/src/process.rs            @<your-github-username>
+# /crates/mimikyu-core/src/discovery.rs          @<your-github-username>
+# /crates/mimikyu-core/src/daemon/               @<your-github-username>
+# /crates/mimikyu-core/src/env_profile/          @<your-github-username>
+# /crates/mimikyu-core/src/mcp/                  @<your-github-username>
+
+# Release automation, installer, supply-chain policy, and governance
+# /.github/                                      @<your-github-username>
+# /scripts/                                      @<your-github-username>
+# /packaging/                                    @<your-github-username>
+# /install.sh                                    @<your-github-username>
+# /deny.toml                                     @<your-github-username>
+# /SECURITY.md                                   @<your-github-username>
+# /ARCHITECTURE.md                               @<your-github-username>

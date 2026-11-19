@@ -1,0 +1,53 @@
+name: "Feature Request"
+description: "Propose an ergonomic agentic primitive, CLI/MCP enhancement, or dual-engine improvement"
+title: "[Feat]: "
+labels:
+  - "enhancement"
+  - "triage"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Have an idea to make `mimikyu` faster, cleaner, or more token-efficient for AI agents? Let's design it!
+        Please review `ARCHITECTURE.md` and `SECURITY.md` before submitting. Proposals for CAPTCHA solvers, proof-of-work crackers, or anti-bot gate bypasses (Requirement R3) are out of scope.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: "Agent Workflow / Problem Statement"
+      description: "What concrete agentic workflow, latency bottleneck, or developer pain point does this solve?"
+      placeholder: "When an agent inspects a table with merged headers..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: "Proposed CLI / MCP / Core Interface"
+      description: "Sketch the ideal CLI flags, `--json` output shape, MCP tool parameters, or `mimikyu-core` API."
+      placeholder: "mimikyu extract tables --include-headers --json"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: engine_scope
+    attributes:
+      label: "Dual-Engine Parity Impact (`DriverSession`)"
+      description: "Can this be supported cleanly across both Chromium (CDP) and Firefox (WebDriver BiDi)?"
+      options:
+        - "Yes — supported in both Chromium CDP and Firefox WebDriver BiDi"
+        - "Engine-agnostic (lives above `DriverSession` in snapshot/extract/cli/mcp/daemon)"
+        - "Single-engine capability (requires `DriverCapabilities` gating — explain above)"
+        - "Not sure yet"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: scope_check
+    attributes:
+      label: "Scope & Architecture Alignment"
+      options:
+        - label: "This proposal complies with the R3 scope boundary (`SECURITY.md` — no CAPTCHA solvers, challenge crackers, or gate bypasses)."
+          required: true
+        - label: "This proposal can be implemented cleanly within `ARCHITECTURE.md` boundaries (`DriverSession` / `ChokepointInput`)."
+          required: true

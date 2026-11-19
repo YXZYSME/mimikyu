@@ -1,0 +1,87 @@
+name: "Bug Report"
+description: "Report a reproducible bug in mimikyu CLI, Daemon, MCP server, or CDP/BiDi browser drivers"
+title: "[Bug]: "
+labels:
+  - "bug"
+  - "triage"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping sharpen `mimikyu`!
+        - **Security vulnerabilities**: Do **not** file a public issue. Use Private Vulnerability Reporting (`SECURITY.md`).
+        - **Scope boundary (R3)**: Issues involving CAPTCHA solvers, human-verification challenges, or anti-bot gate bypasses are out of scope and closed immediately.
+
+  - type: input
+    id: version
+    attributes:
+      label: "Mimikyu Version"
+      description: "Output of `mimikyu --version` (or git commit SHA if built from source)"
+      placeholder: "mimikyu 0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: engine
+    attributes:
+      label: "Browser Engine"
+      description: "Which engine(s) exhibit the issue?"
+      options:
+        - "Chromium (CDP)"
+        - "Firefox (WebDriver BiDi)"
+        - "Both Chromium and Firefox"
+        - "N/A (CLI / Daemon / Installer / Build)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: "Operating System & Architecture"
+      options:
+        - "macOS (Apple Silicon / aarch64)"
+        - "macOS (Intel / x86_64)"
+        - "Linux (x86_64)"
+        - "Linux (aarch64)"
+        - "Other (specify in diagnostics)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: "Environment Diagnostics (`mimikyu doctor --json`)"
+      description: "Paste the output of `mimikyu doctor --json` (redact any personal home directory paths first)."
+      render: json
+    validations:
+      required: false
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: "Minimal Reproduction Steps"
+      description: "Exact CLI commands, MCP tool payload, or self-contained local HTML snippet reproducing the issue."
+      placeholder: |
+        1. `mimikyu --session repro session new --virtual --engine chromium`
+        2. `mimikyu --session repro open http://127.0.0.1:8080/...`
+        3. `mimikyu --session repro snapshot --interactive-only`
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_actual
+    attributes:
+      label: "Expected vs. Actual Behavior"
+      description: "What should happen vs. what actually happened (include error messages or `--json` envelopes)?"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: "Pre-Flight Checks"
+      options:
+        - label: "I redacted any personal host paths, cookies, proxy credentials, and secrets from this report."
+          required: true
+        - label: "This report respects the R3 scope boundary (`SECURITY.md`) and is not a security vulnerability disclosure."
+          required: true
