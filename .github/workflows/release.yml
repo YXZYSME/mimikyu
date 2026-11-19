@@ -170,7 +170,7 @@ jobs:
             packaging/homebrew/mimikyu.rb > release-assets/mimikyu.rb
 
       - name: Attest SLSA build provenance for release artifacts
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v4
         with:
           subject-path: |
             release-assets/mimikyu-*.tar.gz
