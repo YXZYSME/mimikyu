@@ -198,7 +198,26 @@ pub async fn wait_idle(
                     match tokio::time::timeout(
                         rem,
                         session.eval_isolated(
-                            "new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))",
+                            r#"new Promise((resolve) => {
+                                let settled = false;
+                                const finish = () => {
+                                    if (!settled) {
+                                        settled = true;
+                                        resolve(true);
+                                    }
+                                };
+                                if (document.hidden || document.visibilityState === "hidden" || typeof requestAnimationFrame !== "function") {
+                                    setTimeout(() => setTimeout(finish, 16), 16);
+                                    return;
+                                }
+                                const fallback = setTimeout(finish, 50);
+                                requestAnimationFrame(() => {
+                                    requestAnimationFrame(() => {
+                                        clearTimeout(fallback);
+                                        finish();
+                                    });
+                                });
+                            })"#,
                         ),
                     )
                     .await

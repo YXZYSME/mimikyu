@@ -14,7 +14,7 @@ pub use presets::{PresetKind, PresetProfile};
 pub use proxy_relay::ProxyRelay;
 pub use scripts::{
     build_firefox_shared_worker_network_clear_script, build_firefox_shared_worker_network_script,
-    build_window_init_script, build_worker_init_script,
+    build_webrtc_no_host_init_script, build_window_init_script, build_worker_init_script,
 };
 
 use crate::driver::{EngineKind, EnvProfile, GeolocationConfig, WebRtcPolicy};

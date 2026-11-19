@@ -480,10 +480,7 @@ pub fn build_chromium_args(
 
     match effective_webrtc_policy(opts) {
         WebRtcPolicy::Default => {}
-        WebRtcPolicy::DisableNonProxiedUdp => {
-            args.push("--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string());
-        }
-        WebRtcPolicy::DisableAll => {
+        WebRtcPolicy::DisableNonProxiedUdp | WebRtcPolicy::DisableAll => {
             args.push("--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string());
             args.push("--enforce-webrtc-ip-permission-check".to_string());
         }
@@ -1404,7 +1401,7 @@ mod tests {
             args_virtual.contains(&"--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string()),
             "expected disable_non_proxied_udp flag for VirtualContext: {args_virtual:?}"
         );
-        assert!(!args_virtual.contains(&"--enforce-webrtc-ip-permission-check".to_string()));
+        assert!(args_virtual.contains(&"--enforce-webrtc-ip-permission-check".to_string()));
         assert!(!args_virtual.iter().any(|a| a.starts_with("--lang=")));
         assert!(!args_virtual.contains(&"--no-proxy-server".to_string()));
 
@@ -1428,6 +1425,7 @@ mod tests {
         let args_proxied = build_chromium_args(&hs, &opts_proxied, Path::new("/tmp/prof"));
         assert!(args_proxied
             .contains(&"--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string()));
+        assert!(args_proxied.contains(&"--enforce-webrtc-ip-permission-check".to_string()));
 
         // 3. EphemeralDir with no proxy and env_profile: None stays Default
         let opts_plain = LaunchOptions {
@@ -1442,6 +1440,7 @@ mod tests {
         assert!(!args_plain
             .iter()
             .any(|a| a.starts_with("--force-webrtc-ip-handling-policy")));
+        assert!(!args_plain.contains(&"--enforce-webrtc-ip-permission-check".to_string()));
 
         // 4. Firefox VirtualContext with env_profile: None writes ICE no-host prefs without disabling RTCPeerConnection or UA/locale
         let dir = tempfile::tempdir().unwrap();

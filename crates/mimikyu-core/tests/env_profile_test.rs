@@ -3574,3 +3574,146 @@ async fn ephemeral_popup_close_then_immediate_set_env_overrides_chromium() {
 async fn ephemeral_popup_close_then_immediate_set_env_overrides_firefox() {
     assert_ephemeral_popup_close_then_immediate_set_env_overrides(EngineKind::Firefox).await;
 }
+
+async fn assert_webrtc_host_candidate_suppression(engine: EngineKind) {
+    let server = TestServer::start().await;
+    let profile = EnvProfileBuilder::from_preset(PresetKind::MacOs, engine)
+        .webrtc(WebRtcPolicy::DisableNonProxiedUdp)
+        .build()
+        .expect("valid macos DisableNonProxiedUdp profile");
+
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            main_world_eval: true,
+            env_profile: Some(profile),
+            ..Default::default()
+        })
+        .await
+        .expect("launch with DisableNonProxiedUdp");
+    let pid = session.info().pid.expect("pid");
+
+    session
+        .navigate(&server.url("/target"))
+        .await
+        .expect("navigate /target");
+
+    let probe_js = r#"(() => new Promise(async (resolve) => {
+        const PC = window.RTCPeerConnection || window.webkitRTCPeerConnection || window.mozRTCPeerConnection;
+        if (!PC) {
+            return resolve({ status: "unavailable", hasHostCandidate: false });
+        }
+        const pc = new PC({ iceServers: [] });
+        const onIceSeen = [];
+        const addElSeen = [];
+        let onceSeen = null;
+
+        const fn = (ev) => {
+            onIceSeen.push(ev && ev.candidate ? ev.candidate.candidate : null);
+        };
+        pc.onicecandidate = fn;
+        const getterMatches = pc.onicecandidate === fn;
+
+        pc.addEventListener("icecandidate", (ev) => {
+            addElSeen.push(ev && ev.candidate ? ev.candidate.candidate : null);
+        });
+        pc.addEventListener("icecandidate", (ev) => {
+            onceSeen = ev && ev.candidate ? ev.candidate.candidate : "EOF";
+        }, { once: true });
+
+        // Simulate raw-IP typ host ICE event (as emitted on Linux without mDNS) followed by srflx.
+        const hostEv = Object.assign(new Event("icecandidate"), {
+            candidate: {
+                candidate: "candidate:1 1 tcp 1518280447 10.1.0.5 9 typ host tcptype active",
+                type: "host",
+            },
+        });
+        pc.dispatchEvent(hostEv);
+
+        const srflxEv = Object.assign(new Event("icecandidate"), {
+            candidate: {
+                candidate: "candidate:2 1 udp 1686052607 203.0.113.9 54321 typ srflx raddr 0.0.0.0 rport 0",
+                type: "srflx",
+            },
+        });
+        pc.dispatchEvent(srflxEv);
+
+        // Also run real ICE gathering via createOffer + setLocalDescription
+        const realCands = [];
+        const pc2 = new PC({ iceServers: [] });
+        pc2.createDataChannel("probe");
+        const realDone = new Promise((r) => {
+            const t = setTimeout(() => r("timeout"), 1200);
+            pc2.onicecandidate = (ev) => {
+                if (ev && ev.candidate && ev.candidate.candidate) {
+                    realCands.push(ev.candidate.candidate);
+                } else if (!ev.candidate) {
+                    clearTimeout(t);
+                    r("ok");
+                }
+            };
+        });
+        const offer = await pc2.createOffer();
+        await pc2.setLocalDescription(offer);
+        const gatherStatus = await realDone;
+        const sdp = pc2.localDescription ? pc2.localDescription.sdp : "";
+        pc.close();
+        pc2.close();
+
+        const anyHostInReal = realCands.some((c) => /\btyp\s+host\b/i.test(c));
+        const anyHostInSdp = sdp.split(/\r?\n/).some((l) => /^a=candidate:/i.test(l) && /\btyp\s+host\b/i.test(l));
+        resolve({
+            status: gatherStatus,
+            getterMatches,
+            onIceSeen,
+            addElSeen,
+            onceSeen,
+            realCands,
+            hasHostCandidate: anyHostInReal || anyHostInSdp,
+        });
+    }))()"#;
+
+    let res = session
+        .eval_main_world(probe_js)
+        .await
+        .expect("eval WebRTC host-candidate probe");
+    assert_eq!(res["getterMatches"], true, "{engine}: {res:?}");
+    assert_eq!(
+        res["onIceSeen"],
+        serde_json::json!([
+            "candidate:2 1 udp 1686052607 203.0.113.9 54321 typ srflx raddr 0.0.0.0 rport 0"
+        ]),
+        "{engine}: synthetic typ host must be filtered from onicecandidate while srflx passes: {res:?}"
+    );
+    assert_eq!(
+        res["addElSeen"],
+        serde_json::json!([
+            "candidate:2 1 udp 1686052607 203.0.113.9 54321 typ srflx raddr 0.0.0.0 rport 0"
+        ]),
+        "{engine}: synthetic typ host must be filtered from addEventListener while srflx passes: {res:?}"
+    );
+    assert_eq!(
+        res["onceSeen"],
+        "candidate:2 1 udp 1686052607 203.0.113.9 54321 typ srflx raddr 0.0.0.0 rport 0",
+        "{engine}: once listener must not be consumed by suppressed typ host event: {res:?}"
+    );
+    assert_eq!(
+        res["hasHostCandidate"], false,
+        "{engine}: real ICE gathering or SDP leaked typ host candidate: {res:?}"
+    );
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn webrtc_host_candidate_suppression_chromium() {
+    assert_webrtc_host_candidate_suppression(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn webrtc_host_candidate_suppression_firefox() {
+    assert_webrtc_host_candidate_suppression(EngineKind::Firefox).await;
+}

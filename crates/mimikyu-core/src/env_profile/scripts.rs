@@ -36,6 +36,10 @@ pub fn build_window_init_script(profile: &EnvProfile, engine: EngineKind) -> Str
       hookedGlProtos: new WeakSet(),
       hookedCanvasProtos: new WeakSet(),
       hookedRtcWins: new WeakSet(),
+      hookedRtcProtos: new WeakSet(),
+      rtcOnIceMap: new WeakMap(),
+      rtcCapListeners: new WeakMap(),
+      rtcBubListeners: new WeakMap(),
       hookedDomRealms: new WeakSet(),
       hookedUrls: new WeakSet(),
       origUrlRevoke: new WeakMap(),
@@ -378,11 +382,168 @@ pub fn build_window_init_script(profile: &EnvProfile, engine: EngineKind) -> Str
 
     if (!targetState.hookedRtcWins.has(win)) {{
       targetState.hookedRtcWins.add(win);
+      if (!targetState.hookedRtcProtos) targetState.hookedRtcProtos = new WeakSet();
+      if (!targetState.rtcOnIceMap) targetState.rtcOnIceMap = new WeakMap();
+      if (!targetState.rtcCapListeners) targetState.rtcCapListeners = new WeakMap();
+      if (!targetState.rtcBubListeners) targetState.rtcBubListeners = new WeakMap();
       const DomExc = win.DOMException || DOMException;
+      const isHostCand = (cand) => {{
+        if (!cand) return false;
+        try {{
+          if (cand.type === 'host') return true;
+          const s = typeof cand.candidate === 'string' ? cand.candidate : '';
+          if (/\btyp\s+host\b/i.test(s)) return true;
+        }} catch {{}}
+        return false;
+      }};
+      const stripHostSdp = (sdp) => {{
+        if (typeof sdp !== 'string' || !sdp) return sdp;
+        return sdp
+          .split(/\r?\n/)
+          .filter((line) => !(/^a=candidate:/i.test(line) && /\btyp\s+host\b/i.test(line)))
+          .join('\r\n');
+      }};
+      const patchRtcProto = (rtcProto) => {{
+        if (!rtcProto || targetState.hookedRtcProtos.has(rtcProto)) return;
+        targetState.hookedRtcProtos.add(rtcProto);
+        const origAdd = rtcProto.addEventListener;
+        const origRem = rtcProto.removeEventListener;
+        try {{
+          const onIceDesc = Object.getOwnPropertyDescriptor(rtcProto, 'onicecandidate');
+          if (onIceDesc && typeof onIceDesc.set === 'function' && typeof origAdd === 'function' && typeof origRem === 'function') {{
+            const origSet = onIceDesc.set;
+            const onIceWrapMap = new WeakMap();
+            Object.defineProperty(rtcProto, 'onicecandidate', {{
+              get() {{
+                return targetState.rtcOnIceMap.has(this)
+                  ? targetState.rtcOnIceMap.get(this)
+                  : null;
+              }},
+              set(fn) {{
+                try {{ origSet.call(this, null); }} catch {{}}
+                const prevWrap = onIceWrapMap.get(this);
+                if (prevWrap) {{
+                  try {{ origRem.call(this, 'icecandidate', prevWrap); }} catch {{}}
+                  onIceWrapMap.delete(this);
+                }}
+                if (typeof fn !== 'function') {{
+                  targetState.rtcOnIceMap.set(this, null);
+                  return;
+                }}
+                targetState.rtcOnIceMap.set(this, fn);
+                const wrap = function(ev) {{
+                  if (targetState.cfg && targetState.cfg.noHostWebRtc && ev && ev.candidate && isHostCand(ev.candidate)) {{
+                    return;
+                  }}
+                  return fn.call(this, ev);
+                }};
+                onIceWrapMap.set(this, wrap);
+                origAdd.call(this, 'icecandidate', wrap);
+              }},
+              enumerable: onIceDesc.enumerable,
+              configurable: true
+            }});
+          }}
+        }} catch {{}}
+        try {{
+          if (typeof origAdd === 'function' && typeof origRem === 'function') {{
+            Object.defineProperty(rtcProto, 'addEventListener', {{
+              value: function(type, listener, options) {{
+                if (String(type) !== 'icecandidate' || (!listener || (typeof listener !== 'function' && typeof listener !== 'object'))) {{
+                  return origAdd.apply(this, arguments);
+                }}
+                const isCap = typeof options === 'boolean' ? options : Boolean(options && options.capture);
+                const isOnce = Boolean(options && typeof options === 'object' && options.once);
+                const store = isCap ? targetState.rtcCapListeners : targetState.rtcBubListeners;
+                let map = store.get(this);
+                if (!map) {{
+                  map = new WeakMap();
+                  store.set(this, map);
+                }}
+                let wrapped = map.get(listener);
+                if (!wrapped) {{
+                  wrapped = function(ev) {{
+                    if (targetState.cfg && targetState.cfg.noHostWebRtc && ev && ev.candidate && isHostCand(ev.candidate)) {{
+                      return;
+                    }}
+                    if (isOnce) {{
+                      map.delete(listener);
+                      try {{ origRem.call(this, type, wrapped, isCap); }} catch {{}}
+                    }}
+                    if (typeof listener === 'function') {{
+                      return listener.call(this, ev);
+                    }}
+                    if (listener && typeof listener.handleEvent === 'function') {{
+                      return listener.handleEvent(ev);
+                    }}
+                  }};
+                  map.set(listener, wrapped);
+                }}
+                const passOpts = (isOnce && options && typeof options === 'object')
+                  ? Object.assign({{}}, options, {{ once: false }})
+                  : options;
+                return arguments.length > 2
+                  ? origAdd.call(this, type, wrapped, passOpts)
+                  : origAdd.call(this, type, wrapped);
+              }},
+              configurable: true,
+              writable: true,
+              enumerable: true
+            }});
+            Object.defineProperty(rtcProto, 'removeEventListener', {{
+              value: function(type, listener, options) {{
+                if (String(type) === 'icecandidate' && listener && (typeof listener === 'function' || typeof listener === 'object')) {{
+                  const isCap = typeof options === 'boolean' ? options : Boolean(options && options.capture);
+                  const store = isCap ? targetState.rtcCapListeners : targetState.rtcBubListeners;
+                  const map = store.get(this);
+                  const wrapped = map ? map.get(listener) : null;
+                  if (wrapped) {{
+                    map.delete(listener);
+                    return arguments.length > 2
+                      ? origRem.call(this, type, wrapped, options)
+                      : origRem.call(this, type, wrapped);
+                  }}
+                }}
+                return origRem.apply(this, arguments);
+              }},
+              configurable: true,
+              writable: true,
+              enumerable: true
+            }});
+          }}
+        }} catch {{}}
+        for (const descProp of ['localDescription', 'currentLocalDescription', 'pendingLocalDescription']) {{
+          try {{
+            const d = Object.getOwnPropertyDescriptor(rtcProto, descProp);
+            if (d && typeof d.get === 'function') {{
+              const origDescGet = d.get;
+              Object.defineProperty(rtcProto, descProp, {{
+                get() {{
+                  const val = origDescGet.call(this);
+                  if (!val || !(targetState.cfg && targetState.cfg.noHostWebRtc) || typeof val.sdp !== 'string') {{
+                    return val;
+                  }}
+                  const cleaned = stripHostSdp(val.sdp);
+                  if (cleaned === val.sdp) return val;
+                  try {{
+                    if (typeof win.RTCSessionDescription === 'function') {{
+                      return new win.RTCSessionDescription({{ type: val.type, sdp: cleaned }});
+                    }}
+                  }} catch {{}}
+                  return {{ type: val.type, sdp: cleaned, toJSON() {{ return {{ type: val.type, sdp: cleaned }}; }} }};
+                }},
+                enumerable: d.enumerable,
+                configurable: true
+              }});
+            }}
+          }} catch {{}}
+        }}
+      }};
       for (const rtcName of ['RTCPeerConnection', 'webkitRTCPeerConnection', 'mozRTCPeerConnection']) {{
         try {{
           if (rtcName in win && typeof win[rtcName] === 'function') {{
             const OrigRtc = win[rtcName];
+            patchRtcProto(OrigRtc.prototype);
             const WrappedRtc = new Proxy(OrigRtc, {{
               construct(target, args, newTarget) {{
                 if (targetState.cfg.disableWebRtc) {{
@@ -2039,8 +2200,43 @@ fn build_js_config(profile: &EnvProfile, engine: EngineKind) -> String {
         "audioBaseLatency": profile.audio_base_latency,
         "audioChannelCount": profile.audio_channel_count,
         "disableWebRtc": profile.webrtc_policy == WebRtcPolicy::DisableAll,
+        "noHostWebRtc": profile.webrtc_policy == WebRtcPolicy::DisableNonProxiedUdp,
     })
     .to_string()
+}
+
+/// Generate a minimal preload script that suppresses WebRTC `typ host` ICE candidates
+/// and SDP host lines (e.g. for `VirtualContext` or proxied sessions without an `EnvProfile`)
+/// without overriding UA, locale, screen, WebGL, or audio properties.
+pub fn build_webrtc_no_host_init_script(engine: EngineKind) -> String {
+    let minimal = EnvProfile {
+        os_family: String::new(),
+        user_agent: String::new(),
+        platform: String::new(),
+        accept_language: String::new(),
+        locale: String::new(),
+        languages: Vec::new(),
+        timezone: String::new(),
+        user_agent_metadata: None,
+        viewport_width: 0,
+        viewport_height: 0,
+        screen_width: 0,
+        screen_height: 0,
+        device_scale_factor: 0.0,
+        is_mobile: false,
+        hardware_concurrency: 0,
+        device_memory_gb: None,
+        webgl_vendor: None,
+        webgl_renderer: None,
+        audio_sample_rate: None,
+        audio_base_latency: None,
+        audio_channel_count: None,
+        geolocation: None,
+        webrtc_policy: WebRtcPolicy::DisableNonProxiedUdp,
+        extra_headers: std::collections::BTreeMap::new(),
+        disable_automation_controlled: true,
+    };
+    build_window_init_script(&minimal, engine)
 }
 
 #[cfg(test)]

@@ -26,7 +26,8 @@ use crate::driver::{
     MOD_ALT, MOD_CONTROL, MOD_META,
 };
 use crate::env_profile::{
-    build_window_init_script, build_worker_init_script, ProxyRelay,
+    build_webrtc_no_host_init_script, build_window_init_script, build_worker_init_script,
+    ProxyRelay,
 };
 use crate::error::{MimikyuError, Result};
 use crate::network::{
@@ -412,15 +413,18 @@ impl BrowserDriver for CdpDriver {
             return Err(err);
         }
 
+        let suppress_webrtc_host_without_profile =
+            opts.profile_mode == crate::driver::ProfileMode::VirtualContext || opts.proxy.is_some();
         if let Err(err) = session
-            .apply_initial_options(
-                opts.env_profile,
-                Vec::new(),
-                opts.block_images,
-                opts.block_media,
-                opts.block_fonts,
-                opts.instant_animations,
-            )
+            .apply_initial_options(InitialSessionOptions {
+                env_profile: opts.env_profile,
+                suppress_webrtc_host_without_profile,
+                permissions: Vec::new(),
+                block_images: opts.block_images,
+                block_media: opts.block_media,
+                block_fonts: opts.block_fonts,
+                instant_animations: opts.instant_animations,
+            })
             .await
         {
             let _ = session.dispose().await;
@@ -3407,6 +3411,16 @@ pub struct CdpSession {
     state: Arc<CdpSessionState>,
 }
 
+struct InitialSessionOptions {
+    env_profile: Option<EnvProfile>,
+    suppress_webrtc_host_without_profile: bool,
+    permissions: Vec<PermissionGrant>,
+    block_images: bool,
+    block_media: bool,
+    block_fonts: bool,
+    instant_animations: bool,
+}
+
 impl CdpSession {
     #[allow(clippy::too_many_arguments)]
     async fn create(
@@ -3511,30 +3525,68 @@ impl CdpSession {
         Ok(session)
     }
 
-    async fn apply_initial_options(
-        &self,
-        env_profile: Option<EnvProfile>,
-        permissions: Vec<PermissionGrant>,
-        block_images: bool,
-        block_media: bool,
-        block_fonts: bool,
-        instant_animations: bool,
-    ) -> Result<()> {
-        if let Some(profile) = env_profile {
-            self.set_env_overrides(profile).await?;
+    async fn install_window_preload_script(&self, win_script: &str) -> Result<()> {
+        *self.state.env_window_script.lock() = Some(win_script.to_string());
+        {
+            let mut prev = self.state.env_script_id.lock().await;
+            if let Some(old_id) = prev.take() {
+                let _ = self.remove_init_script(&old_id).await;
+            }
+            let new_id = self.add_init_script(win_script).await?;
+            *prev = Some(new_id);
         }
-        if !permissions.is_empty() {
-            self.set_permissions(permissions).await?;
+        {
+            let mut prev_iso = self.state.env_isolated_script_id.lock().await;
+            if let Some(old_id) = prev_iso.take() {
+                let _ = self.remove_init_script(&old_id).await;
+            }
+            let iso_res = self
+                .call(
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    json!({
+                        "source": win_script,
+                        "worldName": "mimikyu_isolated",
+                    }),
+                )
+                .await?;
+            if let Some(iso_id) = iso_res["identifier"].as_str() {
+                *prev_iso = Some(iso_id.to_string());
+            }
+        }
+        self.state.isolated_worlds.lock().clear();
+        let _ = self
+            .call(
+                "Runtime.evaluate",
+                json!({
+                    "expression": win_script,
+                    "returnByValue": true,
+                    "silent": true,
+                }),
+            )
+            .await;
+        Ok(())
+    }
+
+    async fn apply_initial_options(&self, init: InitialSessionOptions) -> Result<()> {
+        if let Some(profile) = init.env_profile {
+            self.set_env_overrides(profile).await?;
+        } else if init.suppress_webrtc_host_without_profile {
+            let rtc_script = build_webrtc_no_host_init_script(EngineKind::Chromium);
+            self.install_window_preload_script(&rtc_script).await?;
+        }
+        if !init.permissions.is_empty() {
+            self.set_permissions(init.permissions).await?;
         }
 
-        if block_images || block_media || block_fonts {
-            self.state
-                .interceptor
-                .lock()
-                .set_categories(block_images, block_media, block_fonts);
+        if init.block_images || init.block_media || init.block_fonts {
+            self.state.interceptor.lock().set_categories(
+                init.block_images,
+                init.block_media,
+                init.block_fonts,
+            );
             self.sync_cdp_network().await?;
         }
-        if instant_animations {
+        if init.instant_animations {
             let _ = self.set_instant_animations(true).await;
         }
         Ok(())
@@ -4473,14 +4525,15 @@ impl DriverSession for CdpSession {
         }
 
         if let Err(err) = session
-            .apply_initial_options(
-                opts.env_profile,
-                opts.permissions,
-                opts.block_images,
-                opts.block_media,
-                opts.block_fonts,
-                opts.instant_animations,
-            )
+            .apply_initial_options(InitialSessionOptions {
+                env_profile: opts.env_profile,
+                suppress_webrtc_host_without_profile: true,
+                permissions: opts.permissions,
+                block_images: opts.block_images,
+                block_media: opts.block_media,
+                block_fonts: opts.block_fonts,
+                instant_animations: opts.instant_animations,
+            })
             .await
         {
             let _ = session.dispose().await;
@@ -4493,6 +4546,7 @@ impl DriverSession for CdpSession {
     async fn new_tab(&self, url: Option<&str>) -> Result<Arc<dyn DriverSession>> {
         self.ensure_alive()?;
         let parent_env_profile = self.state.env_profile.lock().clone();
+        let parent_win_script = self.state.env_window_script.lock().clone();
         let parent_interceptor = self.state.interceptor.lock().clone();
         let parent_instant_anim = self.state.instant_animations.load(Ordering::SeqCst);
 
@@ -4574,8 +4628,13 @@ impl DriverSession for CdpSession {
                 || guard.cdp_fetch_patterns().is_some()
         };
 
-        if let Some(profile) = parent_env_profile
-            && let Err(err) = session.set_env_overrides(profile).await
+        if let Some(profile) = parent_env_profile {
+            if let Err(err) = session.set_env_overrides(profile).await {
+                let _ = session.dispose().await;
+                return Err(err);
+            }
+        } else if let Some(ref win_script) = parent_win_script
+            && let Err(err) = session.install_window_preload_script(win_script).await
         {
             let _ = session.dispose().await;
             return Err(err);

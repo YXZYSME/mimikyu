@@ -908,3 +908,62 @@ async fn wait_text_open_shadow_dom_chromium() {
 async fn wait_text_open_shadow_dom_firefox() {
     assert_wait_text_open_shadow_dom(EngineKind::Firefox).await;
 }
+
+async fn assert_wait_idle_succeeds_when_raf_is_throttled(engine: EngineKind) {
+    let server = TestServer::start().await;
+    let session = driver_for(engine)
+        .launch(LaunchOptions {
+            engine,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            ..Default::default()
+        })
+        .await
+        .expect("launch browser");
+    let pid = session.info().pid.expect("pid");
+
+    session
+        .navigate(&server.url("/target"))
+        .await
+        .expect("navigate /target");
+
+    // Simulate background/multi-tab compositor throttling where requestAnimationFrame never fires.
+    session
+        .eval_isolated("window.requestAnimationFrame = () => 0; true")
+        .await
+        .expect("override rAF in isolated world");
+
+    let t0 = std::time::Instant::now();
+    WaitEngine::wait_idle(
+        session.as_ref(),
+        None,
+        WaitIdleOptions {
+            timeout_ms: 2_000,
+            poll_interval_ms: 25,
+            network_quiet_ms: 100,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap_or_else(|e| {
+        panic!("{engine}: wait_idle timed out when requestAnimationFrame is throttled: {e}")
+    });
+    assert!(
+        t0.elapsed() < std::time::Duration::from_millis(1_500),
+        "{engine}: wait_idle took too long ({:?}) with throttled rAF",
+        t0.elapsed()
+    );
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn wait_idle_succeeds_when_raf_is_throttled_chromium() {
+    assert_wait_idle_succeeds_when_raf_is_throttled(EngineKind::Chromium).await;
+}
+
+#[tokio::test]
+async fn wait_idle_succeeds_when_raf_is_throttled_firefox() {
+    assert_wait_idle_succeeds_when_raf_is_throttled(EngineKind::Firefox).await;
+}
