@@ -129,7 +129,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/mimikyu" "$STAGE_DIR/mimikyu"
           chmod 0755 "$STAGE_DIR/mimikyu"
           cp README.md CHANGELOG.md "$STAGE_DIR/"
-          for lic in LICENSE LICENSE-MIT LICENSE-APACHE; do
+          for lic in LICENSE LICENSE-MIT LICENSE-APACHE NOTICE; do
             if [ -f "$lic" ]; then
               cp "$lic" "$STAGE_DIR/"
             fi
@@ -327,9 +327,11 @@ jobs:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Publish mimikyu-mcp to npm with provenance
-        working-directory: packaging/npm/mimikyu-mcp
-        run: npm publish --provenance --access public
+      - name: Publish npm packages (mimikyu-mcp, saengil-mimikyu, mimikyu-cli) with provenance
+        run: |
+          for pkg_dir in mimikyu-mcp saengil-mimikyu mimikyu-cli; do
+            (cd "packaging/npm/$pkg_dir" && npm publish --provenance --access public)
+          done
 
       - name: Install Cosign & verify mcp-publisher CLI
         uses: sigstore/cosign-installer@v3.8.2
@@ -349,3 +351,29 @@ jobs:
           tar -xzf "$archive"
           ./mcp-publisher login github-oidc --registry https://registry.modelcontextprotocol.io
           ./mcp-publisher publish server.json --registry https://registry.modelcontextprotocol.io
+
+  publish-pypi:
+    name: Publish Python Package (mimikyu) to PyPI (Trusted Publishing OIDC)
+    needs: publish
+    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ (inputs.tag && format('refs/tags/{0}', inputs.tag)) || github.ref }}
+
+      - name: Install uv & build mimikyu wheel + sdist
+        uses: astral-sh/setup-uv@v5
+
+      - name: Build Python distribution artifacts
+        working-directory: packaging/pypi
+        run: uv build --out-dir dist
+
+      - name: Publish to PyPI via Trusted Publishing OIDC
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: packaging/pypi/dist/

@@ -92,6 +92,26 @@ brew tap YXZYSME/tap
 brew install mimikyu
 ```
 
+### Node / `npm` & `npx`
+
+```bash
+# Install the `mimikyu` CLI binary globally via Saengil's official npm package
+npm install -g saengil-mimikyu
+npx -y saengil-mimikyu doctor
+
+# (Also published as `mimikyu-cli` and MCP launcher `mimikyu-mcp`)
+```
+
+### Python / `pip` & `uvx`
+
+```bash
+# Install `mimikyu` and `mimikyu-mcp` via PyPI
+pip install mimikyu
+
+# Or run ephemerally with uvx
+uvx mimikyu doctor
+```
+
 ### Build & Install from Local Source
 
 ```bash
