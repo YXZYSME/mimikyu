@@ -347,7 +347,7 @@ jobs:
             if curl -fsSL "https://registry.npmjs.org/${pkg_dir}/${REL_VER}" >/dev/null 2>&1; then
               echo "${pkg_dir}@${REL_VER} already published on npm; skipping."
             else
-              (cd "packaging/npm/$pkg_dir" && npm publish --provenance --access public)
+              (cd "packaging/npm/$pkg_dir" && npm publish --provenance --access public --loglevel verbose)
             fi
           done
 
