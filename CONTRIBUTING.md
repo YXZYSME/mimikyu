@@ -93,6 +93,7 @@ We use **Squash and Merge** on `main` with [Conventional Commits](https://www.co
 
 - `feat/<short-slug>` — new capability (e.g., `feat/snapshot-landmark-roles`)
 - `fix/<short-slug>` — bug fix (e.g., `fix/bidi-iframe-scroll-bounds`)
+- `sec/<short-slug>` — security hardening or vulnerability remediation (e.g., `sec/wave1-hardening`)
 - `docs/<short-slug>` — documentation or examples
 - `test/<short-slug>` — unit or E2E test coverage
 - `refactor/<short-slug>` / `perf/<short-slug>` / `ci/<short-slug>`
@@ -128,6 +129,23 @@ Read [ARCHITECTURE.md](./ARCHITECTURE.md) for the full design rationale. In summ
 5. **Strict Hygiene & Supply-Chain Discipline**:
    - Never hardcode personal machine paths, usernames, or private LAN IPs in code, snapshots, or docs.
    - Avoid adding new crate dependencies unless truly necessary; any new dependency must pass `cargo deny check` against `deny.toml` (`crates.io` only, permissive license allowlist).
+
+---
+
+## 5. Parallel-Team Workflow Standard
+
+When multiple engineers or agent lanes work on `mimikyu` concurrently, follow three rules to keep `main` clean and avoid merge friction:
+
+1. **Branch Isolation & Early Draft PRs (Never Push Directly to `main`)**:
+   - Always develop on scoped `feat/`, `fix/`, `sec/`, or `docs/` branches—never commit or push work directly to `main`.
+   - Use isolated `git worktree` checkouts (`git worktree add ../mimikyu-<lane> -b <type>/<slug> origin/main`) when running parallel lanes on the same workstation so builds, test servers, and working trees never collide.
+   - Open a **Draft PR** targeting `main` early so GitHub Actions CI and Cloudflare Pages preview URLs validate each lane continuously before review.
+2. **Exclusive Lane & File Ownership**:
+   - Assign clear, non-overlapping file ownership across concurrent lanes (for example, keeping a security/infrastructure hardening lane separate from a product/feedback feature lane).
+   - Coordinate upfront whenever two active PRs need to touch shared high-churn files—especially `crates/mimikyu-core/src/session.rs`, `crates/mimikyu-core/src/mcp/tools.rs`, `README.md`, and `website/`.
+3. **Regenerate Derived Website Artifacts After Rebasing**:
+   - Never hand-merge generated site artifacts (`website/src/data/release.json`, `website/public/llms.txt`, `website/public/mimikyu-banner.svg`, or `website/public/og-card.png`) during a rebase.
+   - Instead, rebase cleanly onto `origin/main` and regenerate derived outputs with the canonical scripts (`node website/scripts/sync_site_data.mjs` and `python3 website/scripts/generate_og.py`), then verify with `npm run build` inside `website/`.
 
 ---
 
