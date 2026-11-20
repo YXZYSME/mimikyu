@@ -110,7 +110,7 @@ def resolve_mimikyu_bin(override: str | None = None) -> Path:
     if env_bin := os.environ.get("MIMIKYU_BIN"):
         candidates.append(Path(env_bin))
     candidates.append(REPO_ROOT / "target" / "release" / "mimikyu")
-    candidates.append(Path("/Users/0001mb2tl_skim/Projects/mimikyu/target/release/mimikyu"))
+    candidates.append(REPO_ROOT / "target" / "debug" / "mimikyu")
     if which := shutil.which("mimikyu"):
         candidates.append(Path(which))
 
