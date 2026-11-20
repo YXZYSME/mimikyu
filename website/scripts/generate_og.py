@@ -29,7 +29,7 @@ def load_site_meta() -> dict:
         "snapshot_ms": 5.0,
         "compression_min": 2.8,
         "compression_max": 3.6,
-        "rust_tests": 358,
+        "rust_tests": 372,
         "e2e_tests": 237,
         "e2e_runs": 244,
     }

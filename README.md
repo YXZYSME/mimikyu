@@ -12,7 +12,7 @@
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B%20(2024)-f5b841?style=flat-square&labelColor=180d2e)](Cargo.toml)
 [![Engines: CDP + BiDi](https://img.shields.io/badge/engines-Chromium%20CDP%20%2B%20Firefox%20BiDi-4ce0b3?style=flat-square&labelColor=180d2e)](ARCHITECTURE.md)
 [![MCP Server: 33 Tools](https://img.shields.io/badge/MCP%202024--11--05-33%20tools-9d80eb?style=flat-square&labelColor=180d2e)](#mcp-server-configuration)
-[![Verified Suite: 358 Rust + 237 E2E (244 runs)](https://img.shields.io/badge/tests-358%20Rust%20%7C%20237%20E2E%20(244%20runs)-4ce0b3?style=flat-square&labelColor=180d2e)](#testing--verification)
+[![Verified Suite: 372 Rust + 237 E2E (244 runs)](https://img.shields.io/badge/tests-372%20Rust%20%7C%20237%20E2E%20(244%20runs)-4ce0b3?style=flat-square&labelColor=180d2e)](#testing--verification)
 [![Security Policy](https://img.shields.io/badge/security-R3%20compliant-ff6b8b?style=flat-square&labelColor=180d2e)](SECURITY.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-ffe47a?style=flat-square&labelColor=180d2e)](#license--parody-notice)
 
@@ -388,7 +388,7 @@ cargo test --workspace
 
 Verified workspace results:
 - `cargo clippy --workspace --all-targets -- -D warnings`: **0 warnings**
-- `cargo test --workspace`: **358 passed, 0 failed, 0 ignored** (`mimikyu-core`: 331/331 across unit & integration suites; `mimikyu-cli`: 26/26 across contract, doctor, and bench CLI suites; `mimikyu`: 1/1 library facade test)
+- `cargo test --workspace`: **372 passed, 0 failed, 0 ignored** (`mimikyu-core`: 345/345 across unit & integration suites; `mimikyu-cli`: 26/26 across contract, doctor, and bench CLI suites; `mimikyu`: 1/1 library facade test)
 - Process & crash hygiene: **0 orphan browser/mimikyu processes**, **0 macOS CrashReporter logs**
 
 ### Opaque-Box Python E2E Suite (`e2e/`)

@@ -3,8 +3,8 @@
   "firefoxCommand": "mimikyu bench --engine firefox --suite all --json",
   "harness": "127.0.0.1:0 dual-origin local HTTP harness (offline, reproducible)",
   "verifiedSuite": {
-    "rustTests": 358,
-    "rustCoreTests": 331,
+    "rustTests": 372,
+    "rustCoreTests": 345,
     "rustCliTests": 26,
     "rustFacadeTests": 1,
     "e2eTests": 237,
