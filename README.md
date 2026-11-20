@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/mimikyu-banner.svg" alt="mimikyu — 16-bit pixel-art banner featuring an original rag-disguise browser sprite mascot, MIMIKYU logo, and runtime HUD" width="100%" />
+<img src="https://raw.githubusercontent.com/YXZYSME/mimikyu/main/assets/mimikyu-banner.svg" alt="mimikyu — 16-bit pixel-art banner featuring an original rag-disguise browser sprite mascot, MIMIKYU logo, and runtime HUD" width="100%" />
 
 <br />
 
@@ -11,19 +11,19 @@
 [![MCP Registry](https://img.shields.io/badge/MCP%20Registry-io.github.YXZYSME%2Fmimikyu-9d80eb?style=flat-square&labelColor=180d2e)](https://registry.modelcontextprotocol.io/v0/servers?search=io.github.YXZYSME/mimikyu)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B%20(2024)-f5b841?style=flat-square&labelColor=180d2e)](Cargo.toml)
 [![Engines: CDP + BiDi](https://img.shields.io/badge/engines-Chromium%20CDP%20%2B%20Firefox%20BiDi-4ce0b3?style=flat-square&labelColor=180d2e)](ARCHITECTURE.md)
-[![MCP Server: 31 Tools](https://img.shields.io/badge/MCP%202024--11--05-31%20tools-9d80eb?style=flat-square&labelColor=180d2e)](#mcp-server-configuration)
-[![Verified Suite: 337 Rust + 244 E2E](https://img.shields.io/badge/tests-337%20Rust%20%7C%20244%20E2E-4ce0b3?style=flat-square&labelColor=180d2e)](#testing--verification)
+[![MCP Server: 33 Tools](https://img.shields.io/badge/MCP%202024--11--05-33%20tools-9d80eb?style=flat-square&labelColor=180d2e)](#mcp-server-configuration)
+[![Verified Suite: 360+ Rust + 244 E2E](https://img.shields.io/badge/tests-360%2B%20Rust%20%7C%20244%20E2E-4ce0b3?style=flat-square&labelColor=180d2e)](#testing--verification)
 [![Security Policy](https://img.shields.io/badge/security-R3%20compliant-ff6b8b?style=flat-square&labelColor=180d2e)](SECURITY.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-ffe47a?style=flat-square&labelColor=180d2e)](#license--parody-notice)
 
-**High-speed native Rust agentic browser runtime, two-tier session/profile isolation layer, warm Unix-socket daemon, and 31-tool MCP control plane driving local Chromium (CDP) and Firefox (W3C WebDriver BiDi).**
+**High-speed native Rust agentic browser runtime, two-tier session/profile isolation layer, privacy vaults, warm Unix-socket daemon, and 33-tool MCP control plane driving local Chromium (CDP) and Firefox (W3C WebDriver BiDi).**
 
-[Install](#installation--updating) · [Releases](https://github.com/YXZYSME/mimikyu/releases) · [Quickstart](#quickstart--cli-examples) · [MCP (31 Tools)](#mcp-server-configuration) · [Benchmarks](#reproducible-local-benchmark-suite) · [Architecture](ARCHITECTURE.md) · [Contributing](CONTRIBUTING.md) · [Security](SECURITY.md)
+[Install](#installation--updating) · [Demos](#live-demos) · [Releases](https://github.com/YXZYSME/mimikyu/releases) · [Quickstart](#quickstart--cli-examples) · [MCP (33 Tools)](#mcp-server-configuration) · [Benchmarks](#reproducible-local-benchmark-suite) · [Website](https://mimikyu.saengil.ai) · [Architecture](ARCHITECTURE.md) · [Security](SECURITY.md)
 
 </div>
 
 <p align="center">
-  <img src="assets/pixel-divider.svg" alt="" width="100%" />
+  <img src="https://raw.githubusercontent.com/YXZYSME/mimikyu/main/assets/pixel-divider.svg" alt="" width="100%" />
 </p>
 
 ## `AGENTDEX // ENTRY NO. 031 — MIMIKYU`
@@ -31,7 +31,7 @@
 <table>
 <tr>
 <td width="152" align="center" valign="middle">
-  <img src="assets/mimikyu-mascot.svg" alt="mimikyu rag-disguise browser sprite mascot" width="128" height="128" />
+  <img src="https://raw.githubusercontent.com/YXZYSME/mimikyu/main/assets/mimikyu-mascot.svg" alt="mimikyu rag-disguise browser sprite mascot" width="128" height="128" />
   <br />
   <sub><b>TYPE:</b> <code>SHADOW / BROWSER</code></sub>
 </td>
@@ -42,14 +42,33 @@
 **Why `mimikyu` exists:**
 - **Coherent Environment & Isolation Foundations:** Built-in OS environment presets (`win11`, `macos`, `linux`), offline GeoIP alignment, authenticated loopback proxy relaying, two-tier browser/context isolation, kinematic input modeling, and granular resource blocking.
 - **Blazing Native Rust Speed:** Compiled into a single native `mimikyu` binary with a warm auto-spawning Unix-socket daemon — delivering **`~5.0 ms` semantic snapshots**, **`~5.4 ms` Markdown extraction**, and **`~67 ms` warm virtual contexts** with zero Node.js or Python runtime overhead.
-- **Token-Efficient `@eN` Agentic Control:** Compresses sprawling DOMs (including open Shadow DOM and nested/cross-origin iframes) by **`2.79x–3.57x`** into deterministic `@e1`, `@e2` interactive element refs, structural diffs, atomic action batches, and **31 turnkey MCP tools**.
+- **Token-Efficient `@eN` Agentic Control:** Compresses sprawling DOMs (including open Shadow DOM and nested/cross-origin iframes) by **`2.79x–3.57x`** into deterministic `@e1`, `@e2` interactive element refs, structural diffs, atomic action batches, **33 turnkey MCP tools** (with R3-compliant Human-in-the-Loop session takeover), and built-in headless CDP screencast recording.
 
 </td>
 </tr>
 </table>
 
 <p align="center">
-  <img src="assets/pixel-divider.svg" alt="" width="100%" />
+  <img src="https://raw.githubusercontent.com/YXZYSME/mimikyu/main/assets/pixel-divider.svg" alt="" width="100%" />
+</p>
+
+## Live Demos
+
+### 100% Raw, Unstylized Live Browser Screencast (Real Public Websites)
+
+Captured directly via `mimikyu`'s built-in `mimikyu record start/stop` (CDP `Page.startScreencast`) across live `github.com/YXZYSME/mimikyu`, `crates.io/crates/mimikyu`, `pypi.org/project/mimikyu/`, and `news.ycombinator.com` — zero overlays or mocked pages:
+
+<p align="center">
+  <a href="https://github.com/YXZYSME/mimikyu/releases/download/v0.2.0/demo-raw-live-browser.mp4">
+    <img src="https://github.com/YXZYSME/mimikyu/releases/download/v0.2.0/demo-raw-live-browser.webp" alt="100% raw unstylized Chromium screencast driven by mimikyu across GitHub, crates.io, PyPI, and Hacker News" width="100%" />
+  </a>
+</p>
+
+- **Full-resolution MP4 captures**: [100% Raw Live Websites (MP4)](https://github.com/YXZYSME/mimikyu/releases/download/v0.2.0/demo-raw-live-browser.mp4) · [The 5ms Agentic Loop (MP4)](https://github.com/YXZYSME/mimikyu/releases/download/v0.2.0/demo-1-hero.mp4) · [Chromium CDP vs Firefox BiDi Parity (MP4)](https://github.com/YXZYSME/mimikyu/releases/download/v0.2.0/demo-2-dual-engine.mp4)
+- **Reproduce locally**: `python3 scripts/demos/record_raw_live.py --headed` or `python3 scripts/demos/record_demos.py` (see [`scripts/demos/README.md`](scripts/demos/README.md)).
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/YXZYSME/mimikyu/main/assets/pixel-divider.svg" alt="" width="100%" />
 </p>
 
 ## Installation & Updating
@@ -168,7 +187,7 @@ cargo build --release
 - **For Running `e2e/`:** Python 3 (standard library only; zero external `pip` packages)
 
 <p align="center">
-  <img src="assets/pixel-divider.svg" alt="" width="100%" />
+  <img src="https://raw.githubusercontent.com/YXZYSME/mimikyu/main/assets/pixel-divider.svg" alt="" width="100%" />
 </p>
 
 ## Architecture
@@ -211,7 +230,7 @@ e2e/                      # Opaque-box Python 3 stdlib E2E test suite (Tiers 1�
    - Both implement `DriverSession` and shut down gracefully via `Browser.close` / `browser.close` before process-group cleanup.
 
 <p align="center">
-  <img src="assets/pixel-divider.svg" alt="" width="100%" />
+  <img src="https://raw.githubusercontent.com/YXZYSME/mimikyu/main/assets/pixel-divider.svg" alt="" width="100%" />
 </p>
 
 ## Features
@@ -235,7 +254,7 @@ e2e/                      # Opaque-box Python 3 stdlib E2E test suite (Tiers 1�
 - **Local Discovery Precedence**: Explicit override path → `MIMIKYU_CHROMIUM_PATH` / `MIMIKYU_FIREFOX_PATH` → Playwright & Puppeteer local caches → system installs & `PATH`.
 
 <p align="center">
-  <img src="assets/pixel-divider.svg" alt="" width="100%" />
+  <img src="https://raw.githubusercontent.com/YXZYSME/mimikyu/main/assets/pixel-divider.svg" alt="" width="100%" />
 </p>
 
 ## Quickstart & CLI Examples
@@ -281,8 +300,8 @@ mimikyu daemon stop
 
 ### MCP Server Configuration
 
-Registered on the **Official MCP Registry** as [`io.github.YXZYSME/mimikyu`](https://registry.modelcontextprotocol.io/v0/servers?search=io.github.YXZYSME/mimikyu). `mimikyu mcp` speaks JSON-RPC 2.0 over stdio (MCP protocol `2024-11-05`) and exposes **31 tools**:
-- **11 `mimikyu_*` tools**: `mimikyu_session_new`, `mimikyu_session_close`, `mimikyu_open`, `mimikyu_snapshot`, `mimikyu_click`, `mimikyu_fill`, `mimikyu_extract`, `mimikyu_wait`, `mimikyu_batch`, `mimikyu_eval`, `mimikyu_screenshot`
+Registered on the **Official MCP Registry** as [`io.github.YXZYSME/mimikyu`](https://registry.modelcontextprotocol.io/v0/servers?search=io.github.YXZYSME/mimikyu). `mimikyu mcp` speaks JSON-RPC 2.0 over stdio (MCP protocol `2024-11-05`) and exposes **33 tools**:
+- **13 `mimikyu_*` tools**: `mimikyu_session_new`, `mimikyu_session_close`, `mimikyu_open`, `mimikyu_snapshot`, `mimikyu_click`, `mimikyu_fill`, `mimikyu_extract`, `mimikyu_wait`, `mimikyu_batch`, `mimikyu_eval`, `mimikyu_screenshot`, `mimikyu_request_human_takeover`, `mimikyu_resume_from_human`
 - **20 `browser_*` tools**: `browser_open`, `browser_close`, `browser_snapshot`, `browser_click`, `browser_fill`, `browser_type`, `browser_press`, `browser_select`, `browser_upload`, `browser_scroll`, `browser_eval`, `browser_extract`, `browser_screenshot`, `browser_wait`, `browser_batch`, `browser_context_list`, `browser_context_close`, `browser_profile_export`, `browser_profile_import`, `browser_env_report`
 
 Zero-install MCP client config via **`npx` (`npm`)**:
@@ -325,7 +344,7 @@ Or using a locally installed `mimikyu` binary on your `PATH`:
 ```
 
 <p align="center">
-  <img src="assets/pixel-divider.svg" alt="" width="100%" />
+  <img src="https://raw.githubusercontent.com/YXZYSME/mimikyu/main/assets/pixel-divider.svg" alt="" width="100%" />
 </p>
 
 ## Reproducible Local Benchmark Suite
@@ -352,7 +371,7 @@ Or using a locally installed `mimikyu` binary on your `PATH`:
 | Agentic workflows passed | **5 / 5 (100%)** | **5 / 5 (100%)** |
 
 <p align="center">
-  <img src="assets/pixel-divider.svg" alt="" width="100%" />
+  <img src="https://raw.githubusercontent.com/YXZYSME/mimikyu/main/assets/pixel-divider.svg" alt="" width="100%" />
 </p>
 
 ## Testing & Verification
@@ -391,7 +410,7 @@ Verified E2E results against `./target/release/mimikyu` (**244/244 passed**, 0 f
 - Scope compliance & hygiene: **0 R3 violations**, **0 leaked processes**, **0 macOS CrashReporter logs**
 
 <p align="center">
-  <img src="assets/pixel-divider.svg" alt="" width="100%" />
+  <img src="https://raw.githubusercontent.com/YXZYSME/mimikyu/main/assets/pixel-divider.svg" alt="" width="100%" />
 </p>
 
 ## Project Documentation & Governance
