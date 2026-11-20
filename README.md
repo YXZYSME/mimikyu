@@ -233,7 +233,20 @@ mimikyu daemon stop
 - **11 `mimikyu_*` tools**: `mimikyu_session_new`, `mimikyu_session_close`, `mimikyu_open`, `mimikyu_snapshot`, `mimikyu_click`, `mimikyu_fill`, `mimikyu_extract`, `mimikyu_wait`, `mimikyu_batch`, `mimikyu_eval`, `mimikyu_screenshot`
 - **20 `browser_*` tools**: `browser_open`, `browser_close`, `browser_snapshot`, `browser_click`, `browser_fill`, `browser_type`, `browser_press`, `browser_select`, `browser_upload`, `browser_scroll`, `browser_eval`, `browser_extract`, `browser_screenshot`, `browser_wait`, `browser_batch`, `browser_context_list`, `browser_context_close`, `browser_profile_export`, `browser_profile_import`, `browser_env_report`
 
-Example MCP client entry (or set `"command": "/path/to/mimikyu/target/release/mimikyu"` when running from source):
+Example MCP client entry (zero-install via `npx -y mimikyu-mcp`, or direct `mimikyu` binary):
+
+```json
+{
+  "mcpServers": {
+    "mimikyu": {
+      "command": "npx",
+      "args": ["-y", "mimikyu-mcp"]
+    }
+  }
+}
+```
+
+Or if `mimikyu` is already installed on your `PATH`:
 
 ```json
 {

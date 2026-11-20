@@ -62,6 +62,8 @@ UMBRELLA_CARGO="$REPO_ROOT/crates/mimikyu/Cargo.toml"
 CARGO_LOCK="$REPO_ROOT/Cargo.lock"
 CHANGELOG="$REPO_ROOT/CHANGELOG.md"
 BREW_FORMULA="$REPO_ROOT/packaging/homebrew/mimikyu.rb"
+MCP_SERVER_JSON="$REPO_ROOT/server.json"
+NPM_PKG_JSON="$REPO_ROOT/packaging/npm/mimikyu-mcp/package.json"
 
 [ -f "$ROOT_CARGO" ] || die "missing $ROOT_CARGO"
 [ -f "$CORE_CARGO" ] || die "missing $CORE_CARGO"
@@ -197,6 +199,40 @@ if [ -f "$BREW_FORMULA" ]; then
     die "packaging/homebrew/mimikyu.rb version '$brew_ver' does not match workspace version '$WORKSPACE_VERSION'"
   fi
   printf '[ok] packaging/homebrew/mimikyu.rb version = %s\n' "$brew_ver"
+fi
+
+if [ -f "$NPM_PKG_JSON" ]; then
+  npm_ver=$(awk '
+    $0 ~ /^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"/ {
+      line = $0
+      sub(/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"/, "", line)
+      sub(/".*$/, "", line)
+      print line
+      exit 0
+    }
+  ' "$NPM_PKG_JSON")
+  [ "$npm_ver" = "$WORKSPACE_VERSION" ] || die "packaging/npm/mimikyu-mcp/package.json version '$npm_ver' does not match workspace version '$WORKSPACE_VERSION'"
+  printf '[ok] packaging/npm/mimikyu-mcp/package.json version = %s\n' "$npm_ver"
+fi
+
+if [ -f "$MCP_SERVER_JSON" ]; then
+  mcp_bad=$(awk -v expected="$WORKSPACE_VERSION" '
+    $0 ~ /^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"/ {
+      line = $0
+      sub(/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"/, "", line)
+      sub(/".*$/, "", line)
+      seen++
+      if (line != expected) {
+        print line
+        exit 0
+      }
+    }
+    END {
+      if (seen == 0) print "missing"
+    }
+  ' "$MCP_SERVER_JSON")
+  [ -z "$mcp_bad" ] || die "server.json version '$mcp_bad' does not match workspace version '$WORKSPACE_VERSION'"
+  printf '[ok] server.json versions = %s\n' "$WORKSPACE_VERSION"
 fi
 
 # 5. Verify CHANGELOG.md structure and release entry

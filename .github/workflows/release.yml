@@ -304,3 +304,48 @@ jobs:
           cargo publish --locked -p mimikyu-core
           cargo publish --locked -p mimikyu-cli
           cargo publish --locked -p mimikyu
+
+  publish-mcp:
+    name: Publish npm (mimikyu-mcp) & Official MCP Registry (OIDC)
+    needs: publish
+    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      MCP_PUBLISHER_VERSION: v1.8.9
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ (inputs.tag && format('refs/tags/{0}', inputs.tag)) || github.ref }}
+
+      - name: Set up Node.js 24 (npm Trusted Publishing OIDC)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Publish mimikyu-mcp to npm with provenance
+        working-directory: packaging/npm/mimikyu-mcp
+        run: npm publish --provenance --access public
+
+      - name: Install Cosign & verify mcp-publisher CLI
+        uses: sigstore/cosign-installer@v3.8.2
+
+      - name: Download, verify, and publish server.json to Official MCP Registry
+        run: |
+          set -eu
+          archive="mcp-publisher_linux_amd64.tar.gz"
+          base_url="https://github.com/modelcontextprotocol/registry/releases/download/${MCP_PUBLISHER_VERSION}"
+          curl -fsSL "$base_url/$archive" -o "$archive"
+          curl -fsSL "$base_url/$archive.sigstore.json" -o "$archive.sigstore.json"
+          cosign verify-blob \
+            --bundle "$archive.sigstore.json" \
+            --certificate-identity "https://github.com/modelcontextprotocol/registry/.github/workflows/release.yml@refs/tags/${MCP_PUBLISHER_VERSION}" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$archive"
+          tar -xzf "$archive"
+          ./mcp-publisher login github-oidc --registry https://registry.modelcontextprotocol.io
+          ./mcp-publisher publish server.json --registry https://registry.modelcontextprotocol.io

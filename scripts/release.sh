@@ -218,6 +218,18 @@ rewrite_homebrew_formula() {
   ' "$in_file" > "$out_file"
 }
 
+rewrite_json_versions() {
+  in_file="$1"
+  out_file="$2"
+  new_ver="$3"
+  awk -v ver="$new_ver" '
+    $0 ~ /^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"/ {
+      sub(/"version"[[:space:]]*:[[:space:]]*"[^"]*"/, "\"version\": \"" ver "\"")
+    }
+    { print }
+  ' "$in_file" > "$out_file"
+}
+
 rewrite_changelog() {
   in_file="$1"
   out_file="$2"
@@ -292,7 +304,7 @@ fi
 # 2. Dry-run simulation (never touches the working tree!)
 if [ "$DRY_RUN" -eq 1 ]; then
   TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mimikyu-release-dryrun.XXXXXX")
-  mkdir -p "$TMP_DIR/crates/mimikyu-core" "$TMP_DIR/crates/mimikyu-cli" "$TMP_DIR/crates/mimikyu" "$TMP_DIR/packaging/homebrew"
+  mkdir -p "$TMP_DIR/crates/mimikyu-core" "$TMP_DIR/crates/mimikyu-cli" "$TMP_DIR/crates/mimikyu" "$TMP_DIR/packaging/homebrew" "$TMP_DIR/packaging/npm/mimikyu-mcp"
 
   rewrite_cargo_toml "$REPO_ROOT/Cargo.toml" "$TMP_DIR/Cargo.toml" "$NEW_VERSION"
   cp "$REPO_ROOT/crates/mimikyu-core/Cargo.toml" "$TMP_DIR/crates/mimikyu-core/Cargo.toml"
@@ -304,6 +316,12 @@ if [ "$DRY_RUN" -eq 1 ]; then
   rewrite_changelog "$REPO_ROOT/CHANGELOG.md" "$TMP_DIR/CHANGELOG.md" "$NEW_VERSION" "$RELEASE_DATE"
   if [ -f "$REPO_ROOT/packaging/homebrew/mimikyu.rb" ]; then
     rewrite_homebrew_formula "$REPO_ROOT/packaging/homebrew/mimikyu.rb" "$TMP_DIR/packaging/homebrew/mimikyu.rb" "$NEW_VERSION"
+  fi
+  if [ -f "$REPO_ROOT/packaging/npm/mimikyu-mcp/package.json" ]; then
+    rewrite_json_versions "$REPO_ROOT/packaging/npm/mimikyu-mcp/package.json" "$TMP_DIR/packaging/npm/mimikyu-mcp/package.json" "$NEW_VERSION"
+  fi
+  if [ -f "$REPO_ROOT/server.json" ]; then
+    rewrite_json_versions "$REPO_ROOT/server.json" "$TMP_DIR/server.json" "$NEW_VERSION"
   fi
 
   log_info "[dry-run] Validating simulated release manifests for $RELEASE_TAG ($CURRENT_VERSION -> $NEW_VERSION)..."
@@ -340,6 +358,18 @@ if [ -f "$REPO_ROOT/packaging/homebrew/mimikyu.rb" ]; then
   mv "$TMP_DIR/mimikyu.rb" "$REPO_ROOT/packaging/homebrew/mimikyu.rb"
 fi
 
+if [ -f "$REPO_ROOT/packaging/npm/mimikyu-mcp/package.json" ]; then
+  log_info "Updating packaging/npm/mimikyu-mcp/package.json version -> $NEW_VERSION"
+  rewrite_json_versions "$REPO_ROOT/packaging/npm/mimikyu-mcp/package.json" "$TMP_DIR/package.json" "$NEW_VERSION"
+  mv "$TMP_DIR/package.json" "$REPO_ROOT/packaging/npm/mimikyu-mcp/package.json"
+fi
+
+if [ -f "$REPO_ROOT/server.json" ]; then
+  log_info "Updating server.json version -> $NEW_VERSION"
+  rewrite_json_versions "$REPO_ROOT/server.json" "$TMP_DIR/server.json" "$NEW_VERSION"
+  mv "$TMP_DIR/server.json" "$REPO_ROOT/server.json"
+fi
+
 log_info "Running 'cargo check --workspace' to synchronize Cargo.lock..."
 cargo check --workspace
 
@@ -354,6 +384,12 @@ log_info "Creating release commit and annotated git tag $RELEASE_TAG..."
 git add Cargo.toml Cargo.lock CHANGELOG.md
 if [ -f "$REPO_ROOT/packaging/homebrew/mimikyu.rb" ]; then
   git add packaging/homebrew/mimikyu.rb
+fi
+if [ -f "$REPO_ROOT/packaging/npm/mimikyu-mcp/package.json" ]; then
+  git add packaging/npm/mimikyu-mcp/package.json
+fi
+if [ -f "$REPO_ROOT/server.json" ]; then
+  git add server.json
 fi
 
 git commit -m "chore(release): ${RELEASE_TAG}"
