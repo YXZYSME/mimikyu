@@ -94,19 +94,19 @@ impl BrowserDriver for BidiDriver {
             .unwrap_or_else(|| profile_dir.join("downloads"));
         let pid = process.pid();
 
-        let conn = BidiConnection::connect(&ws_session_url, process, root_relay, pool_download_dir)
-            .await?;
+        let conn = BidiConnection::connect(
+            &ws_session_url,
+            process,
+            root_relay,
+            pool_download_dir,
+            opts.ignore_https_errors,
+        )
+        .await?;
 
         let new_sess = match conn
             .send(
                 "session.new",
-                json!({
-                    "capabilities": {
-                        "alwaysMatch": {
-                            "acceptInsecureCerts": true
-                        }
-                    }
-                }),
+                build_session_new_params(opts.ignore_https_errors),
             )
             .await
         {
@@ -165,13 +165,16 @@ impl BrowserDriver for BidiDriver {
 
         let (user_context, owns_user_context, target_id) = match opts.profile_mode {
             ProfileMode::VirtualContext => {
-                let uc = match create_user_context(&conn, opts.proxy.as_ref()).await {
-                    Ok(u) => u,
-                    Err(e) => {
-                        conn.shutdown_all().await;
-                        return Err(e);
-                    }
-                };
+                let uc =
+                    match create_user_context(&conn, opts.proxy.as_ref(), opts.ignore_https_errors)
+                        .await
+                    {
+                        Ok(u) => u,
+                        Err(e) => {
+                            conn.shutdown_all().await;
+                            return Err(e);
+                        }
+                    };
                 conn.isolated_contexts.write().insert(uc.clone());
                 // Must use type: "window" (type: "tab" with default background:false hangs in headless firefox-1497).
                 let created = match conn
@@ -298,11 +301,38 @@ fn bidi_capabilities() -> DriverCapabilities {
     }
 }
 
-async fn create_user_context(conn: &BidiConnection, proxy: Option<&ProxyConfig>) -> Result<String> {
-    let mut params = json!({ "acceptInsecureCerts": true });
+fn build_session_new_params(ignore_https_errors: bool) -> Value {
+    let mut always_match = serde_json::Map::new();
+    if ignore_https_errors {
+        always_match.insert("acceptInsecureCerts".to_string(), json!(true));
+    }
+    json!({
+        "capabilities": {
+            "alwaysMatch": always_match
+        }
+    })
+}
+
+fn build_create_user_context_params(
+    proxy: Option<&ProxyConfig>,
+    ignore_https_errors: bool,
+) -> Result<Value> {
+    let mut params = json!({});
+    if ignore_https_errors {
+        params["acceptInsecureCerts"] = json!(true);
+    }
     if let Some(p) = proxy {
         params["proxy"] = proxy_to_bidi_json(p)?;
     }
+    Ok(params)
+}
+
+async fn create_user_context(
+    conn: &BidiConnection,
+    proxy: Option<&ProxyConfig>,
+    ignore_https_errors: bool,
+) -> Result<String> {
+    let params = build_create_user_context_params(proxy, ignore_https_errors)?;
     let res = conn.send("browser.createUserContext", params).await?;
     res["userContext"]
         .as_str()
@@ -367,6 +397,7 @@ struct BidiConnection {
     active_targets: RwLock<HashMap<String, String>>,
     global_intercept_id: AsyncMutex<Option<String>>,
     intercept_owners: Mutex<HashSet<u64>>,
+    ignore_https_errors: bool,
     pool_download_dir: PathBuf,
     active_pool_downloads: Arc<Mutex<HashSet<String>>>,
     recent_content_disposition: Mutex<HashMap<(String, String), String>>,
@@ -504,6 +535,7 @@ impl BidiConnection {
         process: ProcessGuard,
         root_proxy_relay: Option<ProxyRelay>,
         pool_download_dir: PathBuf,
+        ignore_https_errors: bool,
     ) -> Result<Arc<Self>> {
         let mut ws_config = WebSocketConfig::default();
         ws_config.max_message_size = Some(128 * 1024 * 1024);
@@ -531,6 +563,7 @@ impl BidiConnection {
             active_targets: RwLock::new(HashMap::new()),
             global_intercept_id: AsyncMutex::new(None),
             intercept_owners: Mutex::new(HashSet::new()),
+            ignore_https_errors,
             pool_download_dir,
             active_pool_downloads: Arc::new(Mutex::new(HashSet::new())),
             recent_content_disposition: Mutex::new(HashMap::new()),
@@ -3483,7 +3516,12 @@ impl DriverSession for BidiSession {
             opts.proxy = Some(rewritten);
             relay_opt = Some(relay);
         }
-        let uc = create_user_context(&self.conn, opts.proxy.as_ref()).await?;
+        let uc = create_user_context(
+            &self.conn,
+            opts.proxy.as_ref(),
+            self.conn.ignore_https_errors,
+        )
+        .await?;
         self.conn.isolated_contexts.write().insert(uc.clone());
 
         let cleanup_uc = |conn: Arc<BidiConnection>, uc: String| async move {
@@ -7491,6 +7529,7 @@ mod tests {
             active_targets: RwLock::new(HashMap::new()),
             global_intercept_id: AsyncMutex::new(None),
             intercept_owners: Mutex::new(HashSet::new()),
+            ignore_https_errors: false,
             pool_download_dir: pool_dir,
             active_pool_downloads: Arc::new(Mutex::new(HashSet::new())),
             recent_content_disposition: Mutex::new(HashMap::new()),
@@ -8193,5 +8232,126 @@ mod tests {
             !fail_placeholder.exists(),
             "fail.bin placeholder cleaned up"
         );
+    }
+
+    #[test]
+    fn bidi_session_and_user_context_enforce_tls_by_default_and_allow_opt_in() {
+        let default_opts = LaunchOptions::default();
+        assert!(!default_opts.ignore_https_errors);
+
+        let sess_default = build_session_new_params(default_opts.ignore_https_errors);
+        assert_eq!(
+            sess_default,
+            json!({
+                "capabilities": {
+                    "alwaysMatch": {}
+                }
+            })
+        );
+        assert!(
+            sess_default["capabilities"]["alwaysMatch"]
+                .get("acceptInsecureCerts")
+                .is_none()
+        );
+
+        let sess_opt_in = build_session_new_params(true);
+        assert_eq!(
+            sess_opt_in,
+            json!({
+                "capabilities": {
+                    "alwaysMatch": {
+                        "acceptInsecureCerts": true
+                    }
+                }
+            })
+        );
+
+        let proxy = ProxyConfig::parse_normalized("http://127.0.0.1:8080").unwrap();
+        let uc_default = build_create_user_context_params(None, false).unwrap();
+        assert_eq!(uc_default, json!({}));
+        assert!(uc_default.get("acceptInsecureCerts").is_none());
+
+        let uc_default_proxy = build_create_user_context_params(Some(&proxy), false).unwrap();
+        assert!(uc_default_proxy.get("acceptInsecureCerts").is_none());
+        assert_eq!(uc_default_proxy["proxy"]["httpProxy"], "127.0.0.1:8080");
+
+        let uc_opt_in = build_create_user_context_params(None, true).unwrap();
+        assert_eq!(uc_opt_in, json!({ "acceptInsecureCerts": true }));
+
+        let uc_opt_in_proxy = build_create_user_context_params(Some(&proxy), true).unwrap();
+        assert_eq!(uc_opt_in_proxy["acceptInsecureCerts"], json!(true));
+        assert_eq!(uc_opt_in_proxy["proxy"]["httpProxy"], "127.0.0.1:8080");
+    }
+
+    #[tokio::test]
+    async fn create_user_context_wire_payload_respects_ignore_https_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        for ignore_https_errors in [false, true] {
+            let (write_tx, mut write_rx) = mpsc::unbounded_channel();
+            let conn = Arc::new(BidiConnection {
+                next_id: AtomicU64::new(1),
+                write_tx,
+                pending: Mutex::new(HashMap::new()),
+                contexts: RwLock::new(HashMap::new()),
+                context_parents: RwLock::new(HashMap::new()),
+                context_openers: RwLock::new(HashMap::new()),
+                context_user_contexts: RwLock::new(HashMap::new()),
+                user_contexts: RwLock::new(HashMap::new()),
+                context_requests: RwLock::new(HashMap::new()),
+                request_stores: RwLock::new(HashMap::new()),
+                isolated_contexts: RwLock::new(HashSet::new()),
+                active_targets: RwLock::new(HashMap::new()),
+                global_intercept_id: AsyncMutex::new(None),
+                intercept_owners: Mutex::new(HashSet::new()),
+                ignore_https_errors,
+                pool_download_dir: tmp.path().to_path_buf(),
+                active_pool_downloads: Arc::new(Mutex::new(HashSet::new())),
+                recent_content_disposition: Mutex::new(HashMap::new()),
+                download_transfers_by_req_id: Mutex::new(HashMap::new()),
+                pending_download_req_ids: Mutex::new(HashMap::new()),
+                download_ends_by_dl_id: Mutex::new(HashMap::new()),
+                download_ends_by_nav: Mutex::new(HashMap::new()),
+                download_ends_by_file: Mutex::new(HashMap::new()),
+                active_download_nav_counts: Arc::new(Mutex::new(HashMap::new())),
+                active_same_url_counts: Arc::new(Mutex::new(HashMap::new())),
+                download_end_supported: AtomicBool::new(false),
+                process: AsyncMutex::new(None),
+                _root_proxy_relay: Mutex::new(None),
+                closed: AtomicBool::new(false),
+                io_tasks: Mutex::new(Vec::new()),
+            });
+
+            let conn_responder = Arc::clone(&conn);
+            let responder = tokio::spawn(async move {
+                let raw = write_rx.recv().await.expect("outgoing BiDi frame");
+                let sent: Value = serde_json::from_str(&raw).expect("valid JSON");
+                let id = sent["id"].as_u64().expect("frame id");
+                conn_responder.handle_incoming(
+                    &json!({
+                        "type": "success",
+                        "id": id,
+                        "result": { "userContext": "uc-test" }
+                    })
+                    .to_string(),
+                );
+                sent
+            });
+
+            let uc = create_user_context(&conn, None, conn.ignore_https_errors)
+                .await
+                .expect("create_user_context");
+            assert_eq!(uc, "uc-test");
+
+            let sent = responder.await.unwrap();
+            assert_eq!(sent["method"], "browser.createUserContext");
+            if ignore_https_errors {
+                assert_eq!(sent["params"]["acceptInsecureCerts"], json!(true));
+            } else {
+                assert!(
+                    sent["params"].get("acceptInsecureCerts").is_none(),
+                    "default context must not emit acceptInsecureCerts: {sent}"
+                );
+            }
+        }
     }
 }

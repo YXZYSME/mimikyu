@@ -289,6 +289,8 @@ pub struct LaunchOptions {
     pub privacy_mode: bool,
     pub instant_animations: bool,
     pub main_world_eval: bool,
+    #[serde(default)]
+    pub ignore_https_errors: bool,
     pub launch_timeout_ms: u64,
     pub extra_args: Vec<String>,
     #[serde(default)]
@@ -315,6 +317,7 @@ impl Default for LaunchOptions {
             privacy_mode: false,
             instant_animations: false,
             main_world_eval: false,
+            ignore_https_errors: false,
             launch_timeout_ms: 15_000,
             extra_args: Vec::new(),
             extra_prefs: BTreeMap::new(),
@@ -1203,5 +1206,22 @@ mod tests {
         // 8. Unrecoverable malformed JSON extracts top-level id (ignoring nested "id")
         let err = parse_protocol_json(r#"{"nested":{"id":999},"id":42,"broken":tru}"#).unwrap_err();
         assert_eq!(err.0, Some(42));
+    }
+
+    #[test]
+    fn launch_options_ignore_https_errors_defaults_to_false() {
+        let opts = LaunchOptions::default();
+        assert!(!opts.ignore_https_errors);
+
+        let mut raw = serde_json::to_value(&opts).unwrap();
+        raw.as_object_mut().unwrap().remove("ignore_https_errors");
+        let decoded: LaunchOptions = serde_json::from_value(raw).unwrap();
+        assert!(!decoded.ignore_https_errors);
+
+        let opt_in = LaunchOptions {
+            ignore_https_errors: true,
+            ..Default::default()
+        };
+        assert!(opt_in.ignore_https_errors);
     }
 }

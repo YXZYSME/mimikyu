@@ -1,9 +1,11 @@
 pub mod pool;
 pub mod protocol;
 
-use std::fs::{self, OpenOptions};
+use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::Write;
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{
+    symlink, DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt,
+};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -30,7 +32,154 @@ pub use protocol::{
 
 const MAX_SUN_PATH_BYTES: usize = 100;
 const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+const DAEMON_DIR_MODE: u32 = 0o700;
+const DAEMON_FILE_MODE: u32 = 0o600;
 pub const DEFAULT_DAEMON_IDLE_TIMEOUT_SECS: u64 = 300;
+
+fn current_euid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+fn fallback_socket_dir() -> PathBuf {
+    let base = if Path::new("/tmp").is_dir() {
+        PathBuf::from("/tmp")
+    } else {
+        std::env::temp_dir()
+    };
+    base.join(format!("mimikyu-{}", current_euid()))
+}
+
+fn validate_fallback_dir_metadata(
+    dir: &Path,
+    meta: &fs::Metadata,
+    expected_uid: u32,
+) -> Result<()> {
+    if meta.file_type().is_symlink() {
+        return Err(MimikyuError::InvalidConfig(format!(
+            "refusing to use symlink '{}' as daemon fallback socket directory",
+            dir.display()
+        )));
+    }
+    if !meta.file_type().is_dir() {
+        return Err(MimikyuError::InvalidConfig(format!(
+            "daemon fallback socket directory '{}' is not a directory",
+            dir.display()
+        )));
+    }
+    if meta.uid() != expected_uid {
+        return Err(MimikyuError::InvalidConfig(format!(
+            "daemon fallback socket directory '{}' is owned by uid {}, expected {}",
+            dir.display(),
+            meta.uid(),
+            expected_uid
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_secure_fallback_dir_for_uid(dir: &Path, expected_uid: u32) -> Result<()> {
+    match DirBuilder::new().mode(DAEMON_DIR_MODE).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    let meta = fs::symlink_metadata(dir)?;
+    validate_fallback_dir_metadata(dir, &meta, expected_uid)?;
+
+    fs::set_permissions(dir, fs::Permissions::from_mode(DAEMON_DIR_MODE))?;
+
+    let verified = fs::symlink_metadata(dir)?;
+    validate_fallback_dir_metadata(dir, &verified, expected_uid)?;
+    let mode = verified.mode() & 0o777;
+    if mode != DAEMON_DIR_MODE {
+        return Err(MimikyuError::InvalidConfig(format!(
+            "daemon fallback socket directory '{}' has permissions {:04o}, expected {:04o}",
+            dir.display(),
+            mode,
+            DAEMON_DIR_MODE
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_secure_fallback_dir(dir: &Path) -> Result<()> {
+    ensure_secure_fallback_dir_for_uid(dir, current_euid())
+}
+
+fn ensure_state_dir_permissions(state_dir: &Path) -> Result<()> {
+    fs::create_dir_all(state_dir)?;
+    fs::set_permissions(state_dir, fs::Permissions::from_mode(DAEMON_DIR_MODE))?;
+    Ok(())
+}
+
+fn is_expected_short_socket_filename(name: &std::ffi::OsStr) -> bool {
+    let Some(s) = name.to_str() else {
+        return false;
+    };
+    let Some(rest) = s.strip_prefix("mkd-") else {
+        return false;
+    };
+    let Some(hex) = rest.strip_suffix(".sock") else {
+        return false;
+    };
+    hex.len() == 16 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn is_safe_cleanup_socket_target(resolved: &Path, paths: &DaemonPaths, expected_uid: u32) -> bool {
+    let Ok(meta) = fs::symlink_metadata(resolved) else {
+        return false;
+    };
+    if meta.file_type().is_symlink() || !meta.file_type().is_socket() {
+        return false;
+    }
+    if meta.uid() != expected_uid {
+        return false;
+    }
+    let Some(file_name) = resolved.file_name() else {
+        return false;
+    };
+    if !is_expected_short_socket_filename(file_name) {
+        return false;
+    }
+    let Some(parent) = resolved.parent() else {
+        return false;
+    };
+    let Ok(canon_parent) = fs::canonicalize(parent) else {
+        return false;
+    };
+
+    let mut allowed_parents: Vec<PathBuf> = Vec::with_capacity(2);
+    if let Ok(canon_fallback) = fs::canonicalize(fallback_socket_dir()) {
+        allowed_parents.push(canon_fallback);
+    }
+    if paths.bound_sock != paths.sock_link
+        && let Some(bound_parent) = paths.bound_sock.parent()
+        && let Ok(canon_bound_parent) = fs::canonicalize(bound_parent)
+        && !allowed_parents.contains(&canon_bound_parent)
+    {
+        allowed_parents.push(canon_bound_parent);
+    }
+
+    allowed_parents.iter().any(|allowed| allowed == &canon_parent)
+}
+
+fn verify_peer_uid(peer_uid: u32, expected_uid: u32) -> std::result::Result<(), String> {
+    if peer_uid == expected_uid {
+        Ok(())
+    } else {
+        Err(format!(
+            "rejected daemon connection from unauthorized uid {peer_uid} (expected {expected_uid})"
+        ))
+    }
+}
+
+fn check_stream_peer_uid(stream: &UnixStream, expected_uid: u32) -> std::result::Result<(), String> {
+    let cred = stream
+        .peer_cred()
+        .map_err(|e| format!("failed to inspect daemon client peer credentials: {e}"))?;
+    verify_peer_uid(cred.uid(), expected_uid)
+}
 
 #[derive(Debug, Clone)]
 pub struct DaemonConfig {
@@ -83,7 +232,7 @@ fn resolve_socket_paths_inner(state_dir: &Path, create_dir: bool) -> Result<Daem
         )));
     }
     if create_dir {
-        fs::create_dir_all(state_dir)?;
+        ensure_state_dir_permissions(state_dir)?;
     }
 
     let canon_state_dir = fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
@@ -104,12 +253,11 @@ fn resolve_socket_paths_inner(state_dir: &Path, create_dir: bool) -> Result<Daem
             use std::fmt::Write as _;
             let _ = write!(&mut hex16, "{byte:02x}");
         }
-        let base = if Path::new("/tmp").is_dir() {
-            PathBuf::from("/tmp")
-        } else {
-            std::env::temp_dir()
-        };
-        base.join(format!("mkd-{hex16}.sock"))
+        let fallback_dir = fallback_socket_dir();
+        if create_dir {
+            ensure_secure_fallback_dir(&fallback_dir)?;
+        }
+        fallback_dir.join(format!("mkd-{hex16}.sock"))
     } else {
         sock_link.clone()
     };
@@ -156,6 +304,7 @@ pub fn is_pid_alive(pid: i32) -> bool {
 }
 
 pub fn cleanup_stale_files(paths: &DaemonPaths) {
+    let euid = current_euid();
     if let Ok(meta) = fs::symlink_metadata(&paths.sock_link) {
         if meta.file_type().is_symlink()
             && let Ok(target) = fs::read_link(&paths.sock_link)
@@ -165,11 +314,21 @@ pub fn cleanup_stale_files(paths: &DaemonPaths) {
             } else {
                 target
             };
-            let _ = fs::remove_file(resolved);
+            if is_safe_cleanup_socket_target(&resolved, paths, euid) {
+                let _ = fs::remove_file(&resolved);
+            } else {
+                tracing::warn!(
+                    sock_link = %paths.sock_link.display(),
+                    target = %resolved.display(),
+                    "refusing to unlink unexpected daemon.sock symlink target"
+                );
+            }
         }
         let _ = fs::remove_file(&paths.sock_link);
     }
-    if paths.bound_sock != paths.sock_link {
+    if paths.bound_sock != paths.sock_link
+        && is_safe_cleanup_socket_target(&paths.bound_sock, paths, euid)
+    {
         let _ = fs::remove_file(&paths.bound_sock);
     }
     let _ = fs::remove_file(&paths.pid_file);
@@ -398,7 +557,9 @@ async fn acquire_daemon_lock(lock_path: &Path) -> Result<fs::File> {
             .write(true)
             .create(true)
             .truncate(false)
+            .mode(DAEMON_FILE_MODE)
             .open(&lock_path)?;
+        file.set_permissions(fs::Permissions::from_mode(DAEMON_FILE_MODE))?;
         file.lock_exclusive()?;
         Ok(file)
     })
@@ -434,7 +595,9 @@ impl DaemonServer {
                         .write(true)
                         .create(true)
                         .truncate(false)
+                        .mode(DAEMON_FILE_MODE)
                         .open(&path)?;
+                    file.set_permissions(fs::Permissions::from_mode(DAEMON_FILE_MODE))?;
                     file.try_lock_exclusive()?;
                     Ok(file)
                 })
@@ -459,11 +622,39 @@ impl DaemonServer {
                 )));
             }
 
-            if paths.bound_sock.exists() {
+            ensure_state_dir_permissions(&paths.state_dir)?;
+            if paths.bound_sock != paths.sock_link
+                && let Some(parent) = paths.bound_sock.parent()
+            {
+                ensure_secure_fallback_dir(parent)?;
+            }
+
+            if let Ok(meta) = fs::symlink_metadata(&paths.bound_sock) {
+                if meta.file_type().is_dir() {
+                    return Err(MimikyuError::InvalidConfig(format!(
+                        "daemon socket path '{}' is a directory",
+                        paths.bound_sock.display()
+                    )));
+                }
+                if meta.uid() != current_euid() {
+                    return Err(MimikyuError::InvalidConfig(format!(
+                        "refusing to replace daemon socket '{}' owned by uid {}",
+                        paths.bound_sock.display(),
+                        meta.uid()
+                    )));
+                }
                 let _ = fs::remove_file(&paths.bound_sock);
             }
 
             let listener = UnixListener::bind(&paths.bound_sock)?;
+            if let Err(err) = fs::set_permissions(
+                &paths.bound_sock,
+                fs::Permissions::from_mode(DAEMON_FILE_MODE),
+            ) {
+                drop(listener);
+                let _ = fs::remove_file(&paths.bound_sock);
+                return Err(err.into());
+            }
 
             if paths.bound_sock != paths.sock_link {
                 let _ = fs::remove_file(&paths.sock_link);
@@ -671,7 +862,9 @@ fn write_pid_file(path: &Path, pid: u32) -> Result<()> {
             .write(true)
             .create(true)
             .truncate(true)
+            .mode(DAEMON_FILE_MODE)
             .open(&tmp_path)?;
+        f.set_permissions(fs::Permissions::from_mode(DAEMON_FILE_MODE))?;
         writeln!(f, "{pid}")?;
         f.flush()?;
     }
@@ -680,6 +873,19 @@ fn write_pid_file(path: &Path, pid: u32) -> Result<()> {
 }
 
 async fn handle_connection(stream: UnixStream, pool: Arc<DaemonPool>) {
+    handle_connection_with_expected_uid(stream, pool, current_euid()).await;
+}
+
+async fn handle_connection_with_expected_uid(
+    stream: UnixStream,
+    pool: Arc<DaemonPool>,
+    expected_uid: u32,
+) {
+    if let Err(reason) = check_stream_peer_uid(&stream, expected_uid) {
+        tracing::warn!("{reason}");
+        drop(stream);
+        return;
+    }
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
 
@@ -1261,4 +1467,245 @@ pub async fn daemon_stop(state_dir: &Path) -> Result<bool> {
 pub async fn run_daemon_foreground(config: DaemonConfig) -> Result<()> {
     let server = DaemonServer::bind(config).await?;
     server.run().await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::net::UnixListener as StdUnixListener;
+
+    #[tokio::test]
+    async fn daemon_bind_enforces_0700_state_dir_and_0600_socket_permissions() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("loose_state_dir");
+        fs::create_dir_all(&state_dir).expect("create state_dir");
+        fs::set_permissions(&state_dir, fs::Permissions::from_mode(0o755)).expect("set loose mode");
+
+        let server = DaemonServer::bind(DaemonConfig::new(state_dir.clone()))
+            .await
+            .expect("bind daemon");
+
+        let dir_mode = fs::symlink_metadata(&state_dir).unwrap().mode() & 0o777;
+        assert_eq!(dir_mode, 0o700, "state_dir must be tightened to 0700");
+
+        let sock_mode = fs::symlink_metadata(&server.paths().bound_sock)
+            .unwrap()
+            .mode()
+            & 0o777;
+        assert_eq!(sock_mode, 0o600, "daemon socket must have mode 0600");
+
+        let pid_mode = fs::symlink_metadata(&server.paths().pid_file)
+            .unwrap()
+            .mode()
+            & 0o777;
+        assert_eq!(pid_mode, 0o600, "daemon pid file must have mode 0600");
+
+        for lock_name in ["daemon-bind.lock", "daemon-active.lock"] {
+            let lock_mode = fs::symlink_metadata(state_dir.join(lock_name))
+                .unwrap()
+                .mode()
+                & 0o777;
+            assert_eq!(lock_mode, 0o600, "{lock_name} must have mode 0600");
+        }
+
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn daemon_long_path_uses_user_owned_0700_fallback_dir_and_0600_socket() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let deep = tmp
+            .path()
+            .join("long_fallback_security_segment_01_xxxxxxxxxxxxxxxx")
+            .join("long_fallback_security_segment_02_xxxxxxxxxxxxxxxx")
+            .join("long_fallback_security_segment_03_xxxxxxxxxxxxxxxx");
+
+        let server = DaemonServer::bind(DaemonConfig::new(deep.clone()))
+            .await
+            .expect("bind long-path daemon");
+
+        let bound_sock = server.paths().bound_sock.clone();
+        assert_ne!(bound_sock, server.paths().sock_link);
+        assert!(bound_sock.as_os_str().as_encoded_bytes().len() < MAX_SUN_PATH_BYTES);
+
+        let fallback_dir = bound_sock.parent().expect("fallback parent");
+        let expected_name = format!("mimikyu-{}", current_euid());
+        assert_eq!(
+            fallback_dir.file_name().and_then(|s| s.to_str()),
+            Some(expected_name.as_str())
+        );
+
+        let dir_meta = fs::symlink_metadata(fallback_dir).expect("fallback dir meta");
+        assert!(!dir_meta.file_type().is_symlink());
+        assert!(dir_meta.file_type().is_dir());
+        assert_eq!(dir_meta.uid(), current_euid());
+        assert_eq!(dir_meta.mode() & 0o777, 0o700);
+
+        let sock_meta = fs::symlink_metadata(&bound_sock).expect("bound sock meta");
+        assert!(sock_meta.file_type().is_socket());
+        assert_eq!(sock_meta.mode() & 0o777, 0o600);
+
+        let state_mode = fs::symlink_metadata(&deep).unwrap().mode() & 0o777;
+        assert_eq!(state_mode, 0o700);
+
+        drop(server);
+        assert!(fs::symlink_metadata(&bound_sock).is_err());
+    }
+
+    #[test]
+    fn ensure_secure_fallback_dir_validates_type_ownership_and_mode() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        // 1. Missing directory is created with 0700.
+        let fresh = tmp.path().join("fresh_fallback");
+        ensure_secure_fallback_dir(&fresh).expect("create fresh fallback dir");
+        let fresh_meta = fs::symlink_metadata(&fresh).unwrap();
+        assert!(fresh_meta.file_type().is_dir());
+        assert_eq!(fresh_meta.mode() & 0o777, 0o700);
+
+        // 2. Existing directory with loose 0755 permissions is tightened to 0700.
+        let loose = tmp.path().join("loose_fallback");
+        fs::create_dir(&loose).unwrap();
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_secure_fallback_dir(&loose).expect("tighten loose dir");
+        assert_eq!(fs::symlink_metadata(&loose).unwrap().mode() & 0o777, 0o700);
+
+        // 3. Symlink (even pointing to a valid 0700 directory) must be rejected.
+        let link_path = tmp.path().join("symlink_fallback");
+        symlink(&fresh, &link_path).unwrap();
+        let err = ensure_secure_fallback_dir(&link_path).expect_err("symlink must fail");
+        assert!(matches!(err, MimikyuError::InvalidConfig(_)));
+
+        // 4. Regular file must be rejected.
+        let file_path = tmp.path().join("file_fallback");
+        fs::write(&file_path, b"not a dir").unwrap();
+        let err = ensure_secure_fallback_dir(&file_path).expect_err("regular file must fail");
+        assert!(matches!(err, MimikyuError::InvalidConfig(_)));
+
+        // 5. UID mismatch must be rejected.
+        let wrong_uid = current_euid().wrapping_add(1);
+        let err = ensure_secure_fallback_dir_for_uid(&fresh, wrong_uid)
+            .expect_err("uid mismatch must fail");
+        assert!(matches!(err, MimikyuError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn cleanup_stale_files_validates_symlink_targets() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("state");
+        let paths = resolve_socket_paths(&state_dir).expect("resolve paths");
+
+        // Case 1: Malicious symlink to an arbitrary user-owned file must NOT unlink target.
+        let victim_file = tmp.path().join("important_secret.txt");
+        fs::write(&victim_file, b"keep me").unwrap();
+        symlink(&victim_file, &paths.sock_link).unwrap();
+        cleanup_stale_files(&paths);
+        assert!(
+            victim_file.exists(),
+            "arbitrary symlink target must never be unlinked"
+        );
+        assert!(
+            fs::symlink_metadata(&paths.sock_link).is_err(),
+            "malicious daemon.sock symlink itself should still be removed"
+        );
+
+        // Case 2: Symlink to a real Unix socket with mkd-<16hex>.sock name OUTSIDE fallback dir.
+        let outside_sock = tmp.path().join("mkd-0123456789abcdef.sock");
+        let _outside_listener = StdUnixListener::bind(&outside_sock).unwrap();
+        symlink(&outside_sock, &paths.sock_link).unwrap();
+        cleanup_stale_files(&paths);
+        assert!(
+            outside_sock.exists(),
+            "socket outside daemon fallback directory must not be unlinked"
+        );
+
+        // Case 3: Path traversal from fallback dir to outside file must NOT unlink target.
+        let fallback_dir = fallback_socket_dir();
+        ensure_secure_fallback_dir(&fallback_dir).unwrap();
+        let traversal_target = fallback_dir
+            .join("..")
+            .join(victim_file.strip_prefix("/").unwrap_or(&victim_file));
+        symlink(&traversal_target, &paths.sock_link).unwrap();
+        cleanup_stale_files(&paths);
+        assert!(
+            victim_file.exists(),
+            "traversal target must not be unlinked"
+        );
+
+        // Case 4: Chained symlink inside fallback dir matching mkd-<16hex>.sock must NOT unlink.
+        let chained_name = format!("mkd-{:016x}.sock", u64::from(std::process::id()) ^ 0xA5A5);
+        let chained_link = fallback_dir.join(&chained_name);
+        let _ = fs::remove_file(&chained_link);
+        symlink(&victim_file, &chained_link).unwrap();
+        symlink(&chained_link, &paths.sock_link).unwrap();
+        cleanup_stale_files(&paths);
+        assert!(
+            chained_link.symlink_metadata().is_ok(),
+            "chained symlink inside fallback dir must not be unlinked as a socket"
+        );
+        assert!(victim_file.exists());
+        let _ = fs::remove_file(&chained_link);
+
+        // Case 5: Legitimate Unix socket inside fallback dir owned by current UID IS cleaned up.
+        let valid_name = format!("mkd-{:016x}.sock", u64::from(std::process::id()) ^ 0x5A5A);
+        let valid_sock = fallback_dir.join(&valid_name);
+        let _ = fs::remove_file(&valid_sock);
+        let valid_listener = StdUnixListener::bind(&valid_sock).unwrap();
+        drop(valid_listener);
+        symlink(&valid_sock, &paths.sock_link).unwrap();
+        cleanup_stale_files(&paths);
+        assert!(
+            fs::symlink_metadata(&valid_sock).is_err(),
+            "legitimate stale daemon socket in fallback dir should be cleaned up"
+        );
+        assert!(fs::symlink_metadata(&paths.sock_link).is_err());
+    }
+
+    #[tokio::test]
+    async fn daemon_connection_enforces_peer_uid_and_rejects_mismatch() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let state_dir = tmp.path().join("uid_auth_state");
+        let paths = resolve_socket_paths(&state_dir).expect("resolve paths");
+        let manager = Arc::new(
+            SessionManager::with_config(SessionManagerConfig {
+                state_dir: paths.state_dir.clone(),
+                ..Default::default()
+            })
+            .expect("session manager"),
+        );
+        let pool = DaemonPool::new(manager, paths, None);
+
+        // 1. Matching UID succeeds and serves Ping RPC.
+        let (server_ok, mut client_ok) = UnixStream::pair().expect("unix stream pair");
+        let pool_ok = Arc::clone(&pool);
+        let srv_task_ok = tokio::spawn(async move {
+            handle_connection_with_expected_uid(server_ok, pool_ok, current_euid()).await;
+        });
+        let ping_req = DaemonRequest {
+            id: 1,
+            op: DaemonOp::Ping,
+        };
+        let resp = send_rpc_on_stream(&mut client_ok, &ping_req)
+            .await
+            .unwrap_or_else(|_| panic!("matching UID must succeed"));
+        assert!(resp.ok);
+        assert_eq!(resp.data.unwrap()["pong"], true);
+        drop(client_ok);
+        srv_task_ok.await.unwrap();
+
+        // 2. Mismatched UID is rejected immediately without serving requests.
+        let (server_bad, mut client_bad) = UnixStream::pair().expect("unix stream pair");
+        let pool_bad = Arc::clone(&pool);
+        let wrong_uid = current_euid().wrapping_add(1);
+        let srv_task_bad = tokio::spawn(async move {
+            handle_connection_with_expected_uid(server_bad, pool_bad, wrong_uid).await;
+        });
+        let res = send_rpc_on_stream(&mut client_bad, &ping_req).await;
+        assert!(
+            res.is_err(),
+            "connection with mismatched peer UID must be rejected"
+        );
+        drop(client_bad);
+        srv_task_bad.await.unwrap();
+    }
 }
