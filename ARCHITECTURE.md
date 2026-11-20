@@ -10,14 +10,14 @@ This document maps the workspace dependency graph and codifies the **five non-ne
 
 `mimikyu` is split into two Rust crates (`edition = "2024"`, MSRV `1.88`) and an opaque-box Python 3 stdlib end-to-end verification suite (`e2e/`):
 
-- **`crates/mimikyu-core`**: Pure library crate containing browser discovery, process-group lifecycle, WebSocket CDP & BiDi protocol drivers, two-tier profile/context isolation, coherent environment profiles & `ProxyRelay`, semantic `@eN` accessibility snapshots, structured extraction, `ChokepointInput`, deterministic waits, the warm Unix-socket daemon, the 31-tool stdio MCP server, the dual-origin local HTTP test harness, and the benchmark suite.
+- **`crates/mimikyu-core`**: Pure library crate containing browser discovery, process-group lifecycle, WebSocket CDP & BiDi protocol drivers, two-tier profile/context isolation, coherent environment profiles & `ProxyRelay`, semantic `@eN` accessibility snapshots, structured extraction, `ChokepointInput`, deterministic waits, the warm Unix-socket daemon, the 33-tool stdio MCP server, the dual-origin local HTTP test harness, and the benchmark suite.
 - **`crates/mimikyu-cli`**: Thin binary crate (`mimikyu`) providing `clap` CLI argument parsing, `--json` envelope formatting, auto-spawning daemon client dispatch, and frontends for `mcp`, `daemon`, `doctor`, and `bench`.
 - **`e2e/`**: Zero-dependency Python 3 stdlib test suite exercising the compiled `mimikyu` binary across local `127.0.0.1:0` HTTP/proxy servers (Tiers 1–4 + `--self-test`).
 
 ```mermaid
 flowchart TD
     CLI["mimikyu-cli (cli, client, batch, output, commands)"] --> Daemon["daemon (Unix-socket NDJSON server & DaemonPool)"]
-    CLI --> MCP["mcp (Stdio JSON-RPC 2.0 server, 31 tools)"]
+    CLI --> MCP["mcp (Stdio JSON-RPC 2.0 server, 33 tools)"]
     CLI --> Bench["bench (Speed & 5-workflow agentic suite + RSS)"]
     CLI --> Session["session (Unified SessionManager)"]
 

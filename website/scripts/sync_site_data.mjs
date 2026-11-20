@@ -13,6 +13,7 @@
  * Writes:
  *   - ./src/data/release.json
  *   - ./public/llms.txt
+ *   - ./public/assets/mimikyu-banner.svg
  */
 
 import fs from 'node:fs';
@@ -34,6 +35,97 @@ const MCP_TOOLS_PATH = path.join(WEBSITE_DIR, 'src', 'data', 'mcp-tools.json');
 const BENCHMARKS_PATH = path.join(WEBSITE_DIR, 'src', 'data', 'benchmarks.json');
 const RELEASE_JSON_PATH = path.join(WEBSITE_DIR, 'src', 'data', 'release.json');
 const LLMS_TXT_PATH = path.join(WEBSITE_DIR, 'public', 'llms.txt');
+const ROOT_BANNER_SVG_PATH = path.join(REPO_ROOT, 'assets', 'mimikyu-banner.svg');
+const SITE_BANNER_SVG_PATH = path.join(WEBSITE_DIR, 'public', 'assets', 'mimikyu-banner.svg');
+
+// 5x7 pixel-art glyph bitmaps matching the native 2px grid typeface in mimikyu-banner.svg
+const PIXEL_FONT = {
+  '0': [' ### ', '#   #', '#  ##', '# # #', '##  #', '#   #', ' ### '],
+  '1': ['  #  ', ' ##  ', '  #  ', '  #  ', '  #  ', '  #  ', ' ### '],
+  '2': [' ### ', '#   #', '    #', '  ## ', ' #   ', '#    ', '#####'],
+  '3': ['#### ', '    #', '    #', ' ### ', '    #', '    #', '#### '],
+  '4': ['   # ', '  ## ', ' # # ', '#  # ', '#####', '   # ', '   # '],
+  '5': ['#####', '#    ', '#    ', '#### ', '    #', '    #', '#### '],
+  '6': [' ### ', '#    ', '#    ', '#### ', '#   #', '#   #', ' ### '],
+  '7': ['#####', '    #', '   # ', '  #  ', ' #   ', ' #   ', ' #   '],
+  '8': [' ### ', '#   #', '#   #', ' ### ', '#   #', '#   #', ' ### '],
+  '9': [' ### ', '#   #', '#   #', ' ####', '    #', '    #', ' ### '],
+  v: ['     ', '     ', '#   #', '#   #', '#   #', ' # # ', '  #  '],
+  '.': ['  ', '  ', '  ', '  ', '  ', '##', '##'],
+  '-': ['     ', '     ', '     ', '#####', '     ', '     ', '     '],
+};
+
+function measurePixelText(text, scale = 2, gapCols = 1) {
+  let cols = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const glyph = PIXEL_FONT[text[i]];
+    if (!glyph) continue;
+    if (cols > 0) cols += gapCols;
+    cols += glyph[0].length;
+  }
+  return cols * scale;
+}
+
+function buildPixelTextPath(text, startX, startY, scale = 2, gapCols = 1) {
+  let cursorX = startX;
+  const cmds = [];
+  for (const ch of text) {
+    const glyph = PIXEL_FONT[ch];
+    if (!glyph) continue;
+    for (let row = 0; row < glyph.length; row += 1) {
+      const line = glyph[row];
+      let col = 0;
+      while (col < line.length) {
+        if (line[col] !== '#') {
+          col += 1;
+          continue;
+        }
+        let run = 1;
+        while (col + run < line.length && line[col + run] === '#') {
+          run += 1;
+        }
+        const rx = cursorX + col * scale;
+        const ry = startY + row * scale;
+        const rw = run * scale;
+        cmds.push(`M${rx} ${ry}h${rw}v${scale}h-${rw}Z`);
+        col += run;
+      }
+    }
+    cursorX += (glyph[0].length + gapCols) * scale;
+  }
+  return cmds.join('');
+}
+
+function renderSyncedBannerSvg(baseSvgText, release) {
+  const cleaned = baseSvgText.replace(/\s*<g id="mimikyu-dynamic-hud">[\s\S]*?<\/g>\s*/g, '\n');
+
+  const entryNumber = String(release.mcp.total).padStart(3, '0');
+  const versionLabel = release.tag.split('-')[0];
+  const toolsCount = String(release.mcp.total);
+
+  const versionWidth = measurePixelText(versionLabel);
+  const versionX = 830 + Math.floor((96 - versionWidth) / 4) * 2;
+  const toolsX = 582;
+
+  const entryPath = buildPixelTextPath(entryNumber, 638, 36);
+  const versionPath = buildPixelTextPath(versionLabel, versionX, 36);
+  const toolsShadowPath = buildPixelTextPath(toolsCount, toolsX + 2, 218);
+  const toolsFgPath = buildPixelTextPath(toolsCount, toolsX, 216);
+
+  const hudGroup = [
+    '  <g id="mimikyu-dynamic-hud">',
+    '    <rect x="638" y="34" width="76" height="18" fill="#0E071C"/>',
+    `    <path fill="#9EFCE4" d="${entryPath}"/>`,
+    '    <rect x="832" y="34" width="92" height="18" fill="#0E071C"/>',
+    `    <path fill="#9EFCE4" d="${versionPath}"/>`,
+    '    <rect x="580" y="214" width="28" height="20" fill="#0E071C"/>',
+    `    <path fill="#090414" d="${toolsShadowPath}"/>`,
+    `    <path fill="#F4EEFF" d="${toolsFgPath}"/>`,
+    '  </g>',
+  ].join('\n');
+
+  return cleaned.replace(/<\/svg>\s*$/, `${hudGroup}\n</svg>\n`);
+}
 
 function parseWorkspacePackage(tomlText) {
   const lines = tomlText.split(/\r?\n/);
@@ -304,6 +396,12 @@ async function main() {
 
   fs.writeFileSync(RELEASE_JSON_PATH, `${JSON.stringify(releasePayload, null, 2)}\n`, 'utf-8');
   fs.writeFileSync(LLMS_TXT_PATH, buildLlmsTxt(releasePayload, mcpData, benchmarks), 'utf-8');
+
+  if (fs.existsSync(ROOT_BANNER_SVG_PATH)) {
+    const baseBannerSvg = fs.readFileSync(ROOT_BANNER_SVG_PATH, 'utf-8');
+    const syncedBannerSvg = renderSyncedBannerSvg(baseBannerSvg, releasePayload);
+    fs.writeFileSync(SITE_BANNER_SVG_PATH, syncedBannerSvg, 'utf-8');
+  }
 
   console.log(
     `[sync_site_data] Synced ${tag} (${versionSource}), ${totalTools} MCP tools (${mimikyuCount} mimikyu_* + ${browserCount} browser_*), demos=${demoReleaseTag}`

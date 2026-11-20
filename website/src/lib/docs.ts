@@ -79,6 +79,17 @@ const DOC_SLUG_BY_FILENAME = new Map(
   DOCS_MANIFEST.map((d) => [d.filename.toLowerCase(), d.slug])
 );
 
+function decodeHtmlEntities(input: string): string {
+  return input
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&#(\d+);/g, (_, dec) => String.fromCharCode(Number(dec)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+}
+
 function slugifyHeading(raw: string): string {
   return raw
     .toLowerCase()
@@ -121,7 +132,7 @@ export function loadDoc(slug: string, basePath = '/'): RenderedDoc {
     renderer: {
       heading({ tokens, depth }) {
         const innerHtml = this.parser.parseInline(tokens);
-        const plainText = innerHtml.replace(/<[^>]+>/g, '').trim();
+        const plainText = decodeHtmlEntities(innerHtml.replace(/<[^>]+>/g, '')).trim();
         const baseId = slugifyHeading(plainText) || `section-${headings.length + 1}`;
         const count = usedIds.get(baseId) ?? 0;
         usedIds.set(baseId, count + 1);
