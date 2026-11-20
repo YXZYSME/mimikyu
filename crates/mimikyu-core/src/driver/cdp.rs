@@ -1786,7 +1786,10 @@ impl CdpSessionState {
         match method {
             "Page.screencastFrame" if !from_child => {
                 let frame_session_id = params.get("sessionId").and_then(Value::as_i64);
-                let data_b64 = params.get("data").and_then(Value::as_str).map(ToString::to_string);
+                let data_b64 = params
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
                 let frame_path = {
                     let mut guard = self.screencast.lock();
                     if let Some(ref mut sc) = *guard
@@ -3264,6 +3267,56 @@ impl CdpSessionState {
         self.prune_pending_requests_for_detached(&sids_to_clean, &HashSet::new());
     }
 
+    fn invalidate_frame_contexts(
+        &self,
+        frame_id: Option<&str>,
+        resolved_fid: Option<&str>,
+        stale_isolated_ctx: Option<i64>,
+        stale_default_ctx: Option<i64>,
+    ) {
+        // Respect canonical lock ordering (`cdp.rs` header comment):
+        //   - `main_frame_id` is acquired singly and never nested.
+        //   - Nested locks follow: 1. `isolated_worlds`, 2. `default_contexts`,
+        //     3. `default_context_sessions`.
+        let prev_main = if frame_id.is_none() {
+            self.main_frame_id.lock().take()
+        } else {
+            None
+        };
+
+        let mut iw = self.isolated_worlds.lock();
+        let mut dc = self.default_contexts.lock();
+        let mut dcs = self.default_context_sessions.lock();
+        for fid in [frame_id, resolved_fid, prev_main.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            match stale_isolated_ctx {
+                Some(stale_id) => {
+                    if iw.get(fid) == Some(&stale_id) {
+                        iw.remove(fid);
+                    }
+                }
+                None => {
+                    iw.remove(fid);
+                }
+            }
+
+            // `default_contexts` is populated passively by `Runtime.executionContextCreated`
+            // events. Compare-and-remove prevents an older RPC failure from wiping a newer
+            // default context ID that already arrived for a same-process child frame, while
+            // still clearing stale main-frame caches when `frame_id.is_none()`.
+            let clear_default = match stale_default_ctx {
+                Some(stale_id) => dc.get(fid) == Some(&stale_id),
+                None => frame_id.is_none(),
+            };
+            if clear_default {
+                dc.remove(fid);
+                dcs.remove(fid);
+            }
+        }
+    }
+
     fn clear_execution_contexts(&self, event_sid: &str, from_child: bool) {
         let iframe_fids = self.iframe_sessions.lock().clone();
         if from_child {
@@ -3908,6 +3961,21 @@ impl CdpSession {
         }
     }
 
+    fn invalidate_frame_contexts(
+        &self,
+        frame_id: Option<&str>,
+        resolved_fid: Option<&str>,
+        stale_isolated_ctx: Option<i64>,
+        stale_default_ctx: Option<i64>,
+    ) {
+        self.state.invalidate_frame_contexts(
+            frame_id,
+            resolved_fid,
+            stale_isolated_ctx,
+            stale_default_ctx,
+        );
+    }
+
     async fn call_for_frame(
         &self,
         frame_id: Option<&str>,
@@ -3921,21 +3989,47 @@ impl CdpSession {
         self.conn.send_raw(Some(sid), method, params).await
     }
 
+    async fn release_cdp_eval_objects(&self, target_frame_id: Option<&str>, res: &Value) {
+        let exc_oid = res["exceptionDetails"]["exception"]["objectId"].as_str();
+        let res_oid = res["result"]["objectId"].as_str();
+        if let Some(oid) = exc_oid {
+            let _ = self
+                .call_for_frame(
+                    target_frame_id,
+                    "Runtime.releaseObject",
+                    json!({ "objectId": oid }),
+                )
+                .await;
+        }
+        if let Some(oid) = res_oid
+            && Some(oid) != exc_oid
+        {
+            let _ = self
+                .call_for_frame(
+                    target_frame_id,
+                    "Runtime.releaseObject",
+                    json!({ "objectId": oid }),
+                )
+                .await;
+        }
+    }
+
+    async fn resolve_cdp_wrapped_eval_result(
+        &self,
+        target_frame_id: Option<&str>,
+        res: Value,
+    ) -> Result<Value> {
+        self.release_cdp_eval_objects(target_frame_id, &res).await;
+        parse_eval_result(res)
+    }
+
     async fn resolve_cdp_eval_result(
         &self,
         target_frame_id: Option<&str>,
         res: Value,
     ) -> Result<Value> {
         if let Some(exc) = res.get("exceptionDetails") {
-            if let Some(oid) = exc["exception"]["objectId"].as_str() {
-                let _ = self
-                    .call_for_frame(
-                        target_frame_id,
-                        "Runtime.releaseObject",
-                        json!({ "objectId": oid }),
-                    )
-                    .await;
-            }
+            self.release_cdp_eval_objects(target_frame_id, &res).await;
             let text = exc["exception"]["description"]
                 .as_str()
                 .or_else(|| exc["text"].as_str())
@@ -3946,9 +4040,7 @@ impl CdpSession {
         let result = &res["result"];
         match classify_cdp_eval_remote_object(result) {
             CdpEvalAction::Resolved(outcome) => {
-                if outcome.is_err()
-                    && let Some(oid) = result.get("objectId").and_then(|v| v.as_str())
-                {
+                if let Some(oid) = result.get("objectId").and_then(|v| v.as_str()) {
                     let _ = self
                         .call_for_frame(
                             target_frame_id,
@@ -3979,15 +4071,7 @@ impl CdpSession {
                     )
                     .await;
                 let val = fn_res?;
-                if let Some(oid) = val["exceptionDetails"]["exception"]["objectId"].as_str() {
-                    let _ = self
-                        .call_for_frame(
-                            target_frame_id,
-                            "Runtime.releaseObject",
-                            json!({ "objectId": oid }),
-                        )
-                        .await;
-                }
+                self.release_cdp_eval_objects(target_frame_id, &val).await;
                 parse_eval_result(val)
             }
         }
@@ -4121,15 +4205,17 @@ impl CdpSession {
         for sel in &selector_chain[1..] {
             let mut next_oids = Vec::new();
             for oid in current_oids {
-                let desc = self
+                let desc_val = match self
                     .call_for_frame(
                         Some(fid),
                         "DOM.describeNode",
                         json!({ "objectId": oid, "depth": 1, "pierce": true }),
                     )
-                    .await;
-                let Ok(desc_val) = desc else {
-                    continue;
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(err) if is_transient_context_error(&err) => return Err(err),
+                    Err(_) => continue,
                 };
                 let Some(srs) = desc_val["node"]["shadowRoots"].as_array() else {
                     continue;
@@ -4138,7 +4224,7 @@ impl CdpSession {
                     let Some(sr_bid) = sr["backendNodeId"].as_i64() else {
                         continue;
                     };
-                    let Ok(sr_resolved) = self
+                    let sr_resolved = match self
                         .call_for_frame(
                             Some(fid),
                             "DOM.resolveNode",
@@ -4149,13 +4235,15 @@ impl CdpSession {
                             }),
                         )
                         .await
-                    else {
-                        continue;
+                    {
+                        Ok(v) => v,
+                        Err(err) if is_transient_context_error(&err) => return Err(err),
+                        Err(_) => continue,
                     };
                     let Some(sr_oid) = sr_resolved["object"]["objectId"].as_str() else {
                         continue;
                     };
-                    let Ok(call_res) = self
+                    let call_res = match self
                         .call_for_frame(
                             Some(fid),
                             "Runtime.callFunctionOn",
@@ -4168,13 +4256,17 @@ impl CdpSession {
                             }),
                         )
                         .await
-                    else {
-                        continue;
-                    };
-                    if let Some(sub_arr_oid) = call_res["result"]["objectId"].as_str()
-                        && let Ok(found) = self.extract_array_object_ids(fid, sub_arr_oid).await
                     {
-                        next_oids.extend(found);
+                        Ok(v) => v,
+                        Err(err) if is_transient_context_error(&err) => return Err(err),
+                        Err(_) => continue,
+                    };
+                    if let Some(sub_arr_oid) = call_res["result"]["objectId"].as_str() {
+                        match self.extract_array_object_ids(fid, sub_arr_oid).await {
+                            Ok(found) => next_oids.extend(found),
+                            Err(err) if is_transient_context_error(&err) => return Err(err),
+                            Err(_) => {}
+                        }
                     }
                 }
             }
@@ -4186,11 +4278,14 @@ impl CdpSession {
 
         let mut matches = Vec::with_capacity(current_oids.len());
         for oid in current_oids {
-            let bid = self
+            let bid = match self
                 .call_for_frame(Some(fid), "DOM.describeNode", json!({ "objectId": oid }))
                 .await
-                .ok()
-                .and_then(|d| d["node"]["backendNodeId"].as_i64());
+            {
+                Ok(d) => d["node"]["backendNodeId"].as_i64(),
+                Err(err) if is_transient_context_error(&err) => return Err(err),
+                Err(_) => None,
+            };
             let info_res = self
                 .call_for_frame(
                     Some(fid),
@@ -4536,14 +4631,30 @@ impl CdpSession {
         selector: &str,
         frame_id: Option<&str>,
     ) -> Result<i64> {
+        self.ensure_alive()?;
         if let Some(fid_in) = frame_id {
             let sel_json = serde_json::to_string(selector)?;
             let expr = format!("document.querySelector({sel_json})");
-            for attempt in 0..2 {
-                let (fid, ctx_id) = self
-                    .get_or_create_isolated_context_for(Some(fid_in))
-                    .await?;
-                let res = self
+            let mut last_transient_err: Option<MimikyuError> = None;
+            for attempt in 0..CONTEXT_MAX_ATTEMPTS {
+                self.ensure_alive()?;
+                let (fid, ctx_id) =
+                    match self.get_or_create_isolated_context_for(Some(fid_in)).await {
+                        Ok(pair) => pair,
+                        Err(err) if is_transient_context_error(&err) => {
+                            self.invalidate_frame_contexts(Some(fid_in), None, None, None);
+                            last_transient_err = Some(err);
+                            if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                                && !self.conn.closed.load(Ordering::SeqCst)
+                            {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                continue;
+                            }
+                            break;
+                        }
+                        Err(err) => return Err(err),
+                    };
+                let eval_val = match self
                     .call_for_frame(
                         Some(&fid),
                         "Runtime.evaluate",
@@ -4554,16 +4665,26 @@ impl CdpSession {
                             "awaitPromise": false,
                         }),
                     )
-                    .await;
-                let eval_val = match res {
+                    .await
+                {
                     Ok(v) => v,
-                    Err(MimikyuError::Protocol { ref message, .. })
-                        if attempt == 0 && message.contains("Cannot find context") =>
-                    {
-                        self.state.isolated_worlds.lock().remove(&fid);
-                        continue;
+                    Err(err) if is_transient_context_error(&err) => {
+                        self.invalidate_frame_contexts(
+                            Some(fid_in),
+                            Some(&fid),
+                            Some(ctx_id),
+                            None,
+                        );
+                        last_transient_err = Some(err);
+                        if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                            && !self.conn.closed.load(Ordering::SeqCst)
+                        {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            continue;
+                        }
+                        break;
                     }
-                    Err(e) => return Err(e),
+                    Err(err) => return Err(err),
                 };
                 if let Some(obj_id) = eval_val["result"]["objectId"].as_str() {
                     let desc = self
@@ -4580,7 +4701,29 @@ impl CdpSession {
                             json!({ "objectId": obj_id }),
                         )
                         .await;
-                    let desc = desc?;
+                    let desc = match desc {
+                        Ok(d) => d,
+                        Err(err)
+                            if is_transient_context_error(&err)
+                                || is_stale_dom_node_error(&err) =>
+                        {
+                            self.invalidate_frame_contexts(
+                                Some(fid_in),
+                                Some(&fid),
+                                Some(ctx_id),
+                                None,
+                            );
+                            last_transient_err = Some(err);
+                            if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                                && !self.conn.closed.load(Ordering::SeqCst)
+                            {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                continue;
+                            }
+                            break;
+                        }
+                        Err(err) => return Err(err),
+                    };
                     return desc["node"]["backendNodeId"]
                         .as_i64()
                         .ok_or_else(|| MimikyuError::ElementNotFound(selector.to_string()));
@@ -4589,33 +4732,282 @@ impl CdpSession {
                     "selector '{selector}' matched no element"
                 )));
             }
+            return Err(format_exhausted_context_error(
+                "query_backend_node_id_in_frame",
+                CONTEXT_MAX_ATTEMPTS,
+                last_transient_err.unwrap_or_else(|| MimikyuError::Protocol {
+                    code: -32000,
+                    message: "Execution context was destroyed".to_string(),
+                }),
+            ));
         }
 
-        let doc = self
-            .call_for_frame(frame_id, "DOM.getDocument", json!({ "depth": 0 }))
-            .await?;
-        let root_id = doc["root"]["nodeId"]
-            .as_i64()
-            .ok_or_else(|| MimikyuError::ElementNotFound(selector.to_string()))?;
-        let q = self
-            .call_for_frame(
-                frame_id,
-                "DOM.querySelector",
-                json!({ "nodeId": root_id, "selector": selector }),
-            )
-            .await?;
-        let node_id = q["nodeId"].as_i64().unwrap_or(0);
-        if node_id == 0 {
-            return Err(MimikyuError::ElementNotFound(format!(
-                "selector '{selector}' matched no element"
-            )));
+        let mut last_transient_err: Option<MimikyuError> = None;
+        for attempt in 0..CONTEXT_MAX_ATTEMPTS {
+            self.ensure_alive()?;
+            let doc = match self
+                .call_for_frame(None, "DOM.getDocument", json!({ "depth": 0 }))
+                .await
+            {
+                Ok(v) => v,
+                Err(err) if is_transient_context_error(&err) => {
+                    self.invalidate_frame_contexts(None, None, None, None);
+                    last_transient_err = Some(err);
+                    if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                        && !self.conn.closed.load(Ordering::SeqCst)
+                    {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
+            let root_id = doc["root"]["nodeId"]
+                .as_i64()
+                .ok_or_else(|| MimikyuError::ElementNotFound(selector.to_string()))?;
+            let q = match self
+                .call_for_frame(
+                    None,
+                    "DOM.querySelector",
+                    json!({ "nodeId": root_id, "selector": selector }),
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(err) if is_transient_context_error(&err) || is_stale_dom_node_error(&err) => {
+                    self.invalidate_frame_contexts(None, None, None, None);
+                    last_transient_err = Some(err);
+                    if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                        && !self.conn.closed.load(Ordering::SeqCst)
+                    {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
+            let node_id = q["nodeId"].as_i64().unwrap_or(0);
+            if node_id == 0 {
+                return Err(MimikyuError::ElementNotFound(format!(
+                    "selector '{selector}' matched no element"
+                )));
+            }
+            let desc = match self
+                .call_for_frame(None, "DOM.describeNode", json!({ "nodeId": node_id }))
+                .await
+            {
+                Ok(v) => v,
+                Err(err) if is_transient_context_error(&err) || is_stale_dom_node_error(&err) => {
+                    self.invalidate_frame_contexts(None, None, None, None);
+                    last_transient_err = Some(err);
+                    if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                        && !self.conn.closed.load(Ordering::SeqCst)
+                    {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
+            return desc["node"]["backendNodeId"]
+                .as_i64()
+                .ok_or_else(|| MimikyuError::ElementNotFound(selector.to_string()));
         }
-        let desc = self
-            .call_for_frame(frame_id, "DOM.describeNode", json!({ "nodeId": node_id }))
-            .await?;
-        desc["node"]["backendNodeId"]
-            .as_i64()
-            .ok_or_else(|| MimikyuError::ElementNotFound(selector.to_string()))
+
+        Err(format_exhausted_context_error(
+            "query_backend_node_id",
+            CONTEXT_MAX_ATTEMPTS,
+            last_transient_err.unwrap_or_else(|| MimikyuError::Protocol {
+                code: -32000,
+                message: "Execution context was destroyed".to_string(),
+            }),
+        ))
+    }
+
+    async fn eval_isolated_readonly(&self, expr: &str, frame_id: Option<&str>) -> Result<Value> {
+        self.eval_isolated_in_frame_with_policy(expr, frame_id, true)
+            .await
+    }
+
+    async fn eval_isolated_in_frame_with_policy(
+        &self,
+        expr: &str,
+        frame_id: Option<&str>,
+        allow_mid_execution_retry: bool,
+    ) -> Result<Value> {
+        self.ensure_alive()?;
+        let wrapped_expr = can_wrap_cdp_eval_expr(expr).then(|| build_wrapped_cdp_eval_expr(expr));
+        let mut use_wrapper = wrapped_expr.is_some();
+        let mut last_transient_err: Option<MimikyuError> = None;
+
+        for attempt in 0..CONTEXT_MAX_ATTEMPTS {
+            self.ensure_alive()?;
+            let (fid, ctx_id) = match self.get_or_create_isolated_context_for(frame_id).await {
+                Ok(pair) => pair,
+                Err(err) if is_transient_context_error(&err) => {
+                    // Context acquisition happens strictly before `expr` runs.
+                    self.invalidate_frame_contexts(frame_id, None, None, None);
+                    last_transient_err = Some(err);
+                    if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                        && !self.conn.closed.load(Ordering::SeqCst)
+                    {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
+
+            if use_wrapper && let Some(ref wrapped) = wrapped_expr {
+                let eval_res = self
+                    .call_for_frame(
+                        Some(&fid),
+                        "Runtime.evaluate",
+                        json!({
+                            "expression": wrapped,
+                            "contextId": ctx_id,
+                            "returnByValue": true,
+                            "awaitPromise": true,
+                        }),
+                    )
+                    .await;
+
+                match eval_res {
+                    Ok(v) if is_compile_time_syntax_error(&v) => {
+                        // V8 failed to parse the wrapped expression (0 bytes executed);
+                        // release exception handles and fall back to bare 2-RPC evaluation.
+                        self.release_cdp_eval_objects(Some(&fid), &v).await;
+                        use_wrapper = false;
+                    }
+                    Ok(v) => return self.resolve_cdp_wrapped_eval_result(Some(&fid), v).await,
+                    Err(err) => match classify_transient_context_error(&err) {
+                        Some(TransientContextErrorKind::PreExecution) => {
+                            self.invalidate_frame_contexts(
+                                frame_id,
+                                Some(&fid),
+                                Some(ctx_id),
+                                None,
+                            );
+                            last_transient_err = Some(err);
+                            if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                                && !self.conn.closed.load(Ordering::SeqCst)
+                            {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                continue;
+                            }
+                            break;
+                        }
+                        Some(TransientContextErrorKind::MidOrPostExecution) => {
+                            self.invalidate_frame_contexts(
+                                frame_id,
+                                Some(&fid),
+                                Some(ctx_id),
+                                None,
+                            );
+                            if allow_mid_execution_retry {
+                                last_transient_err = Some(err);
+                                if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                                    && !self.conn.closed.load(Ordering::SeqCst)
+                                {
+                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                    continue;
+                                }
+                                break;
+                            }
+                            return Err(format_mid_eval_context_destroyed_error(
+                                "isolated-world evaluation",
+                                err,
+                            ));
+                        }
+                        None => return Err(err),
+                    },
+                }
+            }
+
+            let eval_res = self
+                .call_for_frame(
+                    Some(&fid),
+                    "Runtime.evaluate",
+                    json!({
+                        "expression": expr,
+                        "contextId": ctx_id,
+                        "returnByValue": false,
+                        "awaitPromise": true,
+                    }),
+                )
+                .await;
+
+            let raw_val = match eval_res {
+                Ok(v) => v,
+                Err(err) => match classify_transient_context_error(&err) {
+                    Some(TransientContextErrorKind::PreExecution) => {
+                        self.invalidate_frame_contexts(frame_id, Some(&fid), Some(ctx_id), None);
+                        last_transient_err = Some(err);
+                        if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                            && !self.conn.closed.load(Ordering::SeqCst)
+                        {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            continue;
+                        }
+                        break;
+                    }
+                    Some(TransientContextErrorKind::MidOrPostExecution) => {
+                        self.invalidate_frame_contexts(frame_id, Some(&fid), Some(ctx_id), None);
+                        if allow_mid_execution_retry {
+                            last_transient_err = Some(err);
+                            if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                                && !self.conn.closed.load(Ordering::SeqCst)
+                            {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                continue;
+                            }
+                            break;
+                        }
+                        return Err(format_mid_eval_context_destroyed_error(
+                            "isolated-world evaluation",
+                            err,
+                        ));
+                    }
+                    None => return Err(err),
+                },
+            };
+
+            match self.resolve_cdp_eval_result(Some(&fid), raw_val).await {
+                Ok(val) => return Ok(val),
+                Err(err) if is_transient_context_error(&err) => {
+                    // Fallback Runtime.callFunctionOn failed after `expr` already ran.
+                    self.invalidate_frame_contexts(frame_id, Some(&fid), Some(ctx_id), None);
+                    if allow_mid_execution_retry {
+                        last_transient_err = Some(err);
+                        if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                            && !self.conn.closed.load(Ordering::SeqCst)
+                        {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            continue;
+                        }
+                        break;
+                    }
+                    return Err(format_mid_eval_context_destroyed_error(
+                        "isolated-world result serialization",
+                        err,
+                    ));
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(format_exhausted_context_error(
+            "isolated-world evaluation",
+            CONTEXT_MAX_ATTEMPTS,
+            last_transient_err.unwrap_or_else(|| MimikyuError::Protocol {
+                code: -32000,
+                message: "Execution context was destroyed".to_string(),
+            }),
+        ))
     }
 }
 
@@ -5078,12 +5470,14 @@ impl DriverSession for CdpSession {
     }
 
     async fn current_url(&self) -> Result<String> {
-        let val = self.eval_isolated("window.location.href").await?;
+        let val = self
+            .eval_isolated_readonly("window.location.href", None)
+            .await?;
         Ok(val.as_str().unwrap_or_default().to_string())
     }
 
     async fn title(&self) -> Result<String> {
-        let val = self.eval_isolated("document.title").await?;
+        let val = self.eval_isolated_readonly("document.title", None).await?;
         Ok(val.as_str().unwrap_or_default().to_string())
     }
 
@@ -5351,36 +5745,8 @@ impl DriverSession for CdpSession {
     }
 
     async fn eval_isolated_in_frame(&self, expr: &str, frame_id: Option<&str>) -> Result<Value> {
-        self.ensure_alive()?;
-        for attempt in 0..2 {
-            let (fid, ctx_id) = self.get_or_create_isolated_context_for(frame_id).await?;
-            let res = self
-                .call_for_frame(
-                    Some(&fid),
-                    "Runtime.evaluate",
-                    json!({
-                        "expression": expr,
-                        "contextId": ctx_id,
-                        "returnByValue": false,
-                        "awaitPromise": true,
-                    }),
-                )
-                .await;
-
-            match res {
-                Ok(v) => return self.resolve_cdp_eval_result(Some(&fid), v).await,
-                Err(MimikyuError::Protocol { ref message, .. })
-                    if attempt == 0 && message.contains("Cannot find context") =>
-                {
-                    self.state.isolated_worlds.lock().remove(&fid);
-                    continue;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        Err(MimikyuError::EvalFailed(
-            "failed to evaluate in isolated world after context refresh".to_string(),
-        ))
+        self.eval_isolated_in_frame_with_policy(expr, frame_id, false)
+            .await
     }
 
     async fn eval_main_world_in_frame(&self, expr: &str, frame_id: Option<&str>) -> Result<Value> {
@@ -5388,69 +5754,179 @@ impl DriverSession for CdpSession {
         if !self.state.main_world_eval {
             return Err(MimikyuError::MainWorldDisabled);
         }
-        let Some(fid) = frame_id else {
-            let res = self
-                .call(
-                    "Runtime.evaluate",
-                    json!({
-                        "expression": expr,
-                        "returnByValue": false,
-                        "awaitPromise": true,
-                    }),
-                )
-                .await?;
-            return self.resolve_cdp_eval_result(None, res).await;
-        };
 
-        let main_fid = self.main_frame_id().await.ok();
-        if main_fid.as_deref() == Some(fid) {
-            let res = self
-                .call(
-                    "Runtime.evaluate",
-                    json!({
-                        "expression": expr,
-                        "returnByValue": false,
-                        "awaitPromise": true,
-                    }),
-                )
-                .await?;
-            return self.resolve_cdp_eval_result(None, res).await;
-        }
+        let wrapped_expr = can_wrap_cdp_eval_expr(expr).then(|| build_wrapped_cdp_eval_expr(expr));
+        let mut use_wrapper = wrapped_expr.is_some();
+        let mut last_transient_err: Option<MimikyuError> = None;
 
-        if self.state.iframe_sessions.lock().contains_key(fid) {
-            let ctx_id = self.state.default_contexts.lock().get(fid).copied();
+        for attempt in 0..CONTEXT_MAX_ATTEMPTS {
+            self.ensure_alive()?;
+            let (target_fid, used_default_ctx) = match frame_id {
+                None => (None, None),
+                Some(fid) => {
+                    let main_fid = self.main_frame_id().await.ok();
+                    let is_oopif = self.state.iframe_sessions.lock().contains_key(fid);
+                    let cached_ctx = self.state.default_contexts.lock().get(fid).copied();
+                    if main_fid.as_deref() == Some(fid) {
+                        (None, None)
+                    } else if is_oopif {
+                        (Some(fid), cached_ctx)
+                    } else if let Some(ctx_id) = cached_ctx {
+                        (None, Some(ctx_id))
+                    } else {
+                        // The frame's default execution context may have just been cleared
+                        // by Page.frameNavigated / Runtime.executionContextsCleared while
+                        // navigating. Back off briefly to allow Runtime.executionContextCreated
+                        // to repopulate it; if it never arrives and no transient context error
+                        // occurred, preserve NotFound.
+                        if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                            && !self.conn.closed.load(Ordering::SeqCst)
+                        {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            continue;
+                        }
+                        if let Some(prev_err) = last_transient_err.take() {
+                            return Err(format_exhausted_context_error(
+                                "main-world evaluation",
+                                CONTEXT_MAX_ATTEMPTS,
+                                prev_err,
+                            ));
+                        }
+                        return Err(MimikyuError::NotFound(format!(
+                            "frame '{fid}' has no default execution context"
+                        )));
+                    }
+                }
+            };
+
+            if use_wrapper && let Some(ref wrapped) = wrapped_expr {
+                let mut params = json!({
+                    "expression": wrapped,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                });
+                if let Some(cid) = used_default_ctx {
+                    params["contextId"] = json!(cid);
+                }
+                let eval_res = match target_fid {
+                    Some(fid) => {
+                        self.call_for_frame(Some(fid), "Runtime.evaluate", params)
+                            .await
+                    }
+                    None => self.call("Runtime.evaluate", params).await,
+                };
+                match eval_res {
+                    Ok(v) if is_compile_time_syntax_error(&v) => {
+                        self.release_cdp_eval_objects(target_fid, &v).await;
+                        use_wrapper = false;
+                    }
+                    Ok(v) => return self.resolve_cdp_wrapped_eval_result(target_fid, v).await,
+                    Err(err) => match classify_transient_context_error(&err) {
+                        Some(TransientContextErrorKind::PreExecution) => {
+                            self.invalidate_frame_contexts(
+                                frame_id,
+                                target_fid,
+                                None,
+                                used_default_ctx,
+                            );
+                            last_transient_err = Some(err);
+                            if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                                && !self.conn.closed.load(Ordering::SeqCst)
+                            {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                continue;
+                            }
+                            break;
+                        }
+                        Some(TransientContextErrorKind::MidOrPostExecution) => {
+                            self.invalidate_frame_contexts(
+                                frame_id,
+                                target_fid,
+                                None,
+                                used_default_ctx,
+                            );
+                            return Err(format_mid_eval_context_destroyed_error(
+                                "main-world evaluation",
+                                err,
+                            ));
+                        }
+                        None => return Err(err),
+                    },
+                }
+            }
+
             let mut params = json!({
                 "expression": expr,
                 "returnByValue": false,
                 "awaitPromise": true,
             });
-            if let Some(cid) = ctx_id {
+            if let Some(cid) = used_default_ctx {
                 params["contextId"] = json!(cid);
             }
-            let res = self
-                .call_for_frame(Some(fid), "Runtime.evaluate", params)
-                .await?;
-            return self.resolve_cdp_eval_result(Some(fid), res).await;
+            let eval_res = match target_fid {
+                Some(fid) => {
+                    self.call_for_frame(Some(fid), "Runtime.evaluate", params)
+                        .await
+                }
+                None => self.call("Runtime.evaluate", params).await,
+            };
+
+            let raw_val = match eval_res {
+                Ok(v) => v,
+                Err(err) => match classify_transient_context_error(&err) {
+                    Some(TransientContextErrorKind::PreExecution) => {
+                        self.invalidate_frame_contexts(
+                            frame_id,
+                            target_fid,
+                            None,
+                            used_default_ctx,
+                        );
+                        last_transient_err = Some(err);
+                        if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                            && !self.conn.closed.load(Ordering::SeqCst)
+                        {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            continue;
+                        }
+                        break;
+                    }
+                    Some(TransientContextErrorKind::MidOrPostExecution) => {
+                        self.invalidate_frame_contexts(
+                            frame_id,
+                            target_fid,
+                            None,
+                            used_default_ctx,
+                        );
+                        return Err(format_mid_eval_context_destroyed_error(
+                            "main-world evaluation",
+                            err,
+                        ));
+                    }
+                    None => return Err(err),
+                },
+            };
+
+            match self.resolve_cdp_eval_result(target_fid, raw_val).await {
+                Ok(val) => return Ok(val),
+                Err(err) if is_transient_context_error(&err) => {
+                    self.invalidate_frame_contexts(frame_id, target_fid, None, used_default_ctx);
+                    return Err(format_mid_eval_context_destroyed_error(
+                        "main-world result serialization",
+                        err,
+                    ));
+                }
+                Err(err) => return Err(err),
+            }
         }
 
-        let ctx_id = self.state.default_contexts.lock().get(fid).copied();
-        let Some(ctx_id) = ctx_id else {
-            return Err(MimikyuError::NotFound(format!(
-                "frame '{fid}' has no default execution context"
-            )));
-        };
-        let res = self
-            .call(
-                "Runtime.evaluate",
-                json!({
-                    "expression": expr,
-                    "contextId": ctx_id,
-                    "returnByValue": false,
-                    "awaitPromise": true,
-                }),
-            )
-            .await?;
-        self.resolve_cdp_eval_result(None, res).await
+        Err(format_exhausted_context_error(
+            "main-world evaluation",
+            CONTEXT_MAX_ATTEMPTS,
+            last_transient_err.unwrap_or_else(|| MimikyuError::Protocol {
+                code: -32000,
+                message: "Execution context was destroyed".to_string(),
+            }),
+        ))
     }
 
     async fn call_function_on_node(
@@ -5461,62 +5937,187 @@ impl DriverSession for CdpSession {
         args: Vec<Value>,
     ) -> Result<Value> {
         self.ensure_alive()?;
-        let (fid, ctx_id) = self.get_or_create_isolated_context_for(frame_id).await?;
-        let group = format!(
-            "mimikyu_node_{}",
-            NEXT_OBJECT_GROUP_ID.fetch_add(1, Ordering::Relaxed)
-        );
-        let resolved = self
-            .call_for_frame(
-                Some(&fid),
-                "DOM.resolveNode",
-                json!({
-                    "backendNodeId": backend_node_id,
-                    "executionContextId": ctx_id,
-                    "objectGroup": group,
-                }),
-            )
-            .await?;
-        let obj_id = resolved["object"]["objectId"]
-            .as_str()
-            .ok_or_else(|| {
-                MimikyuError::ElementNotFound(format!(
-                    "backendNodeId {backend_node_id} could not be resolved"
-                ))
-            })?
-            .to_string();
         let call_args: Vec<Value> = args.into_iter().map(|v| json!({ "value": v })).collect();
-        let res = self
-            .call_for_frame(
-                Some(&fid),
-                "Runtime.callFunctionOn",
-                json!({
-                    "objectId": obj_id,
-                    "functionDeclaration": function_declaration,
-                    "arguments": call_args,
-                    "returnByValue": true,
-                    "awaitPromise": true,
-                }),
-            )
-            .await;
-        let _ = self
-            .call_for_frame(
-                Some(&fid),
-                "Runtime.releaseObjectGroup",
-                json!({ "objectGroup": group }),
-            )
-            .await;
-        let val = res?;
-        if let Some(oid) = val["exceptionDetails"]["exception"]["objectId"].as_str() {
+        let mut last_transient_err: Option<MimikyuError> = None;
+
+        for attempt in 0..CONTEXT_MAX_ATTEMPTS {
+            self.ensure_alive()?;
+            let (fid, ctx_id) = match self.get_or_create_isolated_context_for(frame_id).await {
+                Ok(pair) => pair,
+                Err(err) if is_transient_context_error(&err) => {
+                    self.invalidate_frame_contexts(frame_id, None, None, None);
+                    last_transient_err = Some(err);
+                    if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                        && !self.conn.closed.load(Ordering::SeqCst)
+                    {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
+
+            let group = format!(
+                "mimikyu_node_{}",
+                NEXT_OBJECT_GROUP_ID.fetch_add(1, Ordering::Relaxed)
+            );
+            let resolved = match self
+                .call_for_frame(
+                    Some(&fid),
+                    "DOM.resolveNode",
+                    json!({
+                        "backendNodeId": backend_node_id,
+                        "executionContextId": ctx_id,
+                        "objectGroup": group,
+                    }),
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(err) if is_transient_context_error(&err) => {
+                    let _ = self
+                        .call_for_frame(
+                            Some(&fid),
+                            "Runtime.releaseObjectGroup",
+                            json!({ "objectGroup": group }),
+                        )
+                        .await;
+                    self.invalidate_frame_contexts(frame_id, Some(&fid), Some(ctx_id), None);
+                    last_transient_err = Some(err);
+                    if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                        && !self.conn.closed.load(Ordering::SeqCst)
+                    {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    break;
+                }
+                Err(err) if is_stale_dom_node_error(&err) => {
+                    let _ = self
+                        .call_for_frame(
+                            Some(&fid),
+                            "Runtime.releaseObjectGroup",
+                            json!({ "objectGroup": group }),
+                        )
+                        .await;
+                    return Err(MimikyuError::ElementNotFound(format!(
+                        "backendNodeId {backend_node_id} could not be resolved: {err}"
+                    )));
+                }
+                Err(err) => {
+                    let _ = self
+                        .call_for_frame(
+                            Some(&fid),
+                            "Runtime.releaseObjectGroup",
+                            json!({ "objectGroup": group }),
+                        )
+                        .await;
+                    return Err(err);
+                }
+            };
+
+            let Some(obj_id) = resolved["object"]["objectId"]
+                .as_str()
+                .map(ToString::to_string)
+            else {
+                let _ = self
+                    .call_for_frame(
+                        Some(&fid),
+                        "Runtime.releaseObjectGroup",
+                        json!({ "objectGroup": group }),
+                    )
+                    .await;
+                return Err(MimikyuError::ElementNotFound(format!(
+                    "backendNodeId {backend_node_id} could not be resolved"
+                )));
+            };
+
+            let res = self
+                .call_for_frame(
+                    Some(&fid),
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": obj_id,
+                        "functionDeclaration": function_declaration,
+                        "arguments": call_args,
+                        "returnByValue": true,
+                        "awaitPromise": true,
+                    }),
+                )
+                .await;
             let _ = self
                 .call_for_frame(
                     Some(&fid),
-                    "Runtime.releaseObject",
-                    json!({ "objectId": oid }),
+                    "Runtime.releaseObjectGroup",
+                    json!({ "objectGroup": group }),
                 )
                 .await;
+
+            let val = match res {
+                Ok(v) => v,
+                Err(err) => match classify_transient_context_error(&err) {
+                    Some(TransientContextErrorKind::PreExecution) => {
+                        self.invalidate_frame_contexts(frame_id, Some(&fid), Some(ctx_id), None);
+                        last_transient_err = Some(err);
+                        if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                            && !self.conn.closed.load(Ordering::SeqCst)
+                        {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            continue;
+                        }
+                        break;
+                    }
+                    Some(TransientContextErrorKind::MidOrPostExecution) => {
+                        self.invalidate_frame_contexts(frame_id, Some(&fid), Some(ctx_id), None);
+                        // If V8 rejected `objectId` lookup before invoking `functionDeclaration`,
+                        // retrying re-resolves `backendNodeId` (failing with ElementNotFound if the
+                        // document navigated away, or succeeding if only the isolated world recycled).
+                        if matches!(
+                            &err,
+                            MimikyuError::Protocol { message, .. }
+                                if message
+                                    .to_ascii_lowercase()
+                                    .contains("could not find object with given id")
+                        ) {
+                            last_transient_err = Some(err);
+                            if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                                && !self.conn.closed.load(Ordering::SeqCst)
+                            {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                continue;
+                            }
+                            break;
+                        }
+                        return Err(format_mid_eval_context_destroyed_error(
+                            "call_function_on_node",
+                            err,
+                        ));
+                    }
+                    None => return Err(err),
+                },
+            };
+
+            if let Some(oid) = val["exceptionDetails"]["exception"]["objectId"].as_str() {
+                let _ = self
+                    .call_for_frame(
+                        Some(&fid),
+                        "Runtime.releaseObject",
+                        json!({ "objectId": oid }),
+                    )
+                    .await;
+            }
+            return parse_eval_result(val);
         }
-        parse_eval_result(val)
+
+        Err(format_exhausted_context_error(
+            "call_function_on_node",
+            CONTEXT_MAX_ATTEMPTS,
+            last_transient_err.unwrap_or_else(|| MimikyuError::Protocol {
+                code: -32000,
+                message: "Execution context was destroyed".to_string(),
+            }),
+        ))
     }
 
     async fn query_shadow(
@@ -5530,22 +6131,64 @@ impl DriverSession for CdpSession {
                 "query_shadow requires at least one selector".to_string(),
             ));
         }
-        let (fid, ctx_id) = self.get_or_create_isolated_context_for(frame_id).await?;
-        let group = format!(
-            "mimikyu_shadow_{}",
-            NEXT_OBJECT_GROUP_ID.fetch_add(1, Ordering::Relaxed)
-        );
-        let res = self
-            .query_shadow_inner(&fid, ctx_id, &group, selector_chain)
-            .await;
-        let _ = self
-            .call_for_frame(
-                Some(&fid),
-                "Runtime.releaseObjectGroup",
-                json!({ "objectGroup": group }),
-            )
-            .await;
-        res
+
+        let mut last_transient_err: Option<MimikyuError> = None;
+        for attempt in 0..CONTEXT_MAX_ATTEMPTS {
+            self.ensure_alive()?;
+            let (fid, ctx_id) = match self.get_or_create_isolated_context_for(frame_id).await {
+                Ok(pair) => pair,
+                Err(err) if is_transient_context_error(&err) => {
+                    self.invalidate_frame_contexts(frame_id, None, None, None);
+                    last_transient_err = Some(err);
+                    if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                        && !self.conn.closed.load(Ordering::SeqCst)
+                    {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
+            let group = format!(
+                "mimikyu_shadow_{}",
+                NEXT_OBJECT_GROUP_ID.fetch_add(1, Ordering::Relaxed)
+            );
+            let res = self
+                .query_shadow_inner(&fid, ctx_id, &group, selector_chain)
+                .await;
+            let _ = self
+                .call_for_frame(
+                    Some(&fid),
+                    "Runtime.releaseObjectGroup",
+                    json!({ "objectGroup": group }),
+                )
+                .await;
+            match res {
+                Ok(matches) => return Ok(matches),
+                Err(err) if is_transient_context_error(&err) => {
+                    self.invalidate_frame_contexts(frame_id, Some(&fid), Some(ctx_id), None);
+                    last_transient_err = Some(err);
+                    if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                        && !self.conn.closed.load(Ordering::SeqCst)
+                    {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        continue;
+                    }
+                    break;
+                }
+                Err(err) => return Err(err),
+            }
+        }
+
+        Err(format_exhausted_context_error(
+            "query_shadow",
+            CONTEXT_MAX_ATTEMPTS,
+            last_transient_err.unwrap_or_else(|| MimikyuError::Protocol {
+                code: -32000,
+                message: "Execution context was destroyed".to_string(),
+            }),
+        ))
     }
 
     async fn closed_shadow_hosts(&self, frame_id: Option<&str>) -> Result<Vec<i64>> {
@@ -5860,7 +6503,7 @@ impl DriverSession for CdpSession {
     async fn viewport_size(&self) -> Result<(f64, f64)> {
         self.ensure_compositor_foreground().await?;
         let val = self
-            .eval_isolated(
+            .eval_isolated_readonly(
                 r#"(() => {
                     const iw = window.innerWidth || 1280;
                     const ih = window.innerHeight || 800;
@@ -5868,6 +6511,7 @@ impl DriverSession for CdpSession {
                     const ch = (document.documentElement && document.documentElement.clientHeight) || ih;
                     return { w: Math.min(iw, cw), h: Math.min(ih, ch) };
                 })()"#,
+                None,
             )
             .await?;
         let w = val["w"].as_f64().unwrap_or(1280.0).max(1.0);
@@ -5878,7 +6522,7 @@ impl DriverSession for CdpSession {
     async fn viewport_and_gutters(&self) -> Result<(f64, f64, f64, f64)> {
         self.ensure_compositor_foreground().await?;
         let val = self
-            .eval_isolated(
+            .eval_isolated_readonly(
                 r#"(() => {
                     const iw = window.innerWidth || 1280;
                     const ih = window.innerHeight || 800;
@@ -5891,6 +6535,7 @@ impl DriverSession for CdpSession {
                         bottom: Math.max(0, ih - ch),
                     };
                 })()"#,
+                None,
             )
             .await?;
         let w = val["w"].as_f64().unwrap_or(1280.0).max(1.0);
@@ -7276,7 +7921,7 @@ impl DriverSession for CdpSession {
         let cookies = self.cookies().await?;
         let mut origins = Vec::new();
         let val = self
-            .eval_isolated(
+            .eval_isolated_readonly(
                 r#"(() => {
                     const o = window.location.origin;
                     if (!o || o === 'null') return null;
@@ -7292,6 +7937,7 @@ impl DriverSession for CdpSession {
                     }
                     return { origin: o, localStorage: ls, sessionStorage: ss };
                 })()"#,
+                None,
             )
             .await
             .unwrap_or(Value::Null);
@@ -7312,7 +7958,7 @@ impl DriverSession for CdpSession {
     async fn set_storage_state(&self, state: StorageState) -> Result<()> {
         self.set_cookies(state.cookies).await?;
         let current_origin = self
-            .eval_isolated("window.location.origin")
+            .eval_isolated_readonly("window.location.origin", None)
             .await
             .ok()
             .and_then(|v| v.as_str().map(ToString::to_string));
@@ -7410,7 +8056,9 @@ impl DriverSession for CdpSession {
     }
 
     async fn document_ready_state(&self) -> Result<String> {
-        let val = self.eval_isolated("document.readyState").await?;
+        let val = self
+            .eval_isolated_readonly("document.readyState", None)
+            .await?;
         Ok(val.as_str().unwrap_or("loading").to_string())
     }
 
@@ -7427,7 +8075,11 @@ impl DriverSession for CdpSession {
         if had_active_screencast {
             let _ = self
                 .conn
-                .send_raw(Some(&self.info.session_id), "Page.stopScreencast", json!({}))
+                .send_raw(
+                    Some(&self.info.session_id),
+                    "Page.stopScreencast",
+                    json!({}),
+                )
                 .await;
         }
         self.conn.sessions.write().remove(&self.info.session_id);
@@ -7544,7 +8196,9 @@ fn normalize_cdp_same_site(raw: &str) -> Option<&'static str> {
     }
 }
 
-const CDP_EVAL_JSON_VALIDATOR: &str = r#"function() {
+macro_rules! cdp_eval_json_validator_core {
+    () => {
+        r#"
     const ancestors = new Set();
     const toString = Object.prototype.toString;
     const nonJsonTags = new Set([
@@ -7658,8 +8312,199 @@ const CDP_EVAL_JSON_VALIDATOR: &str = r#"function() {
             ancestors.delete(v);
         }
     };
-    return walk(this);
-}"#;
+"#
+    };
+}
+
+const CDP_EVAL_JSON_VALIDATOR_CORE: &str = cdp_eval_json_validator_core!();
+
+const CDP_EVAL_JSON_VALIDATOR: &str = concat!(
+    "function() {",
+    cdp_eval_json_validator_core!(),
+    "    return walk(this);\n}",
+);
+
+/// Backoff schedule between bounded CDP transient context recovery attempts.
+/// 4 attempts total (initial + 3 retries: 25ms -> 75ms -> 150ms; 250ms cap).
+const CONTEXT_RETRY_BACKOFF_MS: [u64; 3] = [25, 75, 150];
+const CONTEXT_MAX_ATTEMPTS: usize = CONTEXT_RETRY_BACKOFF_MS.len() + 1;
+
+/// Two-tier classification of transient CDP execution-context / navigation races.
+///
+/// - `PreExecution` (Tier A): The frame or execution context was already gone
+///   before the script/command could execute (zero side effects possible).
+/// - `MidOrPostExecution` (Tier B): The execution context, remote object handle,
+///   or target was invalidated during or after script execution (side effects
+///   may already have occurred; retry only for read-only internal queries).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransientContextErrorKind {
+    PreExecution,
+    MidOrPostExecution,
+}
+
+fn classify_transient_context_error(err: &MimikyuError) -> Option<TransientContextErrorKind> {
+    let MimikyuError::Protocol { code, message } = err else {
+        return None;
+    };
+    if *code != -32000 && *code != -32602 {
+        return None;
+    }
+    let msg = message.to_ascii_lowercase();
+    if msg.contains("cannot find context")
+        || msg.contains("cannot find default execution context")
+        || msg.contains("no frame for given id found")
+    {
+        return Some(TransientContextErrorKind::PreExecution);
+    }
+    if msg.contains("execution context was destroyed")
+        || msg.contains("could not find object with given id")
+        || msg.contains("inspected target navigated or closed")
+    {
+        return Some(TransientContextErrorKind::MidOrPostExecution);
+    }
+    None
+}
+
+fn is_transient_context_error(err: &MimikyuError) -> bool {
+    classify_transient_context_error(err).is_some()
+}
+
+fn is_stale_dom_node_error(err: &MimikyuError) -> bool {
+    let MimikyuError::Protocol { code, message } = err else {
+        return false;
+    };
+    if *code != -32000 {
+        return false;
+    }
+    let msg = message.to_ascii_lowercase();
+    msg.contains("could not find node with given id")
+        || msg.contains("no node with given id found")
+        || msg.contains("node with given id does not belong to the document")
+}
+
+fn format_exhausted_context_error(
+    operation: &str,
+    attempts: usize,
+    last_err: MimikyuError,
+) -> MimikyuError {
+    let (code, detail) = match last_err {
+        MimikyuError::Protocol { code, message } => (code, message),
+        other => (-32000, other.to_string()),
+    };
+    MimikyuError::Protocol {
+        code,
+        message: format!(
+            "Execution context was destroyed during {operation} (exhausted {attempts} attempts while frame navigated: {detail})"
+        ),
+    }
+}
+
+fn format_mid_eval_context_destroyed_error(operation: &str, err: MimikyuError) -> MimikyuError {
+    let (code, detail) = match err {
+        MimikyuError::Protocol { code, message } => (code, message),
+        other => (-32000, other.to_string()),
+    };
+    MimikyuError::Protocol {
+        code,
+        message: format!(
+            "Execution context was destroyed during {operation}; not re-executed to preserve side-effect safety ({detail})"
+        ),
+    }
+}
+
+fn starts_with_js_keyword(s: &str, kw: &str) -> bool {
+    let Some(rest) = s.strip_prefix(kw) else {
+        return false;
+    };
+    rest.chars()
+        .next()
+        .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
+}
+
+/// Returns true when `expr` can be safely wrapped inside a single-RPC
+/// `Runtime.evaluate(returnByValue: true)` validator call without changing
+/// top-level JS semantics (such as bare `{ ... }` block statements or
+/// `function`/`class` declarations). Any remaining multi-statement scripts
+/// that fail to parse inside `(...)` are detected via `is_compile_time_syntax_error`
+/// before any JS executes and fall back cleanly to the 2-RPC path.
+fn can_wrap_cdp_eval_expr(expr: &str) -> bool {
+    let trimmed = expr.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('{')
+        || trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.ends_with(';')
+    {
+        return false;
+    }
+    const STATEMENT_PREFIXES: &[&str] = &[
+        "function", "class", "var", "let", "const", "if", "for", "while", "do", "switch", "try",
+        "throw", "with", "debugger", "return", "import", "export",
+    ];
+    if STATEMENT_PREFIXES
+        .iter()
+        .any(|kw| starts_with_js_keyword(trimmed, kw))
+    {
+        return false;
+    }
+    if starts_with_js_keyword(trimmed, "async") {
+        let after_async = trimmed["async".len()..].trim_start();
+        if starts_with_js_keyword(after_async, "function") {
+            return false;
+        }
+    }
+    true
+}
+
+/// Wraps a JS expression so `CDP_EVAL_JSON_VALIDATOR_CORE` validates and
+/// normalizes the return value (or resolved Promise value) in a single atomic
+/// `Runtime.evaluate(..., returnByValue: true, awaitPromise: true)` RPC.
+///
+/// Because `expr` is passed as the call argument, it evaluates in the outer
+/// global scope (preserving `this === globalThis`, zero identifier shadowing,
+/// and zero `eval()` / CSP dependency).
+fn build_wrapped_cdp_eval_expr(expr: &str) -> String {
+    format!(
+        "((__v) => {{\n\
+            const __validate = (function() {{\n\
+                {CDP_EVAL_JSON_VALIDATOR_CORE}\n\
+                return (root) => (root === undefined ? null : walk(root));\n\
+            }})();\n\
+            if (__v !== null && (typeof __v === 'object' || typeof __v === 'function')) {{\n\
+                if (typeof Promise === 'function' && __v instanceof Promise) {{\n\
+                    return __v.then(__validate);\n\
+                }}\n\
+                const __then = __v.then;\n\
+                if (typeof __then === 'function') {{\n\
+                    return new Promise((resolve, reject) => {{\n\
+                        __then.call(__v, resolve, reject);\n\
+                    }}).then(__validate);\n\
+                }}\n\
+            }}\n\
+            return __validate(__v);\n\
+        }})((\n{expr}\n))"
+    )
+}
+
+/// Detects a V8 compile-time `SyntaxError` (zero instructions executed).
+/// Runtime `SyntaxError`s (e.g. `JSON.parse('{')`, `throw new SyntaxError(...)`)
+/// always carry non-empty `stackTrace.callFrames` and return `false` so
+/// side-effecting scripts are NEVER re-executed.
+fn is_compile_time_syntax_error(res: &Value) -> bool {
+    let Some(exc) = res.get("exceptionDetails") else {
+        return false;
+    };
+    let class_name = exc
+        .get("exception")
+        .and_then(|e| e.get("className"))
+        .and_then(|v| v.as_str());
+    let has_stack_frames = exc
+        .get("stackTrace")
+        .and_then(|st| st.get("callFrames"))
+        .and_then(|cf| cf.as_array())
+        .is_some_and(|frames| !frames.is_empty());
+    class_name == Some("SyntaxError") && !has_stack_frames
+}
 
 #[derive(Debug)]
 enum CdpEvalAction {
@@ -8356,8 +9201,14 @@ mod tests {
             frame_count: 0,
             started_at_ms: 100,
         };
-        assert_eq!(sc.next_frame_path(), PathBuf::from("/tmp/frames/frame-000001.png"));
-        assert_eq!(sc.next_frame_path(), PathBuf::from("/tmp/frames/frame-000002.png"));
+        assert_eq!(
+            sc.next_frame_path(),
+            PathBuf::from("/tmp/frames/frame-000001.png")
+        );
+        assert_eq!(
+            sc.next_frame_path(),
+            PathBuf::from("/tmp/frames/frame-000002.png")
+        );
         assert_eq!(sc.frame_count, 2);
 
         let mut sc_jpg = CdpScreencastState {
@@ -8371,9 +9222,18 @@ mod tests {
             sc_jpg.next_frame_path(),
             PathBuf::from("/tmp/jpg/frame-000001.jpg")
         );
-        assert_eq!("png".parse::<ScreencastFormat>().unwrap(), ScreencastFormat::Png);
-        assert_eq!("jpeg".parse::<ScreencastFormat>().unwrap(), ScreencastFormat::Jpeg);
-        assert_eq!("jpg".parse::<ScreencastFormat>().unwrap(), ScreencastFormat::Jpeg);
+        assert_eq!(
+            "png".parse::<ScreencastFormat>().unwrap(),
+            ScreencastFormat::Png
+        );
+        assert_eq!(
+            "jpeg".parse::<ScreencastFormat>().unwrap(),
+            ScreencastFormat::Jpeg
+        );
+        assert_eq!(
+            "jpg".parse::<ScreencastFormat>().unwrap(),
+            ScreencastFormat::Jpeg
+        );
         assert!("gif".parse::<ScreencastFormat>().is_err());
     }
 
@@ -8857,6 +9717,13 @@ mod tests {
                         }
                         _ => {
                             let _ = st.collect_same_proc_env_contexts(Some("main-fid"));
+                            st.invalidate_frame_contexts(None, Some("main-fid"), None, None);
+                            st.invalidate_frame_contexts(
+                                Some("fid-0"),
+                                Some("fid-0"),
+                                Some(0),
+                                Some(0),
+                            );
                             st.isolated_worlds.lock().clear();
                         }
                     }
@@ -8878,5 +9745,357 @@ mod tests {
         for h in handles {
             h.join().expect("worker thread panicked");
         }
+    }
+
+    #[test]
+    fn transient_context_error_classification_covers_all_six_patterns_and_rejects_non_transient() {
+        // Tier A — Pre-execution lookup failures (expression never ran)
+        let tier_a_cases = [
+            MimikyuError::Protocol {
+                code: -32000,
+                message: "Cannot find context with specified id".to_string(),
+            },
+            MimikyuError::Protocol {
+                code: -32000,
+                message: "Cannot find default execution context".to_string(),
+            },
+            MimikyuError::Protocol {
+                code: -32000,
+                message: "No frame for given id found".to_string(),
+            },
+            MimikyuError::Protocol {
+                code: -32602,
+                message: "No frame for given id found".to_string(),
+            },
+        ];
+        for err in &tier_a_cases {
+            assert_eq!(
+                classify_transient_context_error(err),
+                Some(TransientContextErrorKind::PreExecution),
+                "expected PreExecution for {err:?}"
+            );
+            assert!(
+                is_transient_context_error(err),
+                "expected is_transient_context_error=true for {err:?}"
+            );
+        }
+
+        // Tier B — Mid/post-execution invalidations (expression may have already run)
+        let tier_b_cases = [
+            MimikyuError::Protocol {
+                code: -32000,
+                message: "Execution context was destroyed.".to_string(),
+            },
+            MimikyuError::Protocol {
+                code: -32000,
+                message: "Could not find object with given id".to_string(),
+            },
+            MimikyuError::Protocol {
+                code: -32000,
+                message: "Inspected target navigated or closed".to_string(),
+            },
+        ];
+        for err in &tier_b_cases {
+            assert_eq!(
+                classify_transient_context_error(err),
+                Some(TransientContextErrorKind::MidOrPostExecution),
+                "expected MidOrPostExecution for {err:?}"
+            );
+            assert!(
+                is_transient_context_error(err),
+                "expected is_transient_context_error=true for {err:?}"
+            );
+        }
+
+        // Non-transient errors MUST NOT be retried as transient context races
+        let non_transient = [
+            MimikyuError::EvalFailed("SyntaxError: Unexpected token '}'".to_string()),
+            MimikyuError::EvalFailed("ReferenceError: x is not defined".to_string()),
+            MimikyuError::Timeout {
+                timeout_ms: 30_000,
+                operation: "CDP Runtime.evaluate".to_string(),
+            },
+            MimikyuError::Disposed,
+            MimikyuError::Transport("CDP WebSocket connection closed".to_string()),
+            MimikyuError::ElementNotFound("selector '#missing' matched no element".to_string()),
+            MimikyuError::MainWorldDisabled,
+            MimikyuError::Protocol {
+                code: -32000,
+                message: "No node with given id found".to_string(),
+            },
+            MimikyuError::Protocol {
+                code: -32000,
+                message: "Could not find node with given id".to_string(),
+            },
+            MimikyuError::Protocol {
+                code: -32601,
+                message: "'Runtime.bogus' wasn't found".to_string(),
+            },
+            MimikyuError::Protocol {
+                code: -32000,
+                message: "DOM Error while querying".to_string(),
+            },
+            MimikyuError::Protocol {
+                code: -32001,
+                message: "Cannot find context with specified id".to_string(),
+            },
+        ];
+        for err in &non_transient {
+            assert_eq!(
+                classify_transient_context_error(err),
+                None,
+                "expected None for non-transient {err:?}"
+            );
+            assert!(
+                !is_transient_context_error(err),
+                "expected is_transient_context_error=false for {err:?}"
+            );
+        }
+
+        // Stale DOM node helper recognizes missing nodeId/backendNodeId distinctly
+        assert!(is_stale_dom_node_error(&MimikyuError::Protocol {
+            code: -32000,
+            message: "No node with given id found".to_string(),
+        }));
+        assert!(is_stale_dom_node_error(&MimikyuError::Protocol {
+            code: -32000,
+            message: "Could not find node with given id".to_string(),
+        }));
+        assert!(is_stale_dom_node_error(&MimikyuError::Protocol {
+            code: -32000,
+            message: "Node with given id does not belong to the document".to_string(),
+        }));
+        assert!(!is_transient_context_error(&MimikyuError::Protocol {
+            code: -32000,
+            message: "Node with given id does not belong to the document".to_string(),
+        }));
+        assert!(!is_stale_dom_node_error(&MimikyuError::Protocol {
+            code: -32000,
+            message: "Cannot find context with specified id".to_string(),
+        }));
+    }
+
+    #[test]
+    fn cdp_exhausted_and_mid_eval_errors_are_clean_descriptive_retryable_protocol_errors() {
+        let raw_stale = MimikyuError::Protocol {
+            code: -32000,
+            message: "Cannot find context with specified id".to_string(),
+        };
+        let exhausted = format_exhausted_context_error(
+            "isolated-world evaluation",
+            CONTEXT_MAX_ATTEMPTS,
+            raw_stale,
+        );
+        match &exhausted {
+            MimikyuError::Protocol { code, message } => {
+                assert_eq!(*code, -32000);
+                assert!(message.contains("Execution context was destroyed"));
+                assert!(message.contains("exhausted 4 attempts"));
+                assert!(message.contains("isolated-world evaluation"));
+            }
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+        assert!(is_transient_context_error(&exhausted));
+
+        let raw_mid = MimikyuError::Protocol {
+            code: -32000,
+            message: "Execution context was destroyed.".to_string(),
+        };
+        let mid_err = format_mid_eval_context_destroyed_error("isolated-world evaluation", raw_mid);
+        match &mid_err {
+            MimikyuError::Protocol { code, message } => {
+                assert_eq!(*code, -32000);
+                assert!(message.contains("Execution context was destroyed"));
+                assert!(message.contains("side-effect safety"));
+            }
+            other => panic!("expected Protocol error, got {other:?}"),
+        }
+        assert!(is_transient_context_error(&mid_err));
+    }
+
+    #[test]
+    fn cdp_invalidate_frame_contexts_respects_frame_scope_and_cas() {
+        let state = dummy_session_state();
+        {
+            let mut iw = state.isolated_worlds.lock();
+            iw.insert("main-fid".to_string(), 10);
+            iw.insert("child-fid".to_string(), 20);
+        }
+        {
+            let mut dc = state.default_contexts.lock();
+            dc.insert("main-fid".to_string(), 1);
+            dc.insert("child-fid".to_string(), 2);
+        }
+        {
+            let mut dcs = state.default_context_sessions.lock();
+            dcs.insert("child-fid".to_string(), "child-sid".to_string());
+        }
+
+        // Invalidating a child frame's isolated world must preserve main_frame_id,
+        // main frame caches, AND the child frame's live default_contexts entry!
+        state.invalidate_frame_contexts(Some("child-fid"), Some("child-fid"), Some(20), None);
+        assert_eq!(state.main_frame_id.lock().as_deref(), Some("main-fid"));
+        assert_eq!(
+            state.isolated_worlds.lock().get("main-fid").copied(),
+            Some(10)
+        );
+        assert!(!state.isolated_worlds.lock().contains_key("child-fid"));
+        assert_eq!(
+            state.default_contexts.lock().get("child-fid").copied(),
+            Some(2)
+        );
+        assert_eq!(
+            state
+                .default_context_sessions
+                .lock()
+                .get("child-fid")
+                .map(String::as_str),
+            Some("child-sid")
+        );
+
+        // Compare-and-remove on default_contexts: stale ctx 99 must NOT wipe newer ctx 2,
+        // whereas matching stale ctx 2 removes it cleanly.
+        state.invalidate_frame_contexts(Some("child-fid"), Some("child-fid"), None, Some(99));
+        assert_eq!(
+            state.default_contexts.lock().get("child-fid").copied(),
+            Some(2)
+        );
+        state.invalidate_frame_contexts(Some("child-fid"), Some("child-fid"), None, Some(2));
+        assert!(!state.default_contexts.lock().contains_key("child-fid"));
+        assert!(
+            !state
+                .default_context_sessions
+                .lock()
+                .contains_key("child-fid")
+        );
+
+        // Re-populate child-fid, then invalidate main frame (frame_id == None):
+        // main_frame_id and main-fid entries must be cleared; child-fid stays intact.
+        state
+            .isolated_worlds
+            .lock()
+            .insert("child-fid".to_string(), 21);
+        state
+            .default_contexts
+            .lock()
+            .insert("child-fid".to_string(), 3);
+        state.invalidate_frame_contexts(None, Some("main-fid"), Some(10), None);
+        assert!(state.main_frame_id.lock().is_none());
+        assert!(!state.isolated_worlds.lock().contains_key("main-fid"));
+        assert!(!state.default_contexts.lock().contains_key("main-fid"));
+        assert_eq!(
+            state.isolated_worlds.lock().get("child-fid").copied(),
+            Some(21)
+        );
+        assert_eq!(
+            state.default_contexts.lock().get("child-fid").copied(),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn cdp_single_rpc_wrapper_guards_statements_and_distinguishes_compile_vs_runtime_syntax_errors()
+    {
+        // Expressions that safely fold into 1-RPC validation
+        for expr in [
+            "1 + 1",
+            "1, 2",
+            "({ a: 1, b: [2, 3] })",
+            "(() => ({ ok: true }))()",
+            "(function foo() {})",
+            "(class Foo {})",
+            "Promise.resolve({ answer: 42 })",
+            "({ then(res) { res(123); } })",
+            "async () => 42",
+            "document.title",
+            "new DataView(new ArrayBuffer(4))",
+        ] {
+            assert!(
+                can_wrap_cdp_eval_expr(expr),
+                "expected expression to be wrappable: {expr}"
+            );
+            let wrapped = build_wrapped_cdp_eval_expr(expr);
+            assert!(wrapped.contains("ArrayBuffer.isView"));
+            assert!(wrapped.contains(expr));
+            assert!(
+                wrapped.ends_with(&format!("((\n{expr}\n))")),
+                "wrapper must group expr in double parens to preserve comma operator"
+            );
+            assert!(
+                !wrapped.to_ascii_lowercase().contains("mimikyu"),
+                "wrapper must not leak tool identifier into main-world stack frames"
+            );
+        }
+
+        // Statements / declarations / comments / empty / trailing semicolon skip wrapper
+        for stmt in [
+            "",
+            "   ",
+            "{ a: 1 }",
+            "function foo() {}",
+            "function* gen() {}",
+            "async function foo() {}",
+            "async function* gen() {}",
+            "class Foo {}",
+            "const x = 1; x + 2",
+            "let x = 1; x + 2",
+            "var x = 1; x + 2",
+            "if (true) 1",
+            "for (let i = 0; i < 1; i++) {}",
+            "throw new Error('boom')",
+            "document.getElementById('x').focus();",
+            "// comment\n1 + 1",
+            "/* comment */ { a: 1 }",
+        ] {
+            assert!(
+                !can_wrap_cdp_eval_expr(stmt),
+                "expected statement/declaration NOT to be wrapped: {stmt}"
+            );
+        }
+
+        // Compile-time SyntaxError (no stack frames) vs runtime SyntaxError (has callFrames)
+        let compile_err = json!({
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {
+                    "type": "object",
+                    "subtype": "error",
+                    "className": "SyntaxError",
+                    "description": "SyntaxError: Unexpected token ';'",
+                    "objectId": "err-1"
+                }
+            }
+        });
+        assert!(is_compile_time_syntax_error(&compile_err));
+
+        let runtime_syntax_err = json!({
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "stackTrace": {
+                    "callFrames": [{ "functionName": "parse", "lineNumber": 0, "columnNumber": 0 }]
+                },
+                "exception": {
+                    "type": "object",
+                    "subtype": "error",
+                    "className": "SyntaxError",
+                    "description": "SyntaxError: Expected property name",
+                    "objectId": "err-2"
+                }
+            }
+        });
+        assert!(!is_compile_time_syntax_error(&runtime_syntax_err));
+
+        let runtime_type_err = json!({
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {
+                    "type": "object",
+                    "subtype": "error",
+                    "className": "TypeError",
+                    "description": "TypeError: boom"
+                }
+            }
+        });
+        assert!(!is_compile_time_syntax_error(&runtime_type_err));
     }
 }
