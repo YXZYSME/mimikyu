@@ -79,6 +79,14 @@ fn session_creation_properties() -> Map<String, Value> {
         json!({ "type": "boolean", "description": "Block web font requests" }),
     );
     props.insert(
+        "block_trackers".into(),
+        json!({ "type": "boolean", "description": "Block curated tracker, analytics, and ad-beacon domains" }),
+    );
+    props.insert(
+        "privacy_mode".into(),
+        json!({ "type": "boolean", "description": "Enable hardened privacy mode (tracker blocking, WebRTC IP leak protection, human-safe window flags)" }),
+    );
+    props.insert(
         "instant_animations".into(),
         json!({ "type": "boolean", "description": "Accelerate CSS animations and transitions" }),
     );
@@ -300,6 +308,29 @@ pub fn tool_definitions() -> Vec<Value> {
             "name": "mimikyu_screenshot",
             "description": "Capture a PNG screenshot of the viewport, full page, or target element",
             "inputSchema": screenshot_schema()
+        }),
+        json!({
+            "name": "mimikyu_request_human_takeover",
+            "description": "Pause automated input on a session and hand control to a human operator (for interactive login, 2FA, or manual review)",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": session_prop(),
+                    "reason": { "type": "string", "description": "Actionable reason explaining what the human operator should complete" }
+                },
+                "required": []
+            }
+        }),
+        json!({
+            "name": "mimikyu_resume_from_human",
+            "description": "Resume automated input on a session after a human operator hands back control",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": session_prop()
+                },
+                "required": []
+            }
         }),
         // 20 browser_* tools
         json!({
@@ -701,6 +732,8 @@ fn build_session_opts(
         block_images: opt_bool(args, "block_images")?.unwrap_or(false),
         block_media: opt_bool(args, "block_media")?.unwrap_or(false),
         block_fonts: opt_bool(args, "block_fonts")?.unwrap_or(false),
+        block_trackers: opt_bool(args, "block_trackers")?.unwrap_or(false),
+        privacy_mode: opt_bool(args, "privacy_mode")?.unwrap_or(false),
         instant_animations: opt_bool(args, "instant_animations")?.unwrap_or(false),
         humanize: opt_bool(args, "humanize")?.unwrap_or(false),
         main_world_eval: opt_bool(args, "main_world_eval")?.unwrap_or(true),
@@ -1055,6 +1088,15 @@ pub async fn call_tool(manager: &SessionManager, name: &str, arguments: Value) -
         "mimikyu_screenshot" | "browser_screenshot" => {
             let session_id = resolve_session_id(&args)?;
             handle_screenshot_tool(manager, &session_id, &args).await
+        }
+        "mimikyu_request_human_takeover" => {
+            let session_id = resolve_session_id(&args)?;
+            let reason = opt_str(&args, "reason")?.map(str::to_string);
+            map_session_result(manager.takeover_session(&session_id, reason).await)
+        }
+        "mimikyu_resume_from_human" => {
+            let session_id = resolve_session_id(&args)?;
+            map_session_result(manager.resume_session(&session_id).await)
         }
         "browser_context_list" => {
             let entries: Vec<SessionListEntry> = manager

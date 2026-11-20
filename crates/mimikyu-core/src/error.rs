@@ -45,6 +45,12 @@ pub enum MimikyuError {
     #[error("unsupported by {engine} driver: {feature}")]
     Unsupported { engine: String, feature: String },
 
+    #[error("session '{session_id}' is paused for human takeover{}; resume with `mimikyu session resume` or `mimikyu_resume_from_human`", .reason.as_deref().map(|r| format!(" ({r})")).unwrap_or_default())]
+    PausedForHuman {
+        session_id: String,
+        reason: Option<String>,
+    },
+
     #[error("session already disposed")]
     Disposed,
 

@@ -283,6 +283,10 @@ pub struct LaunchOptions {
     pub block_images: bool,
     pub block_media: bool,
     pub block_fonts: bool,
+    #[serde(default)]
+    pub block_trackers: bool,
+    #[serde(default)]
+    pub privacy_mode: bool,
     pub instant_animations: bool,
     pub main_world_eval: bool,
     pub launch_timeout_ms: u64,
@@ -307,6 +311,8 @@ impl Default for LaunchOptions {
             block_images: false,
             block_media: false,
             block_fonts: false,
+            block_trackers: false,
+            privacy_mode: false,
             instant_animations: false,
             main_world_eval: false,
             launch_timeout_ms: 15_000,
@@ -325,6 +331,10 @@ pub struct ContextOptions {
     pub block_images: bool,
     pub block_media: bool,
     pub block_fonts: bool,
+    #[serde(default)]
+    pub block_trackers: bool,
+    #[serde(default)]
+    pub privacy_mode: bool,
     pub instant_animations: bool,
     pub main_world_eval: bool,
     #[serde(default)]
@@ -386,6 +396,8 @@ pub struct DriverCapabilities {
     pub supports_closed_shadow_dom: bool,
     pub supports_pdf: bool,
     pub supports_network_intercept: bool,
+    #[serde(default)]
+    pub supports_screencast: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -535,6 +547,70 @@ pub struct ScreenshotOpts {
     pub max_width: Option<u32>,
     #[serde(default)]
     pub max_height: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ScreencastFormat {
+    #[default]
+    Png,
+    Jpeg,
+}
+
+impl ScreencastFormat {
+    pub fn file_extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpg",
+        }
+    }
+
+    pub fn protocol_name(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpeg => "jpeg",
+        }
+    }
+}
+
+impl FromStr for ScreencastFormat {
+    type Err = MimikyuError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "png" => Ok(Self::Png),
+            "jpeg" | "jpg" => Ok(Self::Jpeg),
+            other => Err(MimikyuError::InvalidConfig(format!(
+                "unknown screencast format '{other}' (expected 'png' or 'jpeg')"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreencastOptions {
+    pub out_dir: PathBuf,
+    #[serde(default)]
+    pub format: ScreencastFormat,
+    #[serde(default)]
+    pub quality: Option<u8>,
+    #[serde(default)]
+    pub max_width: Option<u32>,
+    #[serde(default)]
+    pub max_height: Option<u32>,
+    #[serde(default)]
+    pub every_nth_frame: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScreencastStatus {
+    pub recording: bool,
+    pub out_dir: PathBuf,
+    pub format: ScreencastFormat,
+    pub frame_count: u64,
+    pub started_at_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped_at_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -735,6 +811,8 @@ pub trait DriverSession: Send + Sync {
     async fn screenshot(&self, opts: ScreenshotOpts) -> Result<Vec<u8>>;
     async fn pdf(&self) -> Result<Vec<u8>>;
     async fn set_instant_animations(&self, enabled: bool) -> Result<()>;
+    async fn start_screencast(&self, opts: ScreencastOptions) -> Result<ScreencastStatus>;
+    async fn stop_screencast(&self) -> Result<ScreencastStatus>;
 
     // Environment, Permissions & Network Control (M2)
     async fn set_env_overrides(&self, profile: EnvProfile) -> Result<()>;

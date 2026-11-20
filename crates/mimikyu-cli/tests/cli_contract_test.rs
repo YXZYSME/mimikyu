@@ -133,6 +133,13 @@ fn cli_help_all_subcommands_r3_compliant() {
     let help_invocations: &[&[&str]] = &[
         &["--help"],
         &["doctor", "--help"],
+        &["browser", "--help"],
+        &["browser", "list", "--help"],
+        &["browser", "path", "--help"],
+        &["browser", "install", "--help"],
+        &["vault", "--help"],
+        &["vault", "launch", "--help"],
+        &["vault", "list", "--help"],
         &["daemon", "--help"],
         &["daemon", "status", "--help"],
         &["daemon", "stop", "--help"],
@@ -142,6 +149,9 @@ fn cli_help_all_subcommands_r3_compliant() {
         &["session", "close", "--help"],
         &["session", "export", "--help"],
         &["session", "import", "--help"],
+        &["session", "pause", "--help"],
+        &["session", "resume", "--help"],
+        &["session", "takeover", "--help"],
         &["close", "--help"],
         &["profile", "--help"],
         &["profile", "list", "--help"],
@@ -169,6 +179,9 @@ fn cli_help_all_subcommands_r3_compliant() {
         &["eval", "--help"],
         &["screenshot", "--help"],
         &["pdf", "--help"],
+        &["record", "--help"],
+        &["record", "start", "--help"],
+        &["record", "stop", "--help"],
         &["logs", "--help"],
         &["mcp", "--help"],
         &["bench", "--help"],
@@ -551,7 +564,7 @@ fn cli_mcp_stdio_roundtrip_and_eof_cleanup() {
 
     let tools_list: Value = serde_json::from_str(lines[1]).unwrap();
     assert_eq!(tools_list["id"], 2);
-    assert_eq!(tools_list["result"]["tools"].as_array().unwrap().len(), 31);
+    assert_eq!(tools_list["result"]["tools"].as_array().unwrap().len(), 33);
 }
 
 #[test]
@@ -1515,6 +1528,272 @@ fn cli_accepts_hyphen_values_and_hyphen_state_dir_daemon_roundtrip() {
 
     assert!(
         run_rel(rel_work, false, &["daemon", "stop", "--json"])
+            .status
+            .success()
+    );
+}
+
+#[test]
+fn cli_browser_dry_run_install_and_managed_discovery_priority() {
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("browser_state");
+    let managed_dir = tmp.path().join("managed_browsers");
+
+    // 1. Offline --dry-run --json for chromium & firefox
+    let cft = Command::new(bin())
+        .env("MIMIKYU_BROWSERS_DIR", &managed_dir)
+        .args([
+            "browser",
+            "install",
+            "chromium",
+            "--dry-run",
+            "--version",
+            "136.0.7103.92",
+            "--json",
+        ])
+        .output()
+        .expect("browser install chromium dry-run");
+    assert!(
+        cft.status.success(),
+        "chromium dry-run failed: {}",
+        String::from_utf8_lossy(&cft.stderr)
+    );
+    let cft_val: Value = serde_json::from_slice(&cft.stdout).expect("cft json");
+    assert_eq!(cft_val["ok"], true);
+    assert_eq!(cft_val["data"]["engine"], "chromium");
+    assert_eq!(cft_val["data"]["dry_run"], true);
+    assert_eq!(cft_val["data"]["version"], "136.0.7103.92");
+    assert!(
+        cft_val["data"]["download_url"]
+            .as_str()
+            .unwrap_or("")
+            .contains("storage.googleapis.com/chrome-for-testing-public/136.0.7103.92/")
+    );
+
+    let ff = Command::new(bin())
+        .env("MIMIKYU_BROWSERS_DIR", &managed_dir)
+        .args([
+            "browser",
+            "install",
+            "firefox",
+            "--dry-run",
+            "--version",
+            "138.0.1",
+            "--json",
+        ])
+        .output()
+        .expect("browser install firefox dry-run");
+    assert!(ff.status.success());
+    let ff_val: Value = serde_json::from_slice(&ff.stdout).expect("ff json");
+    assert_eq!(ff_val["ok"], true);
+    assert_eq!(ff_val["data"]["engine"], "firefox");
+    assert_eq!(ff_val["data"]["dry_run"], true);
+    assert!(
+        ff_val["data"]["checksum_url"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with("/releases/138.0.1/SHA256SUMS")
+    );
+
+    // 2. Place a fake MimikyuManaged Firefox bundle (zero-spawn application.ini!) and verify MimikyuManaged takes priority over Playwright/System
+    use std::os::unix::fs::PermissionsExt;
+    let fake_bin = managed_dir.join("firefox-999.0/Firefox.app/Contents/MacOS/firefox");
+    let fake_ini = managed_dir.join("firefox-999.0/Firefox.app/Contents/Resources/application.ini");
+    fs::create_dir_all(fake_bin.parent().unwrap()).unwrap();
+    fs::create_dir_all(fake_ini.parent().unwrap()).unwrap();
+    fs::write(&fake_bin, "#!/bin/sh\nexit 99\n").unwrap();
+    let mut perms = fs::metadata(&fake_bin).unwrap().permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&fake_bin, perms).unwrap();
+    fs::write(&fake_ini, "[App]\nVendor=Mozilla\nName=Firefox\nVersion=999.0\n").unwrap();
+
+    let path_out = Command::new(bin())
+        .env_remove("MIMIKYU_FIREFOX_PATH")
+        .env("MIMIKYU_BROWSERS_DIR", &managed_dir)
+        .args(["--state-dir"])
+        .arg(&state_dir)
+        .args(["browser", "path", "firefox", "--json"])
+        .output()
+        .expect("browser path firefox");
+    assert!(
+        path_out.status.success(),
+        "browser path firefox failed: {}",
+        String::from_utf8_lossy(&path_out.stdout)
+    );
+    let path_val: Value = serde_json::from_slice(&path_out.stdout).expect("browser path json");
+    assert_eq!(path_val["ok"], true);
+    assert_eq!(path_val["data"]["source"], "mimikyu_managed");
+    assert_eq!(path_val["data"]["version"], "Mozilla Firefox 999.0");
+}
+
+#[test]
+fn cli_vault_launch_hitl_pause_resume_and_screencast_recording() {
+    let srv = LocalMiniServer::start();
+    let tmp = tempfile::tempdir().unwrap();
+    let state_dir = tmp.path().join("v02_state");
+    let _guard = DaemonCleanupGuard {
+        state_dir: state_dir.clone(),
+    };
+
+    // 1. Vault launch argument validation (invalid vault name fails cleanly without launching browser)
+    let bad_vault = run_cli(
+        &state_dir,
+        &["--no-daemon", "vault", "launch", "../escape", "--json"],
+    );
+    assert!(!bad_vault.status.success());
+    let bad_val: Value = serde_json::from_slice(&bad_vault.stdout).expect("bad vault json");
+    assert_eq!(bad_val["ok"], false);
+
+    // 2. Launch privacy vault in headless mode for CI-safe verification + verify persistent profile & navigation
+    let url = srv.url("/");
+    let launch = run_cli(
+        &state_dir,
+        &[
+            "vault",
+            "launch",
+            "work_vault",
+            "--headless",
+            "--block-trackers",
+            "--url",
+            &url,
+            "--json",
+        ],
+    );
+    assert!(
+        launch.status.success(),
+        "vault launch failed: {}",
+        String::from_utf8_lossy(&launch.stdout)
+    );
+    let launch_val: Value = serde_json::from_slice(&launch.stdout).expect("vault launch json");
+    assert_eq!(launch_val["ok"], true);
+    assert_eq!(launch_val["data"]["session_id"], "work_vault");
+    assert_eq!(launch_val["data"]["mode"], "persistent");
+    assert!(state_dir.join("profiles/work_vault").is_dir());
+
+    // 3. HITL pause -> automated click fails cleanly -> resume -> automated click succeeds
+    let pause_out = run_cli(
+        &state_dir,
+        &[
+            "--session",
+            "work_vault",
+            "session",
+            "pause",
+            "--reason",
+            "operator review",
+            "--json",
+        ],
+    );
+    assert!(
+        pause_out.status.success(),
+        "session pause failed: {}",
+        String::from_utf8_lossy(&pause_out.stdout)
+    );
+    let pause_val: Value = serde_json::from_slice(&pause_out.stdout).expect("pause json");
+    assert_eq!(pause_val["data"]["paused_for_human"], true);
+    assert_eq!(pause_val["data"]["pause_reason"], "operator review");
+
+    let blocked_click = run_cli(
+        &state_dir,
+        &["--session", "work_vault", "click", "#btn", "--json"],
+    );
+    assert!(!blocked_click.status.success());
+    let blocked_val: Value = serde_json::from_slice(&blocked_click.stdout).expect("blocked click");
+    assert_eq!(blocked_val["ok"], false);
+    assert!(
+        blocked_val["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("paused for human takeover")
+    );
+
+    let resume_out = run_cli(
+        &state_dir,
+        &["--session", "work_vault", "session", "resume", "--json"],
+    );
+    assert!(resume_out.status.success());
+    let resume_val: Value = serde_json::from_slice(&resume_out.stdout).expect("resume json");
+    assert_eq!(resume_val["data"]["paused_for_human"], false);
+
+    // 4. Headless screencast recording start -> interact -> stop
+    let frames_dir = tmp.path().join("frames");
+    let frames_str = frames_dir.to_string_lossy().to_string();
+    let rec_start = run_cli(
+        &state_dir,
+        &[
+            "--session",
+            "work_vault",
+            "record",
+            "start",
+            "--out-dir",
+            &frames_str,
+            "--format",
+            "png",
+            "--json",
+        ],
+    );
+    assert!(
+        rec_start.status.success(),
+        "record start failed: {}",
+        String::from_utf8_lossy(&rec_start.stdout)
+    );
+    let rec_start_val: Value = serde_json::from_slice(&rec_start.stdout).expect("rec start json");
+    assert_eq!(rec_start_val["data"]["recording"], true);
+
+    // Trigger visual paint updates so Chromium emits screencast frames
+    assert!(
+        run_cli(
+            &state_dir,
+            &["--session", "work_vault", "fill", "#name", "alice", "--json"],
+        )
+        .status
+        .success()
+    );
+    assert!(
+        run_cli(
+            &state_dir,
+            &["--session", "work_vault", "click", "#btn", "--json"],
+        )
+        .status
+        .success()
+    );
+    thread::sleep(Duration::from_millis(250));
+
+    let rec_stop = run_cli(
+        &state_dir,
+        &["--session", "work_vault", "record", "stop", "--json"],
+    );
+    assert!(
+        rec_stop.status.success(),
+        "record stop failed: {}",
+        String::from_utf8_lossy(&rec_stop.stdout)
+    );
+    let rec_stop_val: Value = serde_json::from_slice(&rec_stop.stdout).expect("rec stop json");
+    assert_eq!(rec_stop_val["data"]["recording"], false);
+    assert!(
+        rec_stop_val["data"]["frame_count"].as_u64().unwrap_or(0) >= 1,
+        "expected >=1 screencast frame, got {rec_stop_val}"
+    );
+    // Allow async frame writer task to flush to disk
+    thread::sleep(Duration::from_millis(100));
+    let first_frame = frames_dir.join("frame-000001.png");
+    assert!(
+        first_frame.is_file(),
+        "expected first screencast frame at {}",
+        first_frame.display()
+    );
+    assert!(
+        fs::read(&first_frame)
+            .unwrap()
+            .starts_with(b"\x89PNG\r\n\x1a\n")
+    );
+
+    assert!(
+        run_cli(&state_dir, &["close", "work_vault", "--json"])
+            .status
+            .success()
+    );
+    assert!(
+        run_cli(&state_dir, &["daemon", "stop", "--json"])
             .status
             .success()
     );

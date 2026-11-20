@@ -121,6 +121,7 @@ async fn assert_route_rules_and_patterns(engine: EngineKind) {
             block_images: false,
             block_media: false,
             block_fonts: false,
+            block_trackers: false,
             blocked_urls: vec![format!("exact:{}", server.url("/api/abort-me"))],
         })
         .await
@@ -488,6 +489,7 @@ async fn assert_oopif_network_interception_and_block_policy(engine: EngineKind) 
             block_images: false,
             block_media: false,
             block_fonts: false,
+            block_trackers: false,
             blocked_urls: vec!["*/api/abort-me*".to_string()],
         })
         .await

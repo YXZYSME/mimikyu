@@ -191,12 +191,87 @@ fn split_rust_regex_flags(raw: &str) -> (String, String) {
     (raw.to_string(), String::new())
 }
 
-/// Declarative blocking policy for resource categories and URL patterns.
+/// Curated built-in tracker, analytics, and ad-beacon domain blocklist preset.
+///
+/// Matched strictly at hostname boundaries (`host == domain || host.ends_with(".<domain>")`)
+/// so legitimate first-party pages or query strings referencing these names are never falsely blocked.
+pub const TRACKER_DOMAINS: &[&str] = &[
+    "doubleclick.net",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "googlesyndication.com",
+    "googleadservices.com",
+    "adservice.google.com",
+    "connect.facebook.net",
+    "analytics.tiktok.com",
+    "ads.linkedin.com",
+    "px.ads.linkedin.com",
+    "snap.licdn.com",
+    "bat.bing.com",
+    "sc-static.net",
+    "tr.snapchat.com",
+    "static.hotjar.com",
+    "script.hotjar.com",
+    "mixpanel.com",
+    "cdn.segment.com",
+    "api.segment.io",
+    "cdn.amplitude.com",
+    "api2.amplitude.com",
+    "fullstory.com",
+    "clarity.ms",
+    "mc.yandex.ru",
+    "sb.scorecardresearch.com",
+    "quantserve.com",
+    "taboola.com",
+    "outbrain.com",
+    "criteo.com",
+    "criteo.net",
+    "adnxs.com",
+    "rubiconproject.com",
+    "pubmatic.com",
+    "openx.net",
+    "casalemedia.com",
+    "amazon-adsystem.com",
+    "omtrdc.net",
+    "demdex.net",
+    "krxd.net",
+    "bam.nr-data.net",
+    "js-agent.newrelic.com",
+    "browser.sentry-cdn.com",
+    "datadoghq-browser-agent.com",
+    "plausible.io",
+    "matomo.cloud",
+];
+
+/// Returns `true` if `url`'s hostname matches any domain in [`TRACKER_DOMAINS`]
+/// at a strict DNS label boundary (`host == domain` or `host.ends_with(".<domain>")`).
+pub fn is_tracker_url(url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(url) else {
+        return false;
+    };
+    let Some(raw_host) = parsed.host_str() else {
+        return false;
+    };
+    let host = raw_host.trim_end_matches('.').to_ascii_lowercase();
+    if host.is_empty() {
+        return false;
+    }
+    TRACKER_DOMAINS.iter().any(|domain| {
+        host == *domain
+            || (host.len() > domain.len()
+                && host.ends_with(domain)
+                && host.as_bytes()[host.len() - domain.len() - 1] == b'.')
+    })
+}
+
+/// Declarative blocking policy for resource categories, built-in trackers, and URL patterns.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockPolicy {
     pub block_images: bool,
     pub block_media: bool,
     pub block_fonts: bool,
+    #[serde(default)]
+    pub block_trackers: bool,
     #[serde(default)]
     pub blocked_urls: Vec<String>,
 }
@@ -240,16 +315,21 @@ impl ResourceBlocker {
         self.policy.block_fonts = block_fonts;
     }
 
+    pub fn set_block_trackers(&mut self, enabled: bool) {
+        self.policy.block_trackers = enabled;
+    }
+
     pub fn has_category_blocks(&self) -> bool {
         self.policy.block_images || self.policy.block_media || self.policy.block_fonts
     }
 
     pub fn has_any_blocks(&self) -> bool {
-        self.has_category_blocks() || !self.compiled_urls.is_empty()
+        self.has_category_blocks() || self.policy.block_trackers || !self.compiled_urls.is_empty()
     }
 
     pub fn should_block_url(&self, url: &str) -> bool {
         self.compiled_urls.iter().any(|p| p.matches(url))
+            || (self.policy.block_trackers && is_tracker_url(url))
     }
 
     pub fn should_block_resource_type(&self, rtype: ResourceType, url: &str) -> bool {
@@ -285,10 +365,18 @@ impl ResourceBlocker {
     }
 
     pub fn cdp_blocked_url_globs(&self) -> Vec<String> {
-        self.compiled_urls
+        let mut out: Vec<String> = self
+            .compiled_urls
             .iter()
             .filter_map(UrlPattern::to_cdp_blocked_url_glob)
-            .collect()
+            .collect();
+        if self.policy.block_trackers {
+            for domain in TRACKER_DOMAINS {
+                out.push(format!("*://{domain}/*"));
+                out.push(format!("*://*.{domain}/*"));
+            }
+        }
+        out
     }
 
     pub fn has_non_cdp_url_patterns(&self) -> bool {
@@ -298,10 +386,18 @@ impl ResourceBlocker {
     }
 
     pub(crate) fn compiled_url_matchers_json(&self) -> Vec<serde_json::Value> {
-        self.compiled_urls
+        let mut out: Vec<serde_json::Value> = self
+            .compiled_urls
             .iter()
             .map(UrlPattern::to_js_matcher)
-            .collect()
+            .collect();
+        if self.policy.block_trackers {
+            for domain in TRACKER_DOMAINS {
+                out.push(serde_json::json!({ "kind": "glob", "val": format!("*://{domain}/*") }));
+                out.push(serde_json::json!({ "kind": "glob", "val": format!("*://*.{domain}/*") }));
+            }
+        }
+        out
     }
 }
 
@@ -404,6 +500,7 @@ mod tests {
             block_images: true,
             block_media: true,
             block_fonts: true,
+            block_trackers: false,
             blocked_urls: vec!["exact:http://127.0.0.1/blocked".to_string()],
         })
         .unwrap();
@@ -470,5 +567,33 @@ mod tests {
             ResourceType::from_bidi("", Some("fetch")),
             ResourceType::Fetch
         );
+    }
+
+    #[test]
+    fn tracker_blocklist_matches_exact_and_subdomains_with_strict_host_boundaries() {
+        assert!(is_tracker_url("https://doubleclick.net/pixel.gif"));
+        assert!(is_tracker_url("https://stats.g.doubleclick.net/r/collect"));
+        assert!(is_tracker_url("https://www.google-analytics.com/g/collect?v=2"));
+        assert!(is_tracker_url("https://WWW.GOOGLE-ANALYTICS.COM./collect"));
+        assert!(is_tracker_url("https://cdn.segment.com/analytics.js/v1/abc/analytics.min.js"));
+
+        // Must NOT falsely match non-tracker domains or query parameters
+        assert!(!is_tracker_url("https://example.com/?ref=doubleclick.net"));
+        assert!(!is_tracker_url("https://notdoubleclick.net/script.js"));
+        assert!(!is_tracker_url("https://doubleclick.net.example.com/pixel"));
+        assert!(!is_tracker_url("http://127.0.0.1:8080/google-analytics.com"));
+        assert!(!is_tracker_url("not-a-valid-url"));
+
+        let blocker = ResourceBlocker::new(BlockPolicy {
+            block_trackers: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(blocker.has_any_blocks());
+        assert!(blocker.should_block_url("https://stats.g.doubleclick.net/r/collect"));
+        assert!(!blocker.should_block_url("http://127.0.0.1:8080/index.html"));
+        let globs = blocker.cdp_blocked_url_globs();
+        assert!(globs.contains(&"*://doubleclick.net/*".to_string()));
+        assert!(globs.contains(&"*://*.doubleclick.net/*".to_string()));
     }
 }

@@ -330,6 +330,7 @@ mod tests {
                 supports_closed_shadow_dom: true,
                 supports_pdf: true,
                 supports_network_intercept: true,
+                supports_screencast: false,
             }
         }
         async fn new_context(&self, _opts: ContextOptions) -> Result<Arc<dyn DriverSession>> {
@@ -502,6 +503,21 @@ mod tests {
         }
         async fn set_instant_animations(&self, _enabled: bool) -> Result<()> {
             Ok(())
+        }
+        async fn start_screencast(
+            &self,
+            _opts: crate::driver::ScreencastOptions,
+        ) -> Result<crate::driver::ScreencastStatus> {
+            Err(MimikyuError::Unsupported {
+                engine: "stub".to_string(),
+                feature: "screencast".to_string(),
+            })
+        }
+        async fn stop_screencast(&self) -> Result<crate::driver::ScreencastStatus> {
+            Err(MimikyuError::Unsupported {
+                engine: "stub".to_string(),
+                feature: "screencast".to_string(),
+            })
         }
         async fn set_env_overrides(&self, _profile: EnvProfile) -> Result<()> {
             Ok(())

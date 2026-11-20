@@ -21,8 +21,9 @@ use crate::driver::{
     AxNode, BoundingBox, BrowserDriver, ConsoleEntry, ContextOptions, Cookie, DriverCapabilities,
     DriverSession, EngineKind, EnvProfile, FrameInfo, KeyEvent, KeyEventType, LaunchOptions,
     MOD_ALT, MOD_CONTROL, MOD_META, MouseButton, MouseEvent, MouseEventType, NavInfo, NetworkEvent,
-    OriginStorage, PageError, PermissionGrant, PermissionState, RouteMock, ScreenshotFormat,
-    ScreenshotOpts, SelectBy, SessionInfo, ShadowMatch, StorageState, TabInfo, WheelEvent, now_ms,
+    OriginStorage, PageError, PermissionGrant, PermissionState, RouteMock, ScreencastFormat,
+    ScreencastOptions, ScreencastStatus, ScreenshotFormat, ScreenshotOpts, SelectBy, SessionInfo,
+    ShadowMatch, StorageState, TabInfo, WheelEvent, now_ms,
 };
 use crate::env_profile::{
     ProxyRelay, build_webrtc_no_host_init_script, build_window_init_script,
@@ -415,8 +416,9 @@ impl BrowserDriver for CdpDriver {
             return Err(err);
         }
 
-        let suppress_webrtc_host_without_profile =
-            opts.profile_mode == crate::driver::ProfileMode::VirtualContext || opts.proxy.is_some();
+        let suppress_webrtc_host_without_profile = opts.privacy_mode
+            || opts.profile_mode == crate::driver::ProfileMode::VirtualContext
+            || opts.proxy.is_some();
         if let Err(err) = session
             .apply_initial_options(InitialSessionOptions {
                 env_profile: opts.env_profile,
@@ -425,6 +427,7 @@ impl BrowserDriver for CdpDriver {
                 block_images: opts.block_images,
                 block_media: opts.block_media,
                 block_fonts: opts.block_fonts,
+                block_trackers: opts.block_trackers || opts.privacy_mode,
                 instant_animations: opts.instant_animations,
             })
             .await
@@ -477,6 +480,7 @@ fn cdp_capabilities() -> DriverCapabilities {
         supports_closed_shadow_dom: true,
         supports_pdf: true,
         supports_network_intercept: true,
+        supports_screencast: true,
     }
 }
 
@@ -1703,6 +1707,26 @@ struct PendingCdpRequest {
 /// All other `CdpSessionState` mutexes (`worker_sessions`, `popup_sessions`,
 /// `popup_child_sessions`, `popup_default_contexts`, `main_frame_id`, etc.)
 /// are acquired singly and never nested.
+#[derive(Debug, Clone)]
+struct CdpScreencastState {
+    active: bool,
+    out_dir: PathBuf,
+    format: ScreencastFormat,
+    frame_count: u64,
+    started_at_ms: u64,
+}
+
+impl CdpScreencastState {
+    fn next_frame_path(&mut self) -> PathBuf {
+        self.frame_count += 1;
+        self.out_dir.join(format!(
+            "frame-{:06}.{}",
+            self.frame_count,
+            self.format.file_extension()
+        ))
+    }
+}
+
 struct CdpSessionState {
     session_id: String,
     target_id: String,
@@ -1744,6 +1768,7 @@ struct CdpSessionState {
     env_extra_headers: Mutex<Option<Value>>,
     env_profile: Mutex<Option<EnvProfile>>,
     pending_storage_scripts: Mutex<Vec<(String, String)>>,
+    screencast: Mutex<Option<CdpScreencastState>>,
     _proxy_relay: Mutex<Option<ProxyRelay>>,
     load_notify: Notify,
     disposed: AtomicBool,
@@ -1759,6 +1784,49 @@ impl CdpSessionState {
         from_child: bool,
     ) {
         match method {
+            "Page.screencastFrame" if !from_child => {
+                let frame_session_id = params.get("sessionId").and_then(Value::as_i64);
+                let data_b64 = params.get("data").and_then(Value::as_str).map(ToString::to_string);
+                let frame_path = {
+                    let mut guard = self.screencast.lock();
+                    if let Some(ref mut sc) = *guard
+                        && sc.active
+                    {
+                        Some(sc.next_frame_path())
+                    } else {
+                        None
+                    }
+                };
+                let conn_clone = Arc::clone(conn);
+                let sid = event_sid.to_string();
+                tokio::spawn(async move {
+                    if let (Some(path), Some(b64)) = (frame_path, data_b64) {
+                        match BASE64.decode(b64.as_bytes()) {
+                            Ok(bytes) => {
+                                if let Err(err) = tokio::fs::write(&path, bytes).await {
+                                    warn!(
+                                        path = %path.display(),
+                                        error = %err,
+                                        "failed writing screencast frame"
+                                    );
+                                }
+                            }
+                            Err(err) => {
+                                warn!(error = %err, "failed decoding base64 screencast frame");
+                            }
+                        }
+                    }
+                    if let Some(ack_id) = frame_session_id {
+                        let _ = conn_clone
+                            .send_raw(
+                                Some(&sid),
+                                "Page.screencastFrameAck",
+                                json!({ "sessionId": ack_id }),
+                            )
+                            .await;
+                    }
+                });
+            }
             "Page.frameNavigated" => {
                 if let Some(frame) = params.get("frame")
                     && let Some(fid) = frame.get("id").and_then(|v| v.as_str())
@@ -3550,6 +3618,7 @@ struct InitialSessionOptions {
     block_images: bool,
     block_media: bool,
     block_fonts: bool,
+    block_trackers: bool,
     instant_animations: bool,
 }
 
@@ -3609,6 +3678,7 @@ impl CdpSession {
             env_extra_headers: Mutex::new(None),
             env_profile: Mutex::new(None),
             pending_storage_scripts: Mutex::new(Vec::new()),
+            screencast: Mutex::new(None),
             _proxy_relay: Mutex::new(proxy_relay),
             load_notify: Notify::new(),
             disposed: AtomicBool::new(false),
@@ -3706,12 +3776,12 @@ impl CdpSession {
             self.set_permissions(init.permissions).await?;
         }
 
-        if init.block_images || init.block_media || init.block_fonts {
-            self.state.interceptor.lock().set_categories(
-                init.block_images,
-                init.block_media,
-                init.block_fonts,
-            );
+        if init.block_images || init.block_media || init.block_fonts || init.block_trackers {
+            {
+                let mut guard = self.state.interceptor.lock();
+                guard.set_categories(init.block_images, init.block_media, init.block_fonts);
+                guard.set_block_trackers(init.block_trackers);
+            }
             self.sync_cdp_network().await?;
         }
         if init.instant_animations {
@@ -4711,6 +4781,7 @@ impl DriverSession for CdpSession {
                 block_images: opts.block_images,
                 block_media: opts.block_media,
                 block_fonts: opts.block_fonts,
+                block_trackers: opts.block_trackers || opts.privacy_mode,
                 instant_animations: opts.instant_animations,
             })
             .await
@@ -6368,6 +6439,97 @@ impl DriverSession for CdpSession {
         })
     }
 
+    async fn start_screencast(&self, opts: ScreencastOptions) -> Result<ScreencastStatus> {
+        self.ensure_alive()?;
+        if opts.out_dir.as_os_str().is_empty() {
+            return Err(MimikyuError::InvalidConfig(
+                "screencast out_dir cannot be empty".to_string(),
+            ));
+        }
+        if opts.out_dir.exists() && !opts.out_dir.is_dir() {
+            return Err(MimikyuError::InvalidConfig(format!(
+                "screencast out_dir '{}' exists and is not a directory",
+                opts.out_dir.display()
+            )));
+        }
+        std::fs::create_dir_all(&opts.out_dir)?;
+
+        let started_at_ms = now_ms();
+        {
+            let mut guard = self.state.screencast.lock();
+            if guard.as_ref().is_some_and(|s| s.active) {
+                return Err(MimikyuError::InvalidConfig(
+                    "screencast is already active for this session".to_string(),
+                ));
+            }
+            *guard = Some(CdpScreencastState {
+                active: true,
+                out_dir: opts.out_dir.clone(),
+                format: opts.format,
+                frame_count: 0,
+                started_at_ms,
+            });
+        }
+
+        let mut params = json!({
+            "format": opts.format.protocol_name(),
+        });
+        if let Some(q) = opts.quality {
+            params["quality"] = json!(q.clamp(1, 100));
+        } else if opts.format == ScreencastFormat::Jpeg {
+            params["quality"] = json!(80);
+        }
+        if let Some(w) = opts.max_width {
+            params["maxWidth"] = json!(w);
+        }
+        if let Some(h) = opts.max_height {
+            params["maxHeight"] = json!(h);
+        }
+        if let Some(nth) = opts.every_nth_frame {
+            params["everyNthFrame"] = json!(nth.max(1));
+        }
+
+        if let Err(err) = self.call("Page.startScreencast", params).await {
+            *self.state.screencast.lock() = None;
+            return Err(err);
+        }
+
+        Ok(ScreencastStatus {
+            recording: true,
+            out_dir: opts.out_dir,
+            format: opts.format,
+            frame_count: 0,
+            started_at_ms,
+            stopped_at_ms: None,
+        })
+    }
+
+    async fn stop_screencast(&self) -> Result<ScreencastStatus> {
+        self.ensure_alive()?;
+        let state = {
+            let mut guard = self.state.screencast.lock();
+            match guard.take() {
+                Some(sc) if sc.active => sc,
+                _ => {
+                    return Err(MimikyuError::InvalidConfig(
+                        "no active screencast for this session".to_string(),
+                    ));
+                }
+            }
+        };
+
+        self.call("Page.stopScreencast", json!({})).await?;
+
+        Ok(ScreencastStatus {
+            recording: false,
+            out_dir: state.out_dir,
+            format: state.format,
+            frame_count: state.frame_count,
+            started_at_ms: state.started_at_ms,
+            stopped_at_ms: Some(now_ms()),
+        })
+    }
+
     async fn set_instant_animations(&self, enabled: bool) -> Result<()> {
         self.ensure_alive()?;
         self.state
@@ -7255,6 +7417,18 @@ impl DriverSession for CdpSession {
     async fn dispose(&self) -> Result<()> {
         if self.state.disposed.swap(true, Ordering::SeqCst) {
             return Ok(());
+        }
+        let had_active_screencast = self
+            .state
+            .screencast
+            .lock()
+            .take()
+            .is_some_and(|sc| sc.active);
+        if had_active_screencast {
+            let _ = self
+                .conn
+                .send_raw(Some(&self.info.session_id), "Page.stopScreencast", json!({}))
+                .await;
         }
         self.conn.sessions.write().remove(&self.info.session_id);
         self.conn
@@ -8173,6 +8347,36 @@ mod tests {
         assert_eq!(ascii_key_code_and_vk("a"), Some(("KeyA", 65)));
     }
 
+    #[test]
+    fn cdp_screencast_state_numbers_frames_and_parses_formats() {
+        let mut sc = CdpScreencastState {
+            active: true,
+            out_dir: PathBuf::from("/tmp/frames"),
+            format: ScreencastFormat::Png,
+            frame_count: 0,
+            started_at_ms: 100,
+        };
+        assert_eq!(sc.next_frame_path(), PathBuf::from("/tmp/frames/frame-000001.png"));
+        assert_eq!(sc.next_frame_path(), PathBuf::from("/tmp/frames/frame-000002.png"));
+        assert_eq!(sc.frame_count, 2);
+
+        let mut sc_jpg = CdpScreencastState {
+            active: true,
+            out_dir: PathBuf::from("/tmp/jpg"),
+            format: ScreencastFormat::Jpeg,
+            frame_count: 0,
+            started_at_ms: 100,
+        };
+        assert_eq!(
+            sc_jpg.next_frame_path(),
+            PathBuf::from("/tmp/jpg/frame-000001.jpg")
+        );
+        assert_eq!("png".parse::<ScreencastFormat>().unwrap(), ScreencastFormat::Png);
+        assert_eq!("jpeg".parse::<ScreencastFormat>().unwrap(), ScreencastFormat::Jpeg);
+        assert_eq!("jpg".parse::<ScreencastFormat>().unwrap(), ScreencastFormat::Jpeg);
+        assert!("gif".parse::<ScreencastFormat>().is_err());
+    }
+
     fn dummy_session_state() -> CdpSessionState {
         CdpSessionState {
             session_id: "main-sid".to_string(),
@@ -8215,6 +8419,7 @@ mod tests {
             env_extra_headers: Mutex::new(None),
             env_profile: Mutex::new(None),
             pending_storage_scripts: Mutex::new(Vec::new()),
+            screencast: Mutex::new(None),
             _proxy_relay: Mutex::new(None),
             load_notify: Notify::new(),
             disposed: AtomicBool::new(false),

@@ -2,7 +2,9 @@ pub mod blocker;
 pub mod intercept;
 pub mod telemetry;
 
-pub use blocker::{BlockPolicy, ResourceBlocker, ResourceType, UrlPattern};
+pub use blocker::{
+    is_tracker_url, BlockPolicy, ResourceBlocker, ResourceType, UrlPattern, TRACKER_DOMAINS,
+};
 pub use intercept::{
     http_reason_phrase, merge_headers_case_insensitive, InterceptDecision, InterceptRequest,
     NetworkInterceptor, RouteRule,

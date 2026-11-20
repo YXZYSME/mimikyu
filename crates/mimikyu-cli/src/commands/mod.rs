@@ -1,3 +1,4 @@
+pub mod browser;
 pub mod page;
 pub mod session;
 
@@ -47,6 +48,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Commands::Browser(args) => browser::handle_browser(args, json_mode),
         Commands::Daemon(args) => {
             let state_dir = resolve_state_dir(cli.state_dir);
             handle_daemon(args, state_dir, global_engine, json_mode).await
@@ -82,6 +84,9 @@ async fn dispatch_client_command(
     match cmd {
         Commands::Session(args) => {
             session::handle_session(client, args, global_session, global_engine, json_mode).await
+        }
+        Commands::Vault(args) => {
+            session::handle_vault(client, args, global_session, global_engine, json_mode).await
         }
         Commands::Close { session_id } => {
             let target = session_id.as_deref().unwrap_or(global_session);
@@ -137,8 +142,13 @@ async fn dispatch_client_command(
             full_page,
         } => page::run_screenshot(client, global_session, out, target, full_page, json_mode).await,
         Commands::Pdf { out } => page::run_pdf(client, global_session, out, json_mode).await,
+        Commands::Record(args) => page::handle_record(client, global_session, args, json_mode).await,
         Commands::Logs { kind } => page::run_logs(client, global_session, kind, json_mode).await,
-        Commands::Doctor | Commands::Daemon(_) | Commands::Mcp | Commands::Bench(_) => {
+        Commands::Doctor
+        | Commands::Browser(_)
+        | Commands::Daemon(_)
+        | Commands::Mcp
+        | Commands::Bench(_) => {
             unreachable!("handled directly without client")
         }
     }
