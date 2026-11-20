@@ -10,8 +10,8 @@ url: "https://github.com/YXZYSME/mimikyu"
 license:
   - MIT
   - Apache-2.0
-version: "0.1.0"
-date-released: "2026-11-19"
+version: "0.2.0"
+date-released: "2026-11-20"
 keywords:
   - browser-automation
   - ai-agents
