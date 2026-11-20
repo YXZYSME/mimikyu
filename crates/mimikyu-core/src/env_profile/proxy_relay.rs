@@ -1,17 +1,20 @@
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::task::JoinHandle;
+use tokio::sync::watch;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::debug;
 
 use crate::driver::ProxyConfig;
 use crate::error::{MimikyuError, Result};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum UpstreamKind {
+    Direct,
     Http {
         host: String,
         port: u16,
@@ -24,33 +27,111 @@ enum UpstreamKind {
     },
 }
 
-/// Local loopback HTTP/CONNECT relay forwarding to authenticated upstream HTTP or SOCKS5 proxies.
+#[derive(Debug, Clone)]
+struct UpstreamState {
+    generation: u64,
+    upstream: Arc<UpstreamKind>,
+}
+
+/// Local loopback HTTP/CONNECT relay supporting direct forwarding and live-swappable upstream
+/// HTTP or SOCKS5 proxies.
 pub struct ProxyRelay {
     local_addr: SocketAddr,
+    state_tx: watch::Sender<UpstreamState>,
     task: JoinHandle<()>,
 }
 
 impl ProxyRelay {
+    /// Start a loopback HTTP/CONNECT relay forwarding to `proxy`.
+    ///
+    /// The relay's upstream target can later be rotated live via [`Self::swap_upstream`].
     pub async fn start(proxy: &ProxyConfig) -> Result<Self> {
-        let upstream = parse_upstream(proxy)?;
+        let upstream = resolve_upstream(Some(proxy))?;
+        Self::start_with_upstream(upstream).await
+    }
+
+    /// Start a loopback HTTP/CONNECT relay initialized in direct-forwarding mode.
+    ///
+    /// Plain HTTP and HTTPS `CONNECT` traffic is forwarded directly to the destination `host:port`
+    /// until rotated via [`Self::swap_upstream`].
+    pub async fn start_direct() -> Result<Self> {
+        Self::start_with_upstream(UpstreamKind::Direct).await
+    }
+
+    /// Start a loopback HTTP/CONNECT relay initialized with `initial` (or direct mode when `None`),
+    /// ready for live upstream rotation via [`Self::swap_upstream`].
+    pub async fn start_rotatable(initial: Option<&ProxyConfig>) -> Result<Self> {
+        let upstream = resolve_upstream(initial)?;
+        Self::start_with_upstream(upstream).await
+    }
+
+    async fn start_with_upstream(initial: UpstreamKind) -> Result<Self> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let local_addr = listener.local_addr()?;
+        debug_assert!(local_addr.ip().is_loopback());
 
-        let task = tokio::spawn(async move {
-            loop {
-                let Ok((client, _)) = listener.accept().await else {
-                    break;
-                };
-                let up = upstream.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = handle_client(client, up).await {
-                        debug!(target: "mimikyu::proxy_relay", "relay connection ended: {e}");
-                    }
-                });
-            }
+        let (state_tx, mut accept_rx) = watch::channel(UpstreamState {
+            generation: 0,
+            upstream: Arc::new(initial),
         });
 
-        Ok(Self { local_addr, task })
+        let task = tokio::spawn(async move {
+            let mut conns = JoinSet::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = wait_for_shutdown(&mut accept_rx) => {
+                        break;
+                    }
+                    Some(_) = conns.join_next(), if !conns.is_empty() => {}
+                    accepted = listener.accept() => {
+                        let Ok((client, _)) = accepted else {
+                            break;
+                        };
+                        while conns.try_join_next().is_some() {}
+                        let conn_rx = accept_rx.clone();
+                        conns.spawn(async move {
+                            if let Err(e) = handle_client(client, conn_rx).await {
+                                debug!(target: "mimikyu::proxy_relay", "relay connection ended: {e}");
+                            }
+                        });
+                    }
+                }
+            }
+            conns.abort_all();
+            while conns.join_next().await.is_some() {}
+        });
+
+        Ok(Self {
+            local_addr,
+            state_tx,
+            task,
+        })
+    }
+
+    /// Atomically swap the active upstream proxy (or switch to direct forwarding when `None`).
+    ///
+    /// Validates and parses `new_proxy` before mutating state: invalid configs or unsupported
+    /// schemes return an error without modifying the active upstream or dropping active tunnels.
+    /// On success, increments the upstream generation so active `CONNECT` tunnels bound to the
+    /// previous upstream abort immediately.
+    pub fn swap_upstream(&self, new_proxy: Option<&ProxyConfig>) -> Result<()> {
+        let next = resolve_upstream(new_proxy)?;
+        self.state_tx.send_modify(|state| {
+            state.generation = state.generation.wrapping_add(1);
+            state.upstream = Arc::new(next);
+        });
+        Ok(())
+    }
+
+    /// Returns `true` when the relay is currently forwarding directly without an upstream proxy.
+    pub fn is_direct(&self) -> bool {
+        matches!(*self.state_tx.borrow().upstream, UpstreamKind::Direct)
+    }
+
+    /// Returns the monotonic upstream generation counter (incremented on every successful swap).
+    pub fn generation(&self) -> u64 {
+        self.state_tx.borrow().generation
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -91,13 +172,17 @@ fn parse_upstream(proxy: &ProxyConfig) -> Result<UpstreamKind> {
         .host_str()
         .map(strip_ipv6_brackets)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| MimikyuError::InvalidConfig(format!("proxy missing host: {}", proxy.server)))?;
+        .ok_or_else(|| {
+            MimikyuError::InvalidConfig(format!("proxy missing host: {}", proxy.server))
+        })?;
 
     let scheme = parsed.scheme().to_ascii_lowercase();
-    let port = parsed.port_or_known_default().unwrap_or(match scheme.as_str() {
-        "socks" | "socks4" | "socks5" | "socks5h" => 1080,
-        _ => 8080,
-    });
+    let port = parsed
+        .port_or_known_default()
+        .unwrap_or(match scheme.as_str() {
+            "socks" | "socks4" | "socks5" | "socks5h" => 1080,
+            _ => 8080,
+        });
 
     let username = proxy
         .username
@@ -150,6 +235,36 @@ fn parse_upstream(proxy: &ProxyConfig) -> Result<UpstreamKind> {
             "unsupported proxy scheme '{other}'"
         ))),
     }
+}
+
+fn resolve_upstream(proxy: Option<&ProxyConfig>) -> Result<UpstreamKind> {
+    let Some(proxy) = proxy else {
+        return Ok(UpstreamKind::Direct);
+    };
+    let trimmed = proxy.server.trim();
+    if trimmed.is_empty() || trimmed.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(MimikyuError::InvalidConfig(
+            "proxy URL cannot be empty or contain whitespace/control characters".to_string(),
+        ));
+    }
+    let upstream = parse_upstream(proxy)?;
+    match &upstream {
+        UpstreamKind::Http { port: 0, .. } | UpstreamKind::Socks5 { port: 0, .. } => {
+            return Err(MimikyuError::InvalidConfig(
+                "proxy port cannot be 0".to_string(),
+            ));
+        }
+        UpstreamKind::Socks5 {
+            credentials: Some((u, p)),
+            ..
+        } if u.len() > 255 || p.len() > 255 => {
+            return Err(MimikyuError::InvalidConfig(
+                "SOCKS5 username/password exceeds 255 bytes".to_string(),
+            ));
+        }
+        UpstreamKind::Direct | UpstreamKind::Http { .. } | UpstreamKind::Socks5 { .. } => {}
+    }
+    Ok(upstream)
 }
 
 fn hex_val(b: u8) -> Option<u8> {
@@ -425,37 +540,277 @@ async fn relay_http_response<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 
 async fn relay_single_http_exchange(
     req_method: &str,
-    client: TcpStream,
-    up: TcpStream,
+    client: &mut TcpStream,
+    up: &mut TcpStream,
 ) -> Result<()> {
-    let (mut client_read, mut client_write) = client.into_split();
-    let (mut up_read, mut up_write) = up.into_split();
+    let (mut client_read, mut client_write) = client.split();
+    let (mut up_read, mut up_write) = up.split();
 
-    let c2u = tokio::spawn(async move {
+    let c2u = async {
         let _ = tokio::io::copy(&mut client_read, &mut up_write).await;
         let _ = up_write.shutdown().await;
-    });
+    };
+    let u2c = async {
+        let res = relay_http_response(req_method, &mut up_read, &mut client_write).await;
+        let _ = client_write.shutdown().await;
+        res
+    };
 
-    let res = relay_http_response(req_method, &mut up_read, &mut client_write).await;
-    let _ = client_write.shutdown().await;
-    match res {
-        Ok(RelayOutcome::Upgraded) => {
-            let _ = c2u.await;
-            Ok(())
-        }
-        Ok(RelayOutcome::Completed) => {
-            c2u.abort();
-            Ok(())
-        }
-        Err(e) => {
-            c2u.abort();
-            Err(e)
+    tokio::pin!(c2u);
+    tokio::pin!(u2c);
+
+    let mut c2u_done = false;
+    loop {
+        tokio::select! {
+            () = &mut c2u, if !c2u_done => {
+                c2u_done = true;
+            }
+            res = &mut u2c => {
+                return match res {
+                    Ok(RelayOutcome::Upgraded) => {
+                        if !c2u_done {
+                            c2u.await;
+                        }
+                        Ok(())
+                    }
+                    Ok(RelayOutcome::Completed) => Ok(()),
+                    Err(e) => Err(e),
+                };
+            }
         }
     }
 }
 
-async fn handle_client(mut client: TcpStream, upstream: UpstreamKind) -> Result<()> {
-    let (head_bytes, leftover) = read_http_head(&mut client).await?;
+struct ParsedRequest<'a> {
+    method: &'a str,
+    target: &'a str,
+    version: &'a str,
+    headers: Vec<&'a str>,
+    leftover: &'a [u8],
+    is_connect: bool,
+    has_upgrade: bool,
+}
+
+async fn wait_for_shutdown(state_rx: &mut watch::Receiver<UpstreamState>) {
+    loop {
+        if state_rx.changed().await.is_err() {
+            return;
+        }
+        let _ = state_rx.borrow_and_update();
+    }
+}
+
+async fn wait_for_generation_change_or_shutdown(
+    state_rx: &mut watch::Receiver<UpstreamState>,
+    captured_gen: u64,
+) {
+    loop {
+        if state_rx.borrow().generation != captured_gen {
+            return;
+        }
+        if state_rx.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn resolve_direct_target(
+    is_connect: bool,
+    target: &str,
+    rest_headers: &[&str],
+) -> Result<(String, u16, Option<String>)> {
+    if is_connect {
+        let (h, p) = parse_host_port(target, 443)?;
+        Ok((h, p, None))
+    } else if let Ok(u) = url::Url::parse(target) {
+        let h = u
+            .host_str()
+            .map(strip_ipv6_brackets)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| MimikyuError::InvalidConfig("missing target host".into()))?;
+        let p = u.port_or_known_default().unwrap_or(80);
+        let mut pq = u.path().to_string();
+        if pq.is_empty() {
+            pq.push('/');
+        }
+        if let Some(q) = u.query() {
+            pq.push('?');
+            pq.push_str(q);
+        }
+        Ok((h, p, Some(pq)))
+    } else {
+        let host_hdr = rest_headers
+            .iter()
+            .find_map(|h| {
+                let (k, v) = h.split_once(':')?;
+                if k.trim().eq_ignore_ascii_case("host") {
+                    Some(v.trim())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("");
+        let (h, p) = parse_host_port(host_hdr, 80)?;
+        Ok((h, p, Some(target.to_string())))
+    }
+}
+
+async fn forward_origin_http_request(
+    client: &mut TcpStream,
+    up: &mut TcpStream,
+    req: &ParsedRequest<'_>,
+    path: &str,
+    target_host: &str,
+    target_port: u16,
+) -> Result<()> {
+    let mut has_host_header = false;
+    let mut out = format!("{} {path} {}\r\n", req.method, req.version);
+    for h in &req.headers {
+        if h.is_empty() || is_hop_by_hop_or_proxy_auth_header(h, req.has_upgrade) {
+            continue;
+        }
+        if let Some((name, _)) = h.split_once(':')
+            && name.trim().eq_ignore_ascii_case("host")
+        {
+            has_host_header = true;
+        }
+        out.push_str(h);
+        out.push_str("\r\n");
+    }
+    if !has_host_header {
+        let host_fmt = if target_host.contains(':') {
+            format!("[{target_host}]")
+        } else {
+            target_host.to_string()
+        };
+        if target_port == 80 {
+            out.push_str(&format!("Host: {host_fmt}\r\n"));
+        } else {
+            out.push_str(&format!("Host: {host_fmt}:{target_port}\r\n"));
+        }
+    }
+    if !req.has_upgrade {
+        out.push_str("Connection: close\r\n");
+    }
+    out.push_str("\r\n");
+    up.write_all(out.as_bytes()).await?;
+    if !req.leftover.is_empty() {
+        up.write_all(req.leftover).await?;
+    }
+    relay_single_http_exchange(req.method, client, up).await
+}
+
+async fn dispatch_to_upstream(
+    client: &mut TcpStream,
+    upstream: &UpstreamKind,
+    req: &ParsedRequest<'_>,
+) -> Result<()> {
+    match upstream {
+        UpstreamKind::Direct => {
+            let (target_host, target_port, origin_path) =
+                resolve_direct_target(req.is_connect, req.target, &req.headers)?;
+            let mut up = TcpStream::connect((target_host.as_str(), target_port)).await?;
+
+            if req.is_connect {
+                client
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await?;
+                if !req.leftover.is_empty() {
+                    up.write_all(req.leftover).await?;
+                }
+                let _ = tokio::io::copy_bidirectional(client, &mut up).await;
+            } else {
+                let path = origin_path.as_deref().unwrap_or("/");
+                forward_origin_http_request(client, &mut up, req, path, &target_host, target_port)
+                    .await?;
+            }
+        }
+        UpstreamKind::Http {
+            host,
+            port,
+            auth_header,
+        } => {
+            let mut up = TcpStream::connect((host.as_str(), *port)).await?;
+            let mut out = format!("{} {} {}\r\n", req.method, req.target, req.version);
+            for h in &req.headers {
+                if h.is_empty() {
+                    continue;
+                }
+                if req.is_connect {
+                    if let Some((name, _)) = h.split_once(':') {
+                        let lower = name.trim().to_ascii_lowercase();
+                        if lower == "proxy-authorization" || lower == "proxy-connection" {
+                            continue;
+                        }
+                    }
+                } else if is_hop_by_hop_or_proxy_auth_header(h, req.has_upgrade) {
+                    continue;
+                }
+                out.push_str(h);
+                out.push_str("\r\n");
+            }
+            if let Some(auth) = auth_header {
+                out.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
+            }
+            if !req.is_connect && !req.has_upgrade {
+                out.push_str("Connection: close\r\n");
+            }
+            out.push_str("\r\n");
+
+            up.write_all(out.as_bytes()).await?;
+            if !req.leftover.is_empty() {
+                up.write_all(req.leftover).await?;
+            }
+
+            if req.is_connect {
+                let _ = tokio::io::copy_bidirectional(client, &mut up).await;
+            } else {
+                relay_single_http_exchange(req.method, client, &mut up).await?;
+            }
+        }
+        UpstreamKind::Socks5 {
+            host,
+            port,
+            credentials,
+        } => {
+            let (target_host, target_port, origin_path) =
+                resolve_direct_target(req.is_connect, req.target, &req.headers)?;
+
+            let mut up = TcpStream::connect((host.as_str(), *port)).await?;
+            socks5_connect(&mut up, &target_host, target_port, credentials.as_ref()).await?;
+
+            if req.is_connect {
+                client
+                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                    .await?;
+                if !req.leftover.is_empty() {
+                    up.write_all(req.leftover).await?;
+                }
+                let _ = tokio::io::copy_bidirectional(client, &mut up).await;
+            } else {
+                let path = origin_path.as_deref().unwrap_or("/");
+                forward_origin_http_request(client, &mut up, req, path, &target_host, target_port)
+                    .await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn handle_client(
+    mut client: TcpStream,
+    mut state_rx: watch::Receiver<UpstreamState>,
+) -> Result<()> {
+    let (head_bytes, leftover) = tokio::select! {
+        biased;
+        _ = wait_for_shutdown(&mut state_rx) => {
+            let _ = client.shutdown().await;
+            return Ok(());
+        }
+        res = read_http_head(&mut client) => res?,
+    };
+
     let head_str = String::from_utf8_lossy(&head_bytes);
     let mut lines = head_str.split("\r\n");
     let req_line = lines.next().unwrap_or("");
@@ -463,7 +818,7 @@ async fn handle_client(mut client: TcpStream, upstream: UpstreamKind) -> Result<
     let method = parts.next().unwrap_or("");
     let target = parts.next().unwrap_or("");
     let version = parts.next().unwrap_or("HTTP/1.1");
-    let rest_headers: Vec<&str> = lines.collect();
+    let headers: Vec<&str> = lines.collect();
 
     if method.is_empty() || target.is_empty() {
         let _ = client
@@ -474,124 +829,45 @@ async fn handle_client(mut client: TcpStream, upstream: UpstreamKind) -> Result<
 
     let is_connect = method.eq_ignore_ascii_case("CONNECT");
     let has_upgrade = !is_connect
-        && rest_headers.iter().any(|h| {
+        && headers.iter().any(|h| {
             h.split_once(':')
                 .is_some_and(|(k, _)| k.trim().eq_ignore_ascii_case("upgrade"))
         });
 
-    match upstream {
-        UpstreamKind::Http {
-            host,
-            port,
-            auth_header,
-        } => {
-            let mut up = TcpStream::connect((host.as_str(), port)).await?;
-            let mut out = format!("{method} {target} {version}\r\n");
-            for h in rest_headers {
-                if h.is_empty() {
-                    continue;
-                }
-                if is_connect {
-                    if let Some((name, _)) = h.split_once(':') {
-                        let lower = name.trim().to_ascii_lowercase();
-                        if lower == "proxy-authorization" || lower == "proxy-connection" {
-                            continue;
-                        }
-                    }
-                } else if is_hop_by_hop_or_proxy_auth_header(h, has_upgrade) {
-                    continue;
-                }
-                out.push_str(h);
-                out.push_str("\r\n");
-            }
-            if let Some(ref auth) = auth_header {
-                out.push_str(&format!("Proxy-Authorization: {auth}\r\n"));
-            }
-            if !is_connect && !has_upgrade {
-                out.push_str("Connection: close\r\n");
-            }
-            out.push_str("\r\n");
+    let req = ParsedRequest {
+        method,
+        target,
+        version,
+        headers,
+        leftover: &leftover,
+        is_connect,
+        has_upgrade,
+    };
 
-            up.write_all(out.as_bytes()).await?;
-            if !leftover.is_empty() {
-                up.write_all(&leftover).await?;
-            }
+    let (captured_gen, upstream) = {
+        let state = state_rx.borrow_and_update();
+        (state.generation, Arc::clone(&state.upstream))
+    };
 
-            if is_connect {
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut up).await;
-            } else {
-                relay_single_http_exchange(method, client, up).await?;
-            }
+    let aborted = tokio::select! {
+        biased;
+        _ = wait_for_generation_change_or_shutdown(&mut state_rx, captured_gen) => {
+            true
         }
-        UpstreamKind::Socks5 {
-            host,
-            port,
-            credentials,
-        } => {
-            let (target_host, target_port, origin_path) = if is_connect {
-                let (h, p) = parse_host_port(target, 443)?;
-                (h, p, None)
-            } else if let Ok(u) = url::Url::parse(target) {
-                let h = u
-                    .host_str()
-                    .map(strip_ipv6_brackets)
-                    .filter(|s| !s.is_empty())
-                    .ok_or_else(|| MimikyuError::InvalidConfig("missing target host".into()))?;
-                let p = u.port_or_known_default().unwrap_or(80);
-                let mut pq = u.path().to_string();
-                if pq.is_empty() {
-                    pq.push('/');
-                }
-                if let Some(q) = u.query() {
-                    pq.push('?');
-                    pq.push_str(q);
-                }
-                (h, p, Some(pq))
-            } else {
-                let host_hdr = rest_headers
-                    .iter()
-                    .find_map(|h| {
-                        let (k, v) = h.split_once(':')?;
-                        if k.trim().eq_ignore_ascii_case("host") {
-                            Some(v.trim())
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or("");
-                let (h, p) = parse_host_port(host_hdr, 80)?;
-                (h, p, Some(target.to_string()))
-            };
-
-            let mut up = TcpStream::connect((host.as_str(), port)).await?;
-            socks5_connect(&mut up, &target_host, target_port, credentials.as_ref()).await?;
-
-            if is_connect {
-                client
-                    .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                    .await?;
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut up).await;
-            } else {
-                let path = origin_path.as_deref().unwrap_or("/");
-                let mut out = format!("{method} {path} {version}\r\n");
-                for h in rest_headers {
-                    if h.is_empty() || is_hop_by_hop_or_proxy_auth_header(h, has_upgrade) {
-                        continue;
-                    }
-                    out.push_str(h);
-                    out.push_str("\r\n");
-                }
-                if !has_upgrade {
-                    out.push_str("Connection: close\r\n");
-                }
-                out.push_str("\r\n");
-                up.write_all(out.as_bytes()).await?;
-                if !leftover.is_empty() {
-                    up.write_all(&leftover).await?;
-                }
-                relay_single_http_exchange(method, client, up).await?;
-            }
+        res = dispatch_to_upstream(&mut client, &upstream, &req) => {
+            res?;
+            false
         }
+    };
+
+    if aborted {
+        debug!(
+            target: "mimikyu::proxy_relay",
+            captured_gen,
+            is_connect,
+            "flushing active relay connection after upstream swap or shutdown"
+        );
+        let _ = client.shutdown().await;
     }
 
     Ok(())
@@ -849,7 +1125,9 @@ mod tests {
                 "response must enforce Connection: close: {resp_str}"
             );
             assert!(
-                !resp_str.to_ascii_lowercase().contains("connection: keep-alive"),
+                !resp_str
+                    .to_ascii_lowercase()
+                    .contains("connection: keep-alive"),
                 "response must strip keep-alive: {resp_str}"
             );
             if path == "/cl" {
@@ -863,10 +1141,22 @@ mod tests {
         assert_eq!(captured.len(), 2);
         for req in &captured {
             let lower = req.to_ascii_lowercase();
-            assert!(lower.contains("connection: close"), "missing Connection: close: {req}");
-            assert!(!lower.contains("proxy-connection:"), "Proxy-Connection leaked: {req}");
-            assert!(!lower.contains("connection: keep-alive"), "keep-alive leaked: {req}");
-            assert!(req.contains("Proxy-Authorization: Basic "), "missing Proxy-Authorization: {req}");
+            assert!(
+                lower.contains("connection: close"),
+                "missing Connection: close: {req}"
+            );
+            assert!(
+                !lower.contains("proxy-connection:"),
+                "Proxy-Connection leaked: {req}"
+            );
+            assert!(
+                !lower.contains("connection: keep-alive"),
+                "keep-alive leaked: {req}"
+            );
+            assert!(
+                req.contains("Proxy-Authorization: Basic "),
+                "missing Proxy-Authorization: {req}"
+            );
         }
 
         srv.abort();
@@ -916,7 +1206,9 @@ mod tests {
                 "upstream must see Upgrade header: {head_str}"
             );
             assert!(
-                head_str.to_ascii_lowercase().contains("connection: upgrade"),
+                head_str
+                    .to_ascii_lowercase()
+                    .contains("connection: upgrade"),
                 "upstream must see Connection: Upgrade: {head_str}"
             );
             s.write_all(
@@ -962,10 +1254,11 @@ mod tests {
         let mut got = leftover;
         while got.len() < 10 {
             let mut chunk = [0u8; 32];
-            let n = tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut chunk))
-                .await
-                .expect("read upgraded response")
-                .unwrap();
+            let n =
+                tokio::time::timeout(std::time::Duration::from_secs(2), client.read(&mut chunk))
+                    .await
+                    .expect("read upgraded response")
+                    .unwrap();
             if n == 0 {
                 break;
             }
@@ -1030,9 +1323,11 @@ mod tests {
             let (head1, _) = read_http_head(&mut s1).await.unwrap();
             let h1 = String::from_utf8_lossy(&head1).into_owned();
             assert!(h1.contains(&format!("Proxy-Authorization: {expected_auth}")));
-            s1.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nipv6-ok")
-                .await
-                .unwrap();
+            s1.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\nipv6-ok",
+            )
+            .await
+            .unwrap();
             let _ = s1.shutdown().await;
 
             // Connection 2: CONNECT tunnel
@@ -1065,10 +1360,13 @@ mod tests {
             .await
             .unwrap();
         let mut resp1 = Vec::new();
-        tokio::time::timeout(std::time::Duration::from_secs(2), c1.read_to_end(&mut resp1))
-            .await
-            .expect("HTTP GET via IPv6 upstream")
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            c1.read_to_end(&mut resp1),
+        )
+        .await
+        .expect("HTTP GET via IPv6 upstream")
+        .unwrap();
         assert!(String::from_utf8_lossy(&resp1).ends_with("\r\n\r\nipv6-ok"));
 
         let mut c2 = TcpStream::connect(relay.local_addr()).await.unwrap();
@@ -1130,9 +1428,11 @@ mod tests {
             let (head, _) = read_http_head(&mut s).await.unwrap();
             let head_str = String::from_utf8_lossy(&head);
             assert!(head_str.starts_with("GET /v6path HTTP/1.1"));
-            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nsocks6-ok")
-                .await
-                .unwrap();
+            s.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nsocks6-ok",
+            )
+            .await
+            .unwrap();
             let _ = s.shutdown().await;
         });
 
@@ -1151,11 +1451,247 @@ mod tests {
             .await
             .unwrap();
         let mut resp = Vec::new();
-        tokio::time::timeout(std::time::Duration::from_secs(2), client.read_to_end(&mut resp))
-            .await
-            .expect("SOCKS5 IPv6 target response")
-            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_to_end(&mut resp),
+        )
+        .await
+        .expect("SOCKS5 IPv6 target response")
+        .unwrap();
         assert!(String::from_utf8_lossy(&resp).ends_with("\r\n\r\nsocks6-ok"));
+        let _ = srv.await;
+    }
+
+    #[test]
+    fn proxy_relay_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ProxyRelay>();
+    }
+
+    #[test]
+    fn resolve_upstream_handles_direct_and_rejects_invalid_configs() {
+        assert_eq!(resolve_upstream(None).unwrap(), UpstreamKind::Direct);
+
+        let port_zero = ProxyConfig {
+            server: "http://127.0.0.1:0".to_string(),
+            username: None,
+            password: None,
+            bypass: Vec::new(),
+        };
+        assert!(matches!(
+            resolve_upstream(Some(&port_zero)),
+            Err(MimikyuError::InvalidConfig(_))
+        ));
+
+        let with_space = ProxyConfig {
+            server: "http://127.0.0.1:8080/bad path".to_string(),
+            username: None,
+            password: None,
+            bypass: Vec::new(),
+        };
+        assert!(matches!(
+            resolve_upstream(Some(&with_space)),
+            Err(MimikyuError::InvalidConfig(_))
+        ));
+
+        let with_crlf = ProxyConfig {
+            server: "http://127.0.0.1:8080\r\n".to_string(),
+            username: None,
+            password: None,
+            bypass: Vec::new(),
+        };
+        // Leading/trailing whitespace is trimmed, embedded control chars are rejected.
+        assert!(resolve_upstream(Some(&with_crlf)).is_ok());
+
+        let embedded_crlf = ProxyConfig {
+            server: "http://127.0.0.1:8080\r\nX-Injected: 1".to_string(),
+            username: None,
+            password: None,
+            bypass: Vec::new(),
+        };
+        assert!(matches!(
+            resolve_upstream(Some(&embedded_crlf)),
+            Err(MimikyuError::InvalidConfig(_))
+        ));
+
+        let https_proxy = ProxyConfig {
+            server: "https://127.0.0.1:8443".to_string(),
+            username: None,
+            password: None,
+            bypass: Vec::new(),
+        };
+        assert!(matches!(
+            resolve_upstream(Some(&https_proxy)),
+            Err(MimikyuError::Unsupported { .. })
+        ));
+
+        let socks4_proxy = ProxyConfig {
+            server: "socks4://127.0.0.1:1080".to_string(),
+            username: None,
+            password: None,
+            bypass: Vec::new(),
+        };
+        assert!(matches!(
+            resolve_upstream(Some(&socks4_proxy)),
+            Err(MimikyuError::Unsupported { .. })
+        ));
+
+        let oversized_socks5 = ProxyConfig {
+            server: "socks5://127.0.0.1:1080".to_string(),
+            username: Some("a".repeat(256)),
+            password: Some("p".to_string()),
+            bypass: Vec::new(),
+        };
+        assert!(matches!(
+            resolve_upstream(Some(&oversized_socks5)),
+            Err(MimikyuError::InvalidConfig(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn preconnected_idle_socket_routes_to_swapped_upstream() {
+        let listener_a = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = listener_a.local_addr().unwrap();
+        let listener_b = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr_b = listener_b.local_addr().unwrap();
+
+        let srv_b = tokio::spawn(async move {
+            let (mut s, _) = listener_b.accept().await.unwrap();
+            let (_head, _) = read_http_head(&mut s).await.unwrap();
+            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nfrom-b")
+                .await
+                .unwrap();
+            let _ = s.shutdown().await;
+        });
+
+        let relay = ProxyRelay::start(&ProxyConfig {
+            server: format!("http://{addr_a}"),
+            username: None,
+            password: None,
+            bypass: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        // Pre-connect TCP socket BEFORE swapping upstream (simulating browser socket preconnect).
+        let mut client = TcpStream::connect(relay.local_addr()).await.unwrap();
+        tokio::task::yield_now().await;
+
+        relay
+            .swap_upstream(Some(&ProxyConfig {
+                server: format!("http://{addr_b}"),
+                username: None,
+                password: None,
+                bypass: Vec::new(),
+            }))
+            .unwrap();
+        assert_eq!(relay.generation(), 1);
+
+        client
+            .write_all(b"GET http://example.test/ HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.read_to_end(&mut resp),
+        )
+        .await
+        .expect("preconnected client should route via swapped upstream B")
+        .unwrap();
+        assert!(String::from_utf8_lossy(&resp).ends_with("\r\n\r\nfrom-b"));
+
+        // Upstream A must never have received a connection.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener_a.accept())
+                .await
+                .is_err(),
+            "upstream A should receive zero connections"
+        );
+        let _ = srv_b.await;
+    }
+
+    #[tokio::test]
+    async fn drop_deterministically_closes_active_tunnels_and_idle_clients() {
+        let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+
+        let (up_closed_tx, up_closed_rx) = tokio::sync::oneshot::channel::<()>();
+        let srv = tokio::spawn(async move {
+            let (mut s, _) = up_listener.accept().await.unwrap();
+            let (_head, _) = read_http_head(&mut s).await.unwrap();
+            s.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+            let mut ping = [0u8; 4];
+            s.read_exact(&mut ping).await.unwrap();
+            assert_eq!(&ping, b"live");
+            s.write_all(b"ack!").await.unwrap();
+            // Wait for relay drop to close the upstream side of the tunnel.
+            let mut sink = [0u8; 16];
+            let _ = s.read(&mut sink).await;
+            let _ = up_closed_tx.send(());
+        });
+
+        let relay = ProxyRelay::start(&ProxyConfig {
+            server: format!("http://{up_addr}"),
+            username: None,
+            password: None,
+            bypass: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let relay_addr = relay.local_addr();
+        assert!(relay_addr.ip().is_loopback());
+
+        // 1. Open an active CONNECT tunnel
+        let mut tunnel_client = TcpStream::connect(relay_addr).await.unwrap();
+        tunnel_client
+            .write_all(b"CONNECT example.test:443 HTTP/1.1\r\nHost: example.test:443\r\n\r\n")
+            .await
+            .unwrap();
+        let (head, _) = read_http_head(&mut tunnel_client).await.unwrap();
+        assert!(String::from_utf8_lossy(&head).starts_with("HTTP/1.1 200"));
+        tunnel_client.write_all(b"live").await.unwrap();
+        let mut ack = [0u8; 4];
+        tunnel_client.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"ack!");
+
+        // 2. Open an idle pre-connected client socket
+        let mut idle_client = TcpStream::connect(relay_addr).await.unwrap();
+        tokio::task::yield_now().await;
+
+        // Drop relay: must abort accept loop AND close active tunnel + idle socket promptly.
+        drop(relay);
+
+        let mut buf = [0u8; 16];
+        let tunnel_eof = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            tunnel_client.read(&mut buf),
+        )
+        .await
+        .expect("active tunnel client must close promptly on Drop");
+        assert!(
+            matches!(tunnel_eof, Ok(0) | Err(_)),
+            "expected tunnel EOF/reset on drop, got {tunnel_eof:?}"
+        );
+
+        let idle_eof = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            idle_client.read(&mut buf),
+        )
+        .await
+        .expect("idle client must close promptly on Drop");
+        assert!(
+            matches!(idle_eof, Ok(0) | Err(_)),
+            "expected idle client EOF/reset on drop, got {idle_eof:?}"
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), up_closed_rx)
+            .await
+            .expect("upstream tunnel socket must close promptly on Drop")
+            .unwrap();
+
         let _ = srv.await;
     }
 }
