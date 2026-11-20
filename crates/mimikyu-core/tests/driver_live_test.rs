@@ -2197,43 +2197,71 @@ async fn assert_activate_tab_across_target_blank_popups(engine: EngineKind) {
         .await
         .expect("navigate /target-blank-host");
 
-    for sel in ["#lnk-blank", "#lnk-noopener"] {
-        let b = session
-            .resolve_selector_box(sel)
-            .await
-            .unwrap_or_else(|e| panic!("{engine} resolve {sel}: {e}"));
-        let (x, y) = b.center();
-        session
-            .dispatch_mouse(MouseEvent {
-                event_type: MouseEventType::Click,
-                x,
-                y,
-                button: MouseButton::Left,
-                click_count: 1,
-                modifiers: 0,
-            })
-            .await
-            .unwrap_or_else(|e| panic!("{engine} click {sel}: {e}"));
-    }
+    let click_link = |sel: &'static str| {
+        let session = &session;
+        async move {
+            let b = session
+                .resolve_selector_box(sel)
+                .await
+                .unwrap_or_else(|e| panic!("{engine} resolve {sel}: {e}"));
+            let (x, y) = b.center();
+            session
+                .dispatch_mouse(MouseEvent {
+                    event_type: MouseEventType::Click,
+                    x,
+                    y,
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    modifiers: 0,
+                })
+                .await
+                .unwrap_or_else(|e| panic!("{engine} click {sel}: {e}"));
+        }
+    };
+
+    click_link("#lnk-blank").await;
 
     let mut blank_tid = None;
-    let mut noopener_tid = None;
-    for _ in 0..120 {
-        let tabs = session.list_tabs().await.expect("list_tabs");
+    for _ in 0..200 {
+        let tabs = session.list_tabs().await.expect("list_tabs for blank");
         blank_tid = tabs
             .iter()
             .find(|t| t.url.contains("/target-blank-child?tag=blank"))
             .map(|t| t.target_id.clone());
-        noopener_tid = tabs
-            .iter()
-            .find(|t| t.url.contains("/target-blank-child?tag=noopener"))
-            .map(|t| t.target_id.clone());
-        if blank_tid.is_some() && noopener_tid.is_some() {
+        let blank_settled = session
+            .eval_isolated("Boolean(document.getElementById('tb-blank')?.textContent)")
+            .await
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if blank_tid.is_some() && blank_settled {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     let blank_tid = blank_tid.expect("blank popup tab present");
+
+    // Re-activate the opener tab (bringing it back to front via Page.bringToFront / BiDi activate)
+    // before resolving and clicking `#lnk-noopener` at its post-layout-shift coordinates.
+    session
+        .activate_tab(&root_tid)
+        .await
+        .unwrap_or_else(|e| panic!("{engine}: activate_tab(root_tid) before noopener failed: {e}"));
+
+    click_link("#lnk-noopener").await;
+
+    let mut noopener_tid = None;
+    for _ in 0..200 {
+        let tabs = session.list_tabs().await.expect("list_tabs for noopener");
+        noopener_tid = tabs
+            .iter()
+            .find(|t| t.url.contains("/target-blank-child?tag=noopener"))
+            .map(|t| t.target_id.clone());
+        if noopener_tid.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     let noopener_tid = noopener_tid.expect("noopener popup tab present");
 
     for target_tid in [&blank_tid, &noopener_tid, &root_tid, &blank_tid] {

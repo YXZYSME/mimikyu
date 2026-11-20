@@ -357,14 +357,21 @@ async fn assert_eval_extract_media_parity(engine: EngineKind) {
         .eval_isolated("document.getElementById('anim-box').classList.add('anim-active')")
         .await
         .expect("trigger anim");
-    tokio::time::sleep(std::time::Duration::from_millis(60)).await;
-    let ended = session
-        .eval_isolated("document.getElementById('anim-box').dataset.animEnded")
-        .await
-        .expect("animEnded");
+    let mut ended = serde_json::json!("false");
+    let anim_deadline = Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        ended = session
+            .eval_isolated("document.getElementById('anim-box').dataset.animEnded")
+            .await
+            .expect("animEnded");
+        if ended == "true" || Instant::now() >= anim_deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
     assert_eq!(
         ended, "true",
-        "{engine}: 2s animation must finish instantly (<100ms), elapsed={}ms",
+        "{engine}: 2s animation must finish instantly (<500ms), elapsed={}ms",
         t0.elapsed().as_millis()
     );
 

@@ -444,7 +444,7 @@ pub fn build_chromium_args(
         "--disable-dev-shm-usage".to_string(),
         "--disable-domain-reliability".to_string(),
         "--disable-extensions".to_string(),
-        "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints,InterestFeedContentSuggestions,AutofillServerCommunication,CertificateTransparencyComponentUpdater".to_string(),
+        "--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter,OptimizationHints,InterestFeedContentSuggestions,AutofillServerCommunication,CertificateTransparencyComponentUpdater,CalculateNativeWinOcclusion,IntensiveWakeUpThrottling".to_string(),
         "--disable-hang-monitor".to_string(),
         "--disable-ipc-flooding-protection".to_string(),
         "--disable-popup-blocking".to_string(),
@@ -1199,6 +1199,13 @@ mod tests {
         let args = build_chromium_args(&hs, &opts, Path::new("/tmp/prof"));
         assert!(args.contains(&"--use-mock-keychain".to_string()));
         assert!(args.contains(&"--password-store=basic".to_string()));
+        assert!(args.contains(&"--disable-background-timer-throttling".to_string()));
+        assert!(args.contains(&"--disable-backgrounding-occluded-windows".to_string()));
+        assert!(args.contains(&"--disable-renderer-backgrounding".to_string()));
+        assert!(args.contains(&"--disable-ipc-flooding-protection".to_string()));
+        assert!(args
+            .iter()
+            .any(|a| a.starts_with("--disable-features=") && a.contains("CalculateNativeWinOcclusion")));
         assert!(!args.contains(&"--headless=new".to_string()));
 
         let cft = DiscoveredBrowser {

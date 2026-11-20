@@ -431,6 +431,9 @@ impl BrowserDriver for CdpDriver {
             return Err(err);
         }
 
+        let _ = session.call("Page.bringToFront", json!({})).await;
+        conn.mark_foreground_target(&target_id);
+
         Ok(session)
     }
 }
@@ -483,11 +486,13 @@ struct CdpConnection {
     iframe_owner_sessions: RwLock<HashMap<String, String>>,
     popup_owner_sessions: RwLock<HashMap<String, String>>,
     popup_target_owners: RwLock<HashMap<String, String>>,
+    auto_attached_page_sessions: RwLock<HashMap<String, String>>,
     shared_worker_targets: RwLock<HashMap<String, String>>,
     handled_sw_fetch_nids: Mutex<VecDeque<String>>,
     browser_fetch_patterns: AsyncMutex<Option<Vec<Value>>>,
     isolated_contexts: RwLock<HashSet<String>>,
     active_targets: RwLock<HashMap<String, String>>,
+    foreground_target: RwLock<Option<String>>,
     process: AsyncMutex<Option<ProcessGuard>>,
     _root_proxy_relay: Mutex<Option<ProxyRelay>>,
     closed: AtomicBool,
@@ -520,6 +525,50 @@ impl CdpConnection {
         }
     }
 
+    fn mark_foreground_target(&self, target_id: &str) {
+        *self.foreground_target.write() = Some(target_id.to_string());
+    }
+
+    fn is_foreground_target(&self, target_id: &str) -> bool {
+        self.foreground_target.read().as_deref() == Some(target_id)
+    }
+
+    fn clear_foreground_target(&self) {
+        *self.foreground_target.write() = None;
+    }
+
+    fn clear_foreground_target_if_matches(&self, target_id: &str) {
+        let mut guard = self.foreground_target.write();
+        if guard.as_deref() == Some(target_id) {
+            *guard = None;
+        }
+    }
+
+    fn session_id_for_target(&self, target_id: &str) -> Option<String> {
+        let states: Vec<Arc<CdpSessionState>> = {
+            let sessions = self.sessions.read();
+            if let Some(st) = sessions
+                .values()
+                .find(|st| st.target_id == target_id && !st.disposed.load(Ordering::SeqCst))
+            {
+                return Some(st.session_id.clone());
+            }
+            sessions.values().cloned().collect()
+        };
+        for st in states {
+            if st.disposed.load(Ordering::SeqCst) {
+                continue;
+            }
+            if let Some(psid) = st.popup_sessions.lock().get(target_id) {
+                return Some(psid.clone());
+            }
+        }
+        self.auto_attached_page_sessions
+            .read()
+            .get(target_id)
+            .cloned()
+    }
+
     async fn connect(
         ws_url: &str,
         process: ProcessGuard,
@@ -544,11 +593,13 @@ impl CdpConnection {
             iframe_owner_sessions: RwLock::new(HashMap::new()),
             popup_owner_sessions: RwLock::new(HashMap::new()),
             popup_target_owners: RwLock::new(HashMap::new()),
+            auto_attached_page_sessions: RwLock::new(HashMap::new()),
             shared_worker_targets: RwLock::new(HashMap::new()),
             handled_sw_fetch_nids: Mutex::new(VecDeque::new()),
             browser_fetch_patterns: AsyncMutex::new(None),
             isolated_contexts: RwLock::new(HashSet::new()),
             active_targets: RwLock::new(HashMap::new()),
+            foreground_target: RwLock::new(None),
             process: AsyncMutex::new(Some(process)),
             _root_proxy_relay: Mutex::new(root_proxy_relay),
             closed: AtomicBool::new(false),
@@ -689,6 +740,15 @@ impl CdpConnection {
             }
         } else if method == "Fetch.requestPaused" {
             self.handle_browser_fetch_paused(&params);
+        } else if method == "Target.targetCreated" {
+            if params
+                .get("targetInfo")
+                .and_then(|t| t.get("type"))
+                .and_then(|v| v.as_str())
+                == Some("page")
+            {
+                self.clear_foreground_target();
+            }
         } else if method == "Target.targetDestroyed" {
             self.handle_target_destroyed(&params);
         } else if method == "Target.attachedToTarget" {
@@ -696,6 +756,9 @@ impl CdpConnection {
         } else if method == "Target.detachedFromTarget"
             && let Some(child_sid) = params.get("sessionId").and_then(|v| v.as_str())
         {
+            self.auto_attached_page_sessions
+                .write()
+                .retain(|_, sid| sid != child_sid);
             let owner_sid_opt = self.iframe_owner_sessions.write().remove(child_sid);
             if let Some(owner_sid) = owner_sid_opt
                 && let Some(owner_state) = self.sessions.read().get(&owner_sid).cloned()
@@ -722,6 +785,15 @@ impl CdpConnection {
         let target_id = info.get("targetId").and_then(|v| v.as_str());
         let opener_tid = info.get("openerId").and_then(|v| v.as_str());
         let target_ctx = info.get("browserContextId").and_then(|v| v.as_str());
+
+        if target_type == "page" {
+            self.clear_foreground_target();
+            if let Some(ptid) = target_id {
+                self.auto_attached_page_sessions
+                    .write()
+                    .insert(ptid.to_string(), auto_sid.clone());
+            }
+        }
 
         if target_type == "page"
             && let Some(ptid) = target_id
@@ -906,6 +978,8 @@ impl CdpConnection {
         let Some(tid) = params.get("targetId").and_then(|v| v.as_str()) else {
             return;
         };
+        self.auto_attached_page_sessions.write().remove(tid);
+        self.clear_foreground_target_if_matches(tid);
         self.shared_worker_targets.write().remove(tid);
         let owner_sid_opt = self.popup_target_owners.write().remove(tid);
         if let Some(owner_sid) = owner_sid_opt {
@@ -1755,6 +1829,9 @@ impl CdpSessionState {
                     .and_then(|t| t.get("type"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                if target_type == "page" {
+                    conn.clear_foreground_target();
+                }
                 let target_id_opt = params
                     .get("targetInfo")
                     .and_then(|t| t.get("targetId"))
@@ -2639,6 +2716,9 @@ impl CdpSessionState {
                     .and_then(|t| t.get("type"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                if target_type == "page" {
+                    conn.clear_foreground_target();
+                }
                 let waiting = params
                     .get("waitingForDebugger")
                     .and_then(|v| v.as_bool())
@@ -3673,6 +3753,43 @@ impl CdpSession {
             .await
     }
 
+    async fn ensure_compositor_foreground(&self) -> Result<()> {
+        self.ensure_alive()?;
+        if !self.conn.is_foreground_target(&self.info.target_id) {
+            let _ = self
+                .conn
+                .send_browser(
+                    "Target.activateTarget",
+                    json!({ "targetId": self.info.target_id }),
+                )
+                .await;
+            let _ = self.call("Page.bringToFront", json!({})).await;
+            self.conn.mark_foreground_target(&self.info.target_id);
+        }
+        Ok(())
+    }
+
+    async fn dispatch_cdp_mouse_event(&self, params: Value) -> Result<()> {
+        self.ensure_compositor_foreground().await?;
+        let mouse_fut = self.call("Input.dispatchMouseEvent", params);
+        tokio::pin!(mouse_fut);
+        match tokio::time::timeout(Duration::from_millis(250), &mut mouse_fut).await {
+            Ok(res) => res.map(|_| ()),
+            Err(_) => {
+                let _ = self
+                    .conn
+                    .send_browser(
+                        "Target.activateTarget",
+                        json!({ "targetId": self.info.target_id }),
+                    )
+                    .await;
+                let _ = self.call("Page.bringToFront", json!({})).await;
+                self.conn.mark_foreground_target(&self.info.target_id);
+                mouse_fut.await.map(|_| ())
+            }
+        }
+    }
+
     async fn call_for_frame(
         &self,
         frame_id: Option<&str>,
@@ -4540,6 +4657,9 @@ impl DriverSession for CdpSession {
             return Err(err);
         }
 
+        let _ = session.call("Page.bringToFront", json!({})).await;
+        self.conn.mark_foreground_target(&target_id);
+
         Ok(session)
     }
 
@@ -4650,6 +4770,8 @@ impl DriverSession for CdpSession {
 
         self.conn
             .set_active_target(self.state.context_id.as_deref(), &target_id);
+        let _ = session.call("Page.bringToFront", json!({})).await;
+        self.conn.mark_foreground_target(&target_id);
 
         if initial_url != "about:blank"
             && let Err(err) = session.navigate(initial_url).await
@@ -4715,13 +4837,20 @@ impl DriverSession for CdpSession {
         self.conn
             .send_browser("Target.activateTarget", json!({ "targetId": target_id }))
             .await?;
+        if let Some(sid) = self.conn.session_id_for_target(target_id) {
+            let _ = self
+                .conn
+                .send_raw(Some(&sid), "Page.bringToFront", json!({}))
+                .await;
+        }
+        self.conn.mark_foreground_target(target_id);
         self.conn
             .set_active_target(self.state.context_id.as_deref(), target_id);
         Ok(())
     }
 
     async fn navigate(&self, url: &str) -> Result<NavInfo> {
-        self.ensure_alive()?;
+        self.ensure_compositor_foreground().await?;
         let notified = self.state.load_notify.notified();
         let res = self
             .call("Page.navigate", json!({ "url": url }))
@@ -4745,7 +4874,7 @@ impl DriverSession for CdpSession {
     }
 
     async fn reload(&self) -> Result<NavInfo> {
-        self.ensure_alive()?;
+        self.ensure_compositor_foreground().await?;
         let notified = self.state.load_notify.notified();
         self.call("Page.reload", json!({})).await?;
         self.state.isolated_worlds.lock().clear();
@@ -4756,7 +4885,7 @@ impl DriverSession for CdpSession {
     }
 
     async fn go_back(&self) -> Result<NavInfo> {
-        self.ensure_alive()?;
+        self.ensure_compositor_foreground().await?;
         let hist = self.call("Page.getNavigationHistory", json!({})).await?;
         let idx = hist["currentIndex"].as_i64().unwrap_or(0);
         let entries = hist["entries"].as_array().ok_or_else(|| {
@@ -4784,7 +4913,7 @@ impl DriverSession for CdpSession {
     }
 
     async fn go_forward(&self) -> Result<NavInfo> {
-        self.ensure_alive()?;
+        self.ensure_compositor_foreground().await?;
         let hist = self.call("Page.getNavigationHistory", json!({})).await?;
         let idx = hist["currentIndex"].as_i64().unwrap_or(0);
         let entries = hist["entries"].as_array().ok_or_else(|| {
@@ -5863,81 +5992,63 @@ impl DriverSession for CdpSession {
 
         match ev.event_type {
             MouseEventType::Move => {
-                self.call(
-                    "Input.dispatchMouseEvent",
-                    json!({
-                        "type": "mouseMoved",
-                        "x": ev.x,
-                        "y": ev.y,
-                        "button": button,
-                        "modifiers": ev.modifiers,
-                    }),
-                )
+                self.dispatch_cdp_mouse_event(json!({
+                    "type": "mouseMoved",
+                    "x": ev.x,
+                    "y": ev.y,
+                    "button": button,
+                    "modifiers": ev.modifiers,
+                }))
                 .await?;
             }
             MouseEventType::Down => {
-                self.call(
-                    "Input.dispatchMouseEvent",
-                    json!({
-                        "type": "mousePressed",
-                        "x": ev.x,
-                        "y": ev.y,
-                        "button": button,
-                        "clickCount": click_count,
-                        "modifiers": ev.modifiers,
-                    }),
-                )
+                self.dispatch_cdp_mouse_event(json!({
+                    "type": "mousePressed",
+                    "x": ev.x,
+                    "y": ev.y,
+                    "button": button,
+                    "clickCount": click_count,
+                    "modifiers": ev.modifiers,
+                }))
                 .await?;
             }
             MouseEventType::Up => {
-                self.call(
-                    "Input.dispatchMouseEvent",
-                    json!({
-                        "type": "mouseReleased",
-                        "x": ev.x,
-                        "y": ev.y,
-                        "button": button,
-                        "clickCount": click_count,
-                        "modifiers": ev.modifiers,
-                    }),
-                )
+                self.dispatch_cdp_mouse_event(json!({
+                    "type": "mouseReleased",
+                    "x": ev.x,
+                    "y": ev.y,
+                    "button": button,
+                    "clickCount": click_count,
+                    "modifiers": ev.modifiers,
+                }))
                 .await?;
             }
             MouseEventType::Click => {
-                self.call(
-                    "Input.dispatchMouseEvent",
-                    json!({
-                        "type": "mouseMoved",
-                        "x": ev.x,
-                        "y": ev.y,
-                        "button": "none",
-                        "modifiers": ev.modifiers,
-                    }),
-                )
+                self.dispatch_cdp_mouse_event(json!({
+                    "type": "mouseMoved",
+                    "x": ev.x,
+                    "y": ev.y,
+                    "button": "none",
+                    "modifiers": ev.modifiers,
+                }))
                 .await?;
-                self.call(
-                    "Input.dispatchMouseEvent",
-                    json!({
-                        "type": "mousePressed",
-                        "x": ev.x,
-                        "y": ev.y,
-                        "button": button,
-                        "clickCount": click_count,
-                        "modifiers": ev.modifiers,
-                    }),
-                )
+                self.dispatch_cdp_mouse_event(json!({
+                    "type": "mousePressed",
+                    "x": ev.x,
+                    "y": ev.y,
+                    "button": button,
+                    "clickCount": click_count,
+                    "modifiers": ev.modifiers,
+                }))
                 .await?;
-                self.call(
-                    "Input.dispatchMouseEvent",
-                    json!({
-                        "type": "mouseReleased",
-                        "x": ev.x,
-                        "y": ev.y,
-                        "button": button,
-                        "clickCount": click_count,
-                        "modifiers": ev.modifiers,
-                    }),
-                )
+                self.dispatch_cdp_mouse_event(json!({
+                    "type": "mouseReleased",
+                    "x": ev.x,
+                    "y": ev.y,
+                    "button": button,
+                    "clickCount": click_count,
+                    "modifiers": ev.modifiers,
+                }))
                 .await?;
             }
         }
@@ -5945,6 +6056,7 @@ impl DriverSession for CdpSession {
     }
 
     async fn dispatch_key(&self, ev: KeyEvent) -> Result<()> {
+        self.ensure_compositor_foreground().await?;
         let spec = named_key_cdp_spec(&ev.key);
 
         if ev.event_type == KeyEventType::Char {
@@ -6047,22 +6159,19 @@ impl DriverSession for CdpSession {
     }
 
     async fn dispatch_wheel(&self, ev: WheelEvent) -> Result<()> {
-        self.call(
-            "Input.dispatchMouseEvent",
-            json!({
-                "type": "mouseWheel",
-                "x": ev.x,
-                "y": ev.y,
-                "deltaX": ev.delta_x,
-                "deltaY": ev.delta_y,
-                "modifiers": ev.modifiers,
-            }),
-        )
-        .await?;
-        Ok(())
+        self.dispatch_cdp_mouse_event(json!({
+            "type": "mouseWheel",
+            "x": ev.x,
+            "y": ev.y,
+            "deltaX": ev.delta_x,
+            "deltaY": ev.delta_y,
+            "modifiers": ev.modifiers,
+        }))
+        .await
     }
 
     async fn insert_text(&self, text: &str) -> Result<()> {
+        self.ensure_compositor_foreground().await?;
         self.call("Input.insertText", json!({ "text": text }))
             .await?;
         Ok(())
@@ -7047,6 +7156,12 @@ impl DriverSession for CdpSession {
             return Ok(());
         }
         self.conn.sessions.write().remove(&self.info.session_id);
+        self.conn
+            .auto_attached_page_sessions
+            .write()
+            .remove(&self.state.target_id);
+        self.conn
+            .clear_foreground_target_if_matches(&self.state.target_id);
         self.conn
             .iframe_owner_sessions
             .write()
