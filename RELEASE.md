@@ -8,8 +8,8 @@ This document defines the official Semantic Versioning, trunk-based branching, a
 
 `mimikyu` follows [Semantic Versioning 2.0.0](https://semver.org/spec/v2.0.0.html) (`MAJOR.MINOR.PATCH`) synchronized across the Cargo workspace:
 
-- **`Cargo.toml`** (`[workspace.package].version`) is the single source of truth inherited by both `crates/mimikyu-core` and `crates/mimikyu-cli`.
-- **`Cargo.lock`**, **`packaging/homebrew/mimikyu.rb`**, and **`CHANGELOG.md`** are kept strictly synchronized and verified in CI by `./scripts/check-version-sync.sh`.
+- **`Cargo.toml`** (`[workspace.package].version`) is the single source of truth inherited by all three workspace crates: `crates/mimikyu-core`, `crates/mimikyu-cli`, and `crates/mimikyu`.
+- **`Cargo.lock`**, **`packaging/homebrew/mimikyu.rb`**, **`packaging/npm/{mimikyu-mcp,saengil-mimikyu,mimikyu-cli}/package.json`**, **`packaging/pypi/pyproject.toml`**, **`packaging/pypi/src/mimikyu_pypi/__init__.py`**, **`server.json`**, **`CITATION.cff`**, and **`CHANGELOG.md`** are kept strictly synchronized and verified in CI by `./scripts/check-version-sync.sh`.
 - **Pre-`1.0` (`0.y.z`) rules**:
   - `0.MINOR.0` — New features, new MCP tools, CLI flag additions, or intentional minor contract evolutions documented in `CHANGELOG.md`.
   - `0.y.PATCH` — Backwards-compatible bug fixes, driver protocol resilience improvements, security fixes, and performance optimizations.
@@ -65,23 +65,23 @@ python3 e2e/run_e2e.py --self-test
 Confirm `## [Unreleased]` in `CHANGELOG.md` summarizes all changes since the previous tag, then preview the release without modifying the working tree:
 
 ```sh
-./scripts/release.sh --dry-run 0.1.1
+./scripts/release.sh --dry-run 0.2.1
 ```
 
-`--dry-run` stages the manifest, lockfile, Homebrew formula, and changelog updates in a temporary directory, runs `./scripts/check-version-sync.sh --tag v0.1.1` against the simulated files, and prints every planned command while leaving your working tree untouched.
+`--dry-run` stages the Cargo, Homebrew, npm, PyPI, MCP (`server.json`), `CITATION.cff`, lockfile, and changelog updates in a temporary directory, runs `./scripts/check-version-sync.sh --tag v0.2.1` against the simulated files, and prints every planned command while leaving your working tree untouched.
 
 ### Step 3: Cut the Release Commit & Annotated Tag
 
 ```sh
-# Creates commit `chore(release): v0.1.1` and annotated tag `v0.1.1` locally
+# Creates commit `chore(release): v0.2.1` and annotated tag `v0.2.1` locally
 # Pass `--sign` to force GPG/SSH tag signing (`git tag -s`)
-./scripts/release.sh 0.1.1
+./scripts/release.sh 0.2.1
 ```
 
 What `./scripts/release.sh` executes deterministically:
 1. Confirms the current branch is `main`, the git working tree is clean, and tag `vX.Y.Z` does not already exist.
-2. Updates `[workspace.package] version = "X.Y.Z"` in `Cargo.toml` and `version "X.Y.Z"` in `packaging/homebrew/mimikyu.rb`.
-3. Runs `cargo check --workspace` so `Cargo.lock` updates cleanly.
+2. Updates `[workspace.package] version = "X.Y.Z"` (and internal `mimikyu-core` dependency version) in `Cargo.toml`, plus synchronized versions across `packaging/homebrew/mimikyu.rb`, `packaging/npm/{mimikyu-mcp,saengil-mimikyu,mimikyu-cli}/package.json`, `packaging/pypi/pyproject.toml`, `packaging/pypi/src/mimikyu_pypi/__init__.py`, `CITATION.cff`, and `server.json`.
+3. Runs `cargo check --workspace` so `Cargo.lock` updates cleanly across all three crates.
 4. Stamps `CHANGELOG.md` (`## [Unreleased]` followed by `## [X.Y.Z] - YYYY-MM-DD`).
 5. Verifies full consistency via `./scripts/check-version-sync.sh --tag vX.Y.Z`.
 6. Commits `chore(release): vX.Y.Z` and creates annotated git tag `vX.Y.Z`.
@@ -91,21 +91,21 @@ What `./scripts/release.sh` executes deterministically:
 By default, `./scripts/release.sh` **never pushes automatically** so maintainers can inspect the commit and tag first:
 
 ```sh
-git show v0.1.1
+git show v0.2.1
 git push origin main
-git push origin v0.1.1
+git push origin v0.2.1
 ```
 
-*(Alternatively, pass `--push` directly: `./scripts/release.sh --sign --push 0.1.1`.)*
+*(Alternatively, pass `--push` directly: `./scripts/release.sh --sign --push 0.2.1`.)*
 
 ---
 
 ## 4. Automated Production Pipeline (`.github/workflows/release.yml`)
 
-Pushing a `v*.*.*` tag triggers [`.github/workflows/release.yml`](./.github/workflows/release.yml) across three gated stages:
+Pushing a `v*.*.*` tag triggers [`.github/workflows/release.yml`](./.github/workflows/release.yml) across six gated jobs (with zero long-lived registry tokens via GitHub OIDC Trusted Publishing):
 
 1. **`verify` Gate**:
-   - Executes `./scripts/check-version-sync.sh --tag ${{ github.ref_name }}` (blocking publication if tag, `Cargo.toml`, `Cargo.lock`, Homebrew formula, or `CHANGELOG.md` are out of sync).
+   - Executes `./scripts/check-version-sync.sh --tag ${{ github.ref_name }}` (blocking publication if the tag, `Cargo.toml`, `Cargo.lock`, npm/PyPI/Homebrew manifests, `server.json`, `CITATION.cff`, or `CHANGELOG.md` are out of sync).
    - Runs `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace --locked`, and `python3 e2e/run_e2e.py --self-test`.
 2. **`build` Matrix**:
    - Compiles `--release --locked` `mimikyu` binaries and packages `mimikyu-<target>.tar.gz` archives for:
@@ -118,6 +118,14 @@ Pushing a `v*.*.*` tag triggers [`.github/workflows/release.yml`](./.github/work
    - Renders a release-ready `mimikyu.rb` Homebrew formula populated with `${{ github.repository }}`, the release version, and the exact SHA-256 digests.
    - Signs SLSA build provenance for `mimikyu-*.tar.gz` and `SHA256SUMS` using [`actions/attest-build-provenance@v2`](https://github.com/actions/attest-build-provenance).
    - Extracts the stamped `## [X.Y.Z]` release notes from `CHANGELOG.md` and publishes the GitHub Release (automatically marking `-alpha`, `-beta`, or `-rc` tags as pre-releases).
+   - Optionally pushes `Formula/mimikyu.rb` to `YXZYSME/homebrew-tap` when `HOMEBREW_TAP_TOKEN` is configured.
+4. **`publish-crates` (crates.io OIDC)**:
+   - Authenticates via `rust-lang/crates-io-auth-action` and publishes `mimikyu-core`, `mimikyu-cli`, and `mimikyu` in dependency order.
+5. **`publish-mcp` (npm & Official MCP Registry OIDC)**:
+   - Publishes `mimikyu-mcp`, `saengil-mimikyu`, and `mimikyu-cli` to npm with `--provenance`.
+   - Verifies `mcp-publisher` via Cosign and publishes `server.json` to `https://registry.modelcontextprotocol.io` using GitHub OIDC.
+6. **`publish-pypi` (PyPI OIDC)**:
+   - Builds the universal wheel and sdist in `packaging/pypi/` via `uv build` and publishes to PyPI via `pypa/gh-action-pypi-publish`.
 
 ---
 
@@ -133,7 +141,7 @@ curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | s
 
 # Pin a specific version and verify both SHA-256 + GitHub SLSA Artifact Attestation
 curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | \
-  sh -s -- --version v0.1.1 --verify-attestation
+  sh -s -- --version v0.2.0 --verify-attestation
 ```
 
 Security guarantees enforced by `install.sh`:
@@ -157,7 +165,7 @@ brew update && brew upgrade mimikyu
 cargo binstall mimikyu-cli
 
 # Build from tagged git source
-cargo install --locked --git https://github.com/YXZYSME/mimikyu --tag v0.1.1 mimikyu-cli
+cargo install --locked --git https://github.com/YXZYSME/mimikyu --tag v0.2.0 mimikyu-cli
 ```
 
 ---

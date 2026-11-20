@@ -31,7 +31,10 @@ const softwareAppJsonLd = {
   applicationCategory: 'DeveloperApplication',
   operatingSystem: 'macOS, Linux',
   softwareVersion: release.version,
-  license: 'https://opensource.org/licenses/MIT',
+  license: [
+    'https://opensource.org/licenses/MIT',
+    'https://www.apache.org/licenses/LICENSE-2.0',
+  ],
   url: `${siteOrigin}${base}`,
   downloadUrl: release.releaseUrl,
   codeRepository: 'https://github.com/YXZYSME/mimikyu',
@@ -87,7 +90,10 @@ const softwareAppJsonLd = {
     />
 
     <!-- Structured Data -->
-    <script type="application/ld+json" set:html={JSON.stringify(softwareAppJsonLd)} />
+    <script
+      type="application/ld+json"
+      set:html={JSON.stringify(softwareAppJsonLd).replace(/</g, '\\u003c')}
+    />
   </head>
   <body class="antialiased selection:bg-[#9D80EB] selection:text-[#090414]">
     <!-- Sticky Pixel-HUD Header -->

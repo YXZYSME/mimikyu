@@ -13,15 +13,15 @@
 
 ## Key Capabilities & Measured Performance
 
-- **~5.0 ms semantic `@eN` snapshots** (Chromium CDP; `19.0 ms` on Firefox BiDi) across open Shadow DOM and nested/cross-origin iframes.
+- **~5.0 ms semantic `@eN` snapshots** (Chromium CDP; `19.0 ms` on Firefox BiDi; local `127.0.0.1` loopback benchmark medians) across open Shadow DOM and nested/cross-origin iframes.
 - **2.79x–3.57x token compression** (967 -> 347 est. tokens on Chromium CDP; 967 -> 271 est. tokens on Firefox BiDi).
-- **~5.4 ms Markdown extraction** (`5.5 ms` on Firefox BiDi) and **~67.1 ms warm virtual contexts** (Tier 2 `VirtualContextPool`).
+- **~5.4 ms Markdown extraction** (`5.5 ms` on Firefox BiDi) and **~67.1 ms warm virtual contexts** (Tier 2 `VirtualContextPool`, local loopback benchmark medians).
 - **Dual-Engine Native Drivers**: Native WebSocket Chromium DevTools Protocol (`driver::cdp`) and W3C WebDriver BiDi (`driver::bidi`) behind a strict `DriverSession` trait boundary.
 - **Managed Browsers & Privacy Vault**: Built-in `mimikyu browser install` (SHA-256 verified Chrome-for-Testing & Firefox), `mimikyu vault launch`, curated DNS-boundary tracker blocking (`--block-trackers`), and headless CDP screencast recording (`mimikyu record`).
 - **Two-Tier Isolation**: Tier 1 `fs2`-locked persistent profiles (`--profile`) or self-cleaning ephemeral directories (`--ephemeral`), plus Tier 2 warm pooled virtual browser contexts (`--virtual`).
 - **Coherent Environment Profiles & ProxyRelay**: Built-in `win11`, `macos`, `linux` presets, offline GeoIP alignment (`--geoip`), and an embedded local `127.0.0.1:0` `ProxyRelay` (`--proxy`) supporting authenticated HTTP/SOCKS5 upstreams without exposing credentials in browser flags.
 - **33 Turnkey MCP Tools**: 13 `mimikyu_*` tools (including R3-compliant human-in-the-loop takeover) + 20 `browser_*` tools over stdio JSON-RPC 2.0.
-- **Verified Suite**: 337 Rust tests (0 Clippy warnings) + 244 opaque-box Python E2E tests (5/5 agentic workflows passing on both Chromium and Firefox).
+- **Verified Suite**: 372 Rust tests (345 mimikyu-core + 26 mimikyu-cli + 1 mimikyu; 0 Clippy warnings) + 237 opaque-box Python E2E tests / 244 runs (5/5 agentic workflows passing on both Chromium and Firefox).
 
 ## Official Package Registries
 
@@ -83,8 +83,8 @@
 - `mimikyu_batch`: Execute an ordered sequence of browser actions in a single call
 - `mimikyu_eval`: Evaluate JavaScript in isolated world or opt-in main world
 - `mimikyu_screenshot`: Capture a PNG screenshot of the viewport, full page, or target element
-- `mimikyu_request_human_takeover`: Pause automated input mutations on a session so a human can legitimately complete login, 2FA, payment, or verification in the browser window
-- `mimikyu_resume_from_human`: Resume automated session execution after human takeover completes and invalidate stale snapshot refs
+- `mimikyu_request_human_takeover`: Pause all automated session operations and hand control to a human operator (for interactive login, 2FA, or manual review); returns a takeover_id required to resume
+- `mimikyu_resume_from_human`: Resume automated session operations after a human operator confirms takeover completion with the active takeover_id
 
 ### `browser_*` Namespace (20 tools)
 - `browser_open`, `browser_close`, `browser_snapshot`, `browser_click`, `browser_fill`, `browser_type`, `browser_press`, `browser_select`, `browser_upload`, `browser_scroll`, `browser_eval`, `browser_extract`, `browser_screenshot`, `browser_wait`, `browser_batch`, `browser_context_list`, `browser_context_close`, `browser_profile_export`, `browser_profile_import`, `browser_env_report`

@@ -15,21 +15,55 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 MASCOT_SVG = ROOT / "assets" / "mimikyu-mascot.svg"
 RELEASE_JSON = ROOT / "website" / "src" / "data" / "release.json"
 MCP_TOOLS_JSON = ROOT / "website" / "src" / "data" / "mcp-tools.json"
+BENCHMARKS_JSON = ROOT / "website" / "src" / "data" / "benchmarks.json"
 OUT_PNG = ROOT / "website" / "public" / "og-card.png"
 
 
-def load_site_meta() -> tuple[str, int]:
-    """Load current release tag and MCP tool count from synced site data."""
-    tag = "v0.2.0"
-    mcp_total = 33
+def load_site_meta() -> dict:
+    """Load current release metadata, MCP tool count, and verified benchmark numbers."""
+    meta = {
+        "tag": "v0.2.0",
+        "rust_version": "1.88",
+        "mcp_total": 33,
+        "protocol_version": "2024-11-05",
+        "snapshot_ms": 5.0,
+        "compression_min": 2.8,
+        "compression_max": 3.6,
+        "rust_tests": 372,
+        "e2e_tests": 237,
+        "e2e_runs": 244,
+    }
     if RELEASE_JSON.exists():
         data = json.loads(RELEASE_JSON.read_text(encoding="utf-8"))
-        tag = data.get("tag", tag)
-        mcp_total = int(data.get("mcp", {}).get("total", mcp_total))
+        meta["tag"] = data.get("tag", meta["tag"])
+        meta["rust_version"] = data.get("rustVersion", meta["rust_version"])
+        mcp = data.get("mcp", {})
+        meta["mcp_total"] = int(mcp.get("total", meta["mcp_total"]))
+        meta["protocol_version"] = mcp.get("protocolVersion", meta["protocol_version"])
     elif MCP_TOOLS_JSON.exists():
         data = json.loads(MCP_TOOLS_JSON.read_text(encoding="utf-8"))
-        mcp_total = int(data.get("total", mcp_total))
-    return tag, mcp_total
+        meta["mcp_total"] = int(data.get("total", meta["mcp_total"]))
+        meta["protocol_version"] = data.get("protocolVersion", meta["protocol_version"])
+
+    if BENCHMARKS_JSON.exists():
+        bench = json.loads(BENCHMARKS_JSON.read_text(encoding="utf-8"))
+        suite = bench.get("verifiedSuite", {})
+        meta["rust_tests"] = int(suite.get("rustTests", meta["rust_tests"]))
+        meta["e2e_tests"] = int(suite.get("e2eTests", meta["e2e_tests"]))
+        meta["e2e_runs"] = int(suite.get("e2eRuns", meta["e2e_runs"]))
+        for m in bench.get("latencyMetrics", []):
+            if m.get("id") == "snapshot":
+                meta["snapshot_ms"] = float(m.get("chromiumMs", meta["snapshot_ms"]))
+                break
+        tc = bench.get("tokenCompression", {})
+        ratios = [
+            float(tc.get("chromium", {}).get("ratio", 2.79)),
+            float(tc.get("firefox", {}).get("ratio", 3.57)),
+        ]
+        meta["compression_min"] = min(ratios)
+        meta["compression_max"] = max(ratios)
+
+    return meta
 
 # Exact 16-bit Dark HUD palette from assets/*.svg
 C_VOID = "#090414"
@@ -185,14 +219,20 @@ def main() -> None:
     f_kpi_lbl = mono_reg(16)
     f_footer = mono_bold(20)
 
-    release_tag, mcp_total = load_site_meta()
+    meta = load_site_meta()
+    release_tag = meta["tag"]
+    mcp_total = meta["mcp_total"]
+    rust_version = meta["rust_version"]
+    snap_label = f"{meta['snapshot_ms']:.1f} ms"
+    comp_label = f"{meta['compression_min']:.1f}x–{meta['compression_max']:.1f}x"
+    total_tests = meta["rust_tests"] + meta["e2e_tests"]
 
     # Status LEDs & Header Kicker
     draw.rectangle([58, 57, 72, 71], fill=C_GOLD)
     draw.rectangle([80, 57, 94, 71], fill=C_MINT)
     draw.rectangle([102, 57, 116, 71], fill=C_VIOLET)
     draw.text((136, 53), f"AGENTDEX // ENTRY NO. {mcp_total:03d} · {release_tag}", font=f_kicker, fill=C_GOLD_BRIGHT)
-    draw.text((W - 320, 53), "RUST 1.88+ · MIT/APACHE", font=f_kicker, fill=C_MINT_BRIGHT)
+    draw.text((W - 320, 53), f"RUST {rust_version}+ · MIT/APACHE", font=f_kicker, fill=C_MINT_BRIGHT)
 
     # Left mascot sprite (256x256 crisp nearest-neighbor from SVG)
     mascot = render_pixel_svg(MASCOT_SVG, scale=2)
@@ -248,7 +288,7 @@ def main() -> None:
     px = rx
     py = 332
     pills = [
-        ("5.0 ms snapshots", C_GOLD_BRIGHT, C_GOLD),
+        (f"{snap_label} snapshots", C_GOLD_BRIGHT, C_GOLD),
         ("CDP + BiDi", C_MINT_BRIGHT, C_MINT),
         (f"{mcp_total} MCP tools", C_TEXT, C_VIOLET),
         ("Rust", C_CORAL, C_CORAL),
@@ -261,10 +301,10 @@ def main() -> None:
     bar_y0, bar_y1 = 428, 526
     draw.rectangle([48, bar_y0, W - 48, bar_y1], fill=C_PANEL, outline=C_BORDER, width=2)
     kpis = [
-        ("5.0 ms", "SEMANTIC @eN SNAPSHOT", C_GOLD_BRIGHT),
-        ("2.8x–3.6x", "TOKEN COMPRESSION", C_MINT_BRIGHT),
-        (f"{mcp_total} TOOLS", "MCP 2024-11-05 STDIO", C_VIOLET),
-        ("581 TESTS", "337 RUST + 244 E2E", C_TEXT),
+        (snap_label, "SEMANTIC @eN SNAPSHOT", C_GOLD_BRIGHT),
+        (comp_label, "TOKEN COMPRESSION", C_MINT_BRIGHT),
+        (f"{mcp_total} TOOLS", f"MCP {meta['protocol_version']} STDIO", C_VIOLET),
+        (f"{total_tests} TESTS", f"{meta['rust_tests']} RUST + {meta['e2e_tests']} E2E", C_TEXT),
     ]
     col_w = (W - 96) // 4
     for i, (val, lbl, col) in enumerate(kpis):

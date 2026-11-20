@@ -3,10 +3,12 @@
   "firefoxCommand": "mimikyu bench --engine firefox --suite all --json",
   "harness": "127.0.0.1:0 dual-origin local HTTP harness (offline, reproducible)",
   "verifiedSuite": {
-    "rustTests": 337,
-    "rustCoreTests": 314,
-    "rustCliTests": 23,
-    "e2eTests": 244,
+    "rustTests": 372,
+    "rustCoreTests": 345,
+    "rustCliTests": 26,
+    "rustFacadeTests": 1,
+    "e2eTests": 237,
+    "e2eRuns": 244,
     "e2eChromium": 208,
     "e2eFirefox": 7,
     "e2eSelfTest": 29,
@@ -72,7 +74,7 @@
     }
   ],
   "memory": {
-    "label": "Process-tree RSS (median)",
+    "label": "Process-tree RSS (last round)",
     "chromiumMb": 278.3,
     "firefoxMb": 727.8,
     "unit": "MB"

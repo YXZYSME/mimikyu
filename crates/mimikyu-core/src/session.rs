@@ -1,7 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::io::ErrorKind;
+use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,6 +43,21 @@ use crate::wait::{
 const MAX_SESSION_ID_LEN: usize = 128;
 const MAX_VIEWPORT_DIM: u32 = 16_384;
 
+pub const ENV_ALLOWED_ROOT: &str = "MIMIKYU_ALLOWED_ROOT";
+pub const ENV_REQUIRE_OOB_RESUME: &str = "MIMIKYU_REQUIRE_OOB_RESUME";
+
+fn env_allowed_root() -> Option<PathBuf> {
+    std::env::var_os(ENV_ALLOWED_ROOT)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+fn env_require_oob_resume() -> bool {
+    std::env::var(ENV_REQUIRE_OOB_RESUME)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -54,6 +70,10 @@ pub struct SessionManagerConfig {
     pub default_headless: bool,
     pub default_telemetry_capacity: Option<usize>,
     pub default_ack_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub allowed_root: Option<PathBuf>,
+    #[serde(default)]
+    pub require_oob_resume: bool,
 }
 
 impl Default for SessionManagerConfig {
@@ -68,6 +88,8 @@ impl Default for SessionManagerConfig {
             default_headless: true,
             default_telemetry_capacity: None,
             default_ack_timeout_ms: None,
+            allowed_root: env_allowed_root(),
+            require_oob_resume: env_require_oob_resume(),
         }
     }
 }
@@ -157,8 +179,24 @@ pub struct PauseStatus {
     pub pause_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub paused_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub takeover_id: Option<String>,
+    #[serde(default)]
+    pub confirmation_required: bool,
     pub url: String,
     pub title: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathConfinementMode {
+    /// Existing regular file to read; canonicalized path must remain within the allowed root.
+    ExistingFile,
+    /// Output file path to write; canonicalized parent and target must remain within the allowed root
+    /// and must not target a symlink.
+    OutputFile,
+    /// Output directory (may not yet exist); canonicalized ancestors and target must remain within
+    /// the allowed root and must not target a symlink.
+    OutputDir,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -291,6 +329,7 @@ struct ManagedSession {
     paused_for_human: bool,
     pause_reason: Option<String>,
     paused_at_ms: Option<u64>,
+    takeover_id: Option<String>,
     disposed: bool,
 }
 
@@ -351,6 +390,7 @@ impl Drop for PendingIdGuard {
 
 pub struct SessionManager {
     config: SessionManagerConfig,
+    allowed_root: Option<PathBuf>,
     profile_store: ProfileStore,
     registry: Arc<parking_lot::Mutex<SessionRegistry>>,
     pools: tokio::sync::Mutex<HashMap<(EngineKind, bool), PoolSlot>>,
@@ -378,6 +418,30 @@ impl SessionManager {
         }
         fs::create_dir_all(&config.state_dir)?;
 
+        let allowed_root = match config.allowed_root.as_ref() {
+            Some(root) => {
+                if root.as_os_str().is_empty() {
+                    return Err(MimikyuError::InvalidConfig(
+                        "allowed_root cannot be empty".to_string(),
+                    ));
+                }
+                let canonical = fs::canonicalize(root).map_err(|e| {
+                    MimikyuError::InvalidConfig(format!(
+                        "allowed_root '{}' is not accessible: {e}",
+                        root.display()
+                    ))
+                })?;
+                if !canonical.is_dir() {
+                    return Err(MimikyuError::InvalidConfig(format!(
+                        "allowed_root '{}' is not a directory",
+                        root.display()
+                    )));
+                }
+                Some(canonical)
+            }
+            None => None,
+        };
+
         let profiles_dir = config
             .profiles_dir
             .clone()
@@ -392,6 +456,7 @@ impl SessionManager {
 
         Ok(Self {
             profile_store: ProfileStore::new(profiles_dir),
+            allowed_root,
             config,
             registry: Arc::new(parking_lot::Mutex::new(SessionRegistry::default())),
             pools: tokio::sync::Mutex::new(HashMap::new()),
@@ -400,6 +465,30 @@ impl SessionManager {
 
     pub fn state_dir(&self) -> &Path {
         &self.config.state_dir
+    }
+
+    pub fn allowed_root(&self) -> Option<&Path> {
+        self.allowed_root.as_deref()
+    }
+
+    pub fn require_oob_resume(&self) -> bool {
+        self.config.require_oob_resume
+    }
+
+    pub fn takeover_confirmation_path(&self, session_id: &str) -> PathBuf {
+        let safe_id = safe_session_token(session_id);
+        self.config
+            .state_dir
+            .join("takeover")
+            .join(format!("{safe_id}.confirmed"))
+    }
+
+    fn resolve_path_if_confined(&self, path: &Path, mode: PathConfinementMode) -> Result<PathBuf> {
+        if let Some(ref root) = self.allowed_root {
+            resolve_confined_path(path, root, mode)
+        } else {
+            Ok(path.to_path_buf())
+        }
     }
 
     pub fn profile_store(&self) -> &ProfileStore {
@@ -451,20 +540,25 @@ impl SessionManager {
 
         let persistent_path = if let Some(ref prof_spec) = opts.profile {
             let resolved = self.profile_store.resolve(prof_spec)?;
-            if resolved.path.exists() && !resolved.path.is_dir() {
+            let target_path = if resolved.is_named {
+                resolved.path
+            } else {
+                self.resolve_path_if_confined(&resolved.path, PathConfinementMode::OutputDir)?
+            };
+            if target_path.exists() && !target_path.is_dir() {
                 return Err(MimikyuError::InvalidConfig(format!(
                     "profile path '{}' exists and is not a directory",
-                    resolved.path.display()
+                    target_path.display()
                 )));
             }
-            fs::create_dir_all(&resolved.path)?;
-            if ProfileLock::is_locked(&resolved.path)? {
+            fs::create_dir_all(&target_path)?;
+            if ProfileLock::is_locked(&target_path)? {
                 return Err(MimikyuError::ProfileLocked(format!(
                     "profile '{}' is currently locked by another session",
-                    resolved.path.display()
+                    target_path.display()
                 )));
             }
-            Some(resolved.path)
+            Some(target_path)
         } else {
             None
         };
@@ -645,6 +739,7 @@ impl SessionManager {
             paused_for_human: false,
             pause_reason: None,
             paused_at_ms: None,
+            takeover_id: None,
             disposed: false,
         };
 
@@ -805,9 +900,13 @@ impl SessionManager {
             .map(|r| r.trim().to_string())
             .filter(|r| !r.is_empty());
         let ts = now_ms();
+        let takeover_id = format!("tk-{}", uuid::Uuid::new_v4().simple());
+        // Remove any stale out-of-band confirmation marker from a prior takeover cycle.
+        let _ = fs::remove_file(self.takeover_confirmation_path(session_id));
         managed.paused_for_human = true;
         managed.pause_reason = cleaned_reason.clone();
         managed.paused_at_ms = Some(ts);
+        managed.takeover_id = Some(takeover_id.clone());
         managed.refresh_meta_best_effort().await;
         managed.sync_pause_meta();
         Ok(PauseStatus {
@@ -815,6 +914,8 @@ impl SessionManager {
             paused_for_human: true,
             pause_reason: cleaned_reason,
             paused_at_ms: Some(ts),
+            takeover_id: Some(takeover_id),
+            confirmation_required: true,
             url: managed.summary.url.clone(),
             title: managed.summary.title.clone(),
         })
@@ -841,6 +942,8 @@ impl SessionManager {
         managed.paused_for_human = false;
         managed.pause_reason = None;
         managed.paused_at_ms = None;
+        managed.takeover_id = None;
+        let _ = fs::remove_file(self.takeover_confirmation_path(session_id));
         // Invalidate snapshot refs because the human operator may have navigated or mutated the DOM.
         managed.snapshot_state.active_ref_map.clear();
         managed.refresh_meta_best_effort().await;
@@ -850,6 +953,99 @@ impl SessionManager {
             paused_for_human: false,
             pause_reason: None,
             paused_at_ms: None,
+            takeover_id: None,
+            confirmation_required: false,
+            url: managed.summary.url.clone(),
+            title: managed.summary.title.clone(),
+        })
+    }
+
+    /// Resume a paused session only when explicit human confirmation and the matching
+    /// `takeover_id` token are provided (and an out-of-band confirmation marker file when
+    /// `require_oob_resume` / `MIMIKYU_REQUIRE_OOB_RESUME` is enabled).
+    pub async fn resume_session_confirmed(
+        &self,
+        session_id: &str,
+        takeover_id: &str,
+        confirmed_by_human: bool,
+    ) -> Result<PauseStatus> {
+        if !confirmed_by_human {
+            return Err(MimikyuError::InvalidConfig(
+                "cannot resume paused session without explicit human confirmation (confirmed_by_human must be true)"
+                    .to_string(),
+            ));
+        }
+        let provided_token = takeover_id.trim();
+        if provided_token.is_empty() {
+            return Err(MimikyuError::InvalidConfig(
+                "missing or empty 'takeover_id'; resume requires the active takeover token from mimikyu_request_human_takeover"
+                    .to_string(),
+            ));
+        }
+
+        let entry = self.lookup_session(session_id)?;
+        let mut managed = entry.handle.lock().await;
+        if managed.disposed {
+            return Err(MimikyuError::Disposed);
+        }
+
+        if managed.paused_for_human {
+            let expected = managed.takeover_id.as_deref().unwrap_or("");
+            if expected.is_empty() || provided_token != expected {
+                return Err(MimikyuError::InvalidConfig(
+                    "invalid or mismatched 'takeover_id' for paused session; verify the active takeover token with the human operator"
+                        .to_string(),
+                ));
+            }
+            if self.config.require_oob_resume {
+                let conf_path = self.takeover_confirmation_path(session_id);
+                match fs::symlink_metadata(&conf_path) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        return Err(MimikyuError::InvalidConfig(format!(
+                            "refusing symlink out-of-band confirmation file '{}'",
+                            conf_path.display()
+                        )));
+                    }
+                    Ok(_) => {
+                        let content = fs::read_to_string(&conf_path).map_err(|e| {
+                            MimikyuError::InvalidConfig(format!(
+                                "failed to read out-of-band human confirmation file '{}': {e}",
+                                conf_path.display()
+                            ))
+                        })?;
+                        if content.trim() != expected {
+                            return Err(MimikyuError::InvalidConfig(format!(
+                                "out-of-band human confirmation token in '{}' does not match active takeover_id",
+                                conf_path.display()
+                            )));
+                        }
+                        let _ = fs::remove_file(&conf_path);
+                    }
+                    Err(_) => {
+                        return Err(MimikyuError::InvalidConfig(format!(
+                            "out-of-band human confirmation required before MCP resume: run `mimikyu --session {session_id} session resume` or write the active takeover_id to '{}'",
+                            conf_path.display()
+                        )));
+                    }
+                }
+            }
+        }
+
+        managed.paused_for_human = false;
+        managed.pause_reason = None;
+        managed.paused_at_ms = None;
+        managed.takeover_id = None;
+        let _ = fs::remove_file(self.takeover_confirmation_path(session_id));
+        managed.snapshot_state.active_ref_map.clear();
+        managed.refresh_meta_best_effort().await;
+        managed.sync_pause_meta();
+        Ok(PauseStatus {
+            session_id: managed.summary.session_id.clone(),
+            paused_for_human: false,
+            pause_reason: None,
+            paused_at_ms: None,
+            takeover_id: None,
+            confirmation_required: false,
             url: managed.summary.url.clone(),
             title: managed.summary.title.clone(),
         })
@@ -858,13 +1054,15 @@ impl SessionManager {
     pub async fn start_screencast(
         &self,
         session_id: &str,
-        opts: ScreencastOptions,
+        mut opts: ScreencastOptions,
     ) -> Result<ScreencastStatus> {
         if opts.out_dir.as_os_str().is_empty() {
             return Err(MimikyuError::InvalidConfig(
                 "screencast out_dir cannot be empty".to_string(),
             ));
         }
+        opts.out_dir =
+            self.resolve_path_if_confined(&opts.out_dir, PathConfinementMode::OutputDir)?;
         if opts.out_dir.exists() && !opts.out_dir.is_dir() {
             return Err(MimikyuError::InvalidConfig(format!(
                 "screencast out_dir '{}' exists and is not a directory",
@@ -876,6 +1074,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         managed.driver.start_screencast(opts).await
     }
 
@@ -889,12 +1088,14 @@ impl SessionManager {
     }
 
     pub async fn export_session(&self, session_id: &str, out_path: &Path) -> Result<()> {
-        validate_output_file_path(out_path)?;
+        let safe_out = self.resolve_path_if_confined(out_path, PathConfinementMode::OutputFile)?;
+        validate_output_file_path(&safe_out)?;
         let entry = self.lookup_session(session_id)?;
         let managed = entry.handle.lock().await;
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         if let Some(ref prof_dir) = managed.persistent_path {
             let mut state = managed.driver.storage_state().await?;
             state.cookies.retain(|c| !c.name.trim().is_empty());
@@ -915,15 +1116,16 @@ impl SessionManager {
                     }
                 }
             }
-            save_storage_state(out_path, &state)?;
+            save_storage_state(&safe_out, &state)?;
         } else {
-            export_storage_state(managed.driver.as_ref(), out_path).await?;
+            export_storage_state(managed.driver.as_ref(), &safe_out).await?;
         }
         Ok(())
     }
 
     pub async fn import_session(&self, session_id: &str, in_path: &Path) -> Result<()> {
-        if in_path.as_os_str().is_empty() || in_path.is_dir() || !in_path.exists() {
+        let safe_in = self.resolve_path_if_confined(in_path, PathConfinementMode::ExistingFile)?;
+        if safe_in.as_os_str().is_empty() || safe_in.is_dir() || !safe_in.exists() {
             return Err(MimikyuError::InvalidConfig(format!(
                 "import storage state file '{}' does not exist or is a directory",
                 in_path.display()
@@ -934,7 +1136,8 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
-        let state = import_storage_state(managed.driver.as_ref(), in_path).await?;
+        managed.ensure_not_paused()?;
+        let state = import_storage_state(managed.driver.as_ref(), &safe_in).await?;
         if let Some(ref prof_dir) = managed.persistent_path {
             if let Ok(cookies) = managed.driver.cookies().await {
                 save_session_cookies(prof_dir, &cookies)?;
@@ -971,6 +1174,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         managed.snapshot_state.active_ref_map.clear();
         let nav = managed.driver.navigate(&valid_url).await?;
         managed.sync_nav_meta(nav.url.clone(), nav.title.clone());
@@ -983,6 +1187,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         managed.snapshot_state.active_ref_map.clear();
         let nav = managed.driver.go_back().await?;
         managed.sync_nav_meta(nav.url.clone(), nav.title.clone());
@@ -995,6 +1200,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         managed.snapshot_state.active_ref_map.clear();
         let nav = managed.driver.go_forward().await?;
         managed.sync_nav_meta(nav.url.clone(), nav.title.clone());
@@ -1007,6 +1213,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         managed.snapshot_state.active_ref_map.clear();
         let nav = managed.driver.reload().await?;
         managed.sync_nav_meta(nav.url.clone(), nav.title.clone());
@@ -1023,6 +1230,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         let driver = Arc::clone(&managed.driver);
         let snap = SnapshotEngine::capture(driver.as_ref(), &mut managed.snapshot_state, opts).await?;
         managed.sync_nav_meta(snap.url.clone(), snap.title.clone());
@@ -1144,7 +1352,8 @@ impl SessionManager {
     }
 
     pub async fn upload(&self, session_id: &str, target: &str, path: PathBuf) -> Result<()> {
-        let meta = fs::metadata(&path).map_err(|e| {
+        let safe_path = self.resolve_path_if_confined(&path, PathConfinementMode::ExistingFile)?;
+        let meta = fs::metadata(&safe_path).map_err(|e| {
             MimikyuError::InvalidConfig(format!(
                 "upload file '{}' is not accessible: {e}",
                 path.display()
@@ -1169,7 +1378,7 @@ impl SessionManager {
             .set_input_files(
                 &tgt,
                 Some(&managed.snapshot_state.active_ref_map),
-                vec![path],
+                vec![safe_path],
                 0,
             )
             .await
@@ -1239,6 +1448,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
 
         let timeout_ms = req.timeout_ms.unwrap_or(DEFAULT_WAIT_TIMEOUT_MS);
         let poll_interval_ms = req.poll_interval_ms.unwrap_or(DEFAULT_POLL_INTERVAL_MS);
@@ -1279,7 +1489,25 @@ impl SessionManager {
         Ok(())
     }
 
-    pub async fn batch(&self, session_id: &str, actions: Vec<BatchAction>) -> Result<BatchReport> {
+    pub async fn batch(
+        &self,
+        session_id: &str,
+        mut actions: Vec<BatchAction>,
+    ) -> Result<BatchReport> {
+        if let Some(ref root) = self.allowed_root {
+            for action in &mut actions {
+                if let BatchAction::Upload { files, .. } = action {
+                    for file in files.iter_mut() {
+                        *file = resolve_confined_path(
+                            file,
+                            root,
+                            PathConfinementMode::ExistingFile,
+                        )?;
+                    }
+                }
+            }
+        }
+
         let entry = self.lookup_session(session_id)?;
         let mut managed = entry.handle.lock().await;
         if managed.disposed {
@@ -1319,6 +1547,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         let opts = ExtractOptions::default();
         match mode {
             ExtractMode::Markdown => {
@@ -1342,6 +1571,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         if main_world {
             if !managed.main_world_eval {
                 return Err(MimikyuError::MainWorldDisabled);
@@ -1352,19 +1582,18 @@ impl SessionManager {
         }
     }
 
-    pub async fn screenshot(
+    pub async fn screenshot_bytes(
         &self,
         session_id: &str,
-        out_path: &Path,
         target: Option<&str>,
         full_page: bool,
-    ) -> Result<ScreenshotResult> {
-        validate_output_file_path(out_path)?;
+    ) -> Result<(Vec<u8>, u32, u32)> {
         let entry = self.lookup_session(session_id)?;
         let managed = entry.handle.lock().await;
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
 
         let media_target = match target {
             Some(raw) => {
@@ -1455,22 +1684,37 @@ impl SessionManager {
             });
         }
 
-        fs::write(out_path, &capture.bytes)?;
+        Ok((capture.bytes, capture.width, capture.height))
+    }
+
+    pub async fn screenshot(
+        &self,
+        session_id: &str,
+        out_path: &Path,
+        target: Option<&str>,
+        full_page: bool,
+    ) -> Result<ScreenshotResult> {
+        let safe_out = self.resolve_path_if_confined(out_path, PathConfinementMode::OutputFile)?;
+        validate_output_file_path(&safe_out)?;
+        let (bytes, width, height) = self.screenshot_bytes(session_id, target, full_page).await?;
+        fs::write(&safe_out, &bytes)?;
         Ok(ScreenshotResult {
-            path: out_path.to_path_buf(),
-            width: capture.width,
-            height: capture.height,
-            bytes: capture.bytes.len(),
+            path: safe_out,
+            width,
+            height,
+            bytes: bytes.len(),
         })
     }
 
     pub async fn pdf(&self, session_id: &str, out_path: &Path) -> Result<PdfResult> {
-        validate_output_file_path(out_path)?;
+        let safe_out = self.resolve_path_if_confined(out_path, PathConfinementMode::OutputFile)?;
+        validate_output_file_path(&safe_out)?;
         let entry = self.lookup_session(session_id)?;
         let managed = entry.handle.lock().await;
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
 
         let bytes = export_pdf(managed.driver.as_ref()).await?;
         if bytes.is_empty() || !bytes.starts_with(b"%PDF-") {
@@ -1480,9 +1724,9 @@ impl SessionManager {
             });
         }
 
-        fs::write(out_path, &bytes)?;
+        fs::write(&safe_out, &bytes)?;
         Ok(PdfResult {
-            path: out_path.to_path_buf(),
+            path: safe_out,
             bytes: bytes.len(),
         })
     }
@@ -1493,6 +1737,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         match kind {
             LogKind::Console => {
                 let entries = managed.driver.console_logs().await?;
@@ -1632,7 +1877,7 @@ async fn dispose_session_entry(entry: SessionEntry) -> Result<()> {
     res
 }
 
-fn safe_session_download_dir(state_dir: &Path, session_id: &str) -> PathBuf {
+fn safe_session_token(session_id: &str) -> String {
     let is_lowercase_safe = !session_id.is_empty()
         && session_id != "."
         && session_id != ".."
@@ -1641,7 +1886,7 @@ fn safe_session_download_dir(state_dir: &Path, session_id: &str) -> PathBuf {
             .chars()
             .all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-' | '_' | '.'));
 
-    let safe_id = if is_lowercase_safe {
+    if is_lowercase_safe {
         session_id.to_string()
     } else {
         let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -1650,8 +1895,11 @@ fn safe_session_download_dir(state_dir: &Path, session_id: &str) -> PathBuf {
             h = h.wrapping_mul(0x0100_0000_01b3);
         }
         format!("s-{h:016x}")
-    };
-    state_dir.join("downloads").join(safe_id)
+    }
+}
+
+fn safe_session_download_dir(state_dir: &Path, session_id: &str) -> PathBuf {
+    state_dir.join("downloads").join(safe_session_token(session_id))
 }
 
 fn cleanup_ephemeral_download_dir(dl_dir: &Path) {
@@ -1839,9 +2087,9 @@ pub fn validate_nav_url(raw: &str) -> Result<String> {
 }
 
 pub fn validate_output_file_path(path: &Path) -> Result<()> {
-    if path.as_os_str().is_empty() {
+    if path.as_os_str().is_empty() || path.to_string_lossy().contains('\0') {
         return Err(MimikyuError::InvalidConfig(
-            "output file path cannot be empty".to_string(),
+            "output file path cannot be empty or contain NUL bytes".to_string(),
         ));
     }
     if path.is_dir() {
@@ -1861,6 +2109,154 @@ pub fn validate_output_file_path(path: &Path) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Resolve `raw_path` and verify that its canonicalized location strictly stays within
+/// `allowed_root`, blocking `../` traversal, absolute escapes, symlink escapes, and
+/// symlink-leaf overwrites.
+pub fn resolve_confined_path(
+    raw_path: &Path,
+    allowed_root: &Path,
+    mode: PathConfinementMode,
+) -> Result<PathBuf> {
+    if raw_path.as_os_str().is_empty() || raw_path.to_string_lossy().contains('\0') {
+        return Err(MimikyuError::InvalidConfig(
+            "file path cannot be empty or contain NUL bytes".to_string(),
+        ));
+    }
+
+    let canonical_root = fs::canonicalize(allowed_root).map_err(|e| {
+        MimikyuError::InvalidConfig(format!(
+            "allowed root '{}' is not accessible: {e}",
+            allowed_root.display()
+        ))
+    })?;
+    if !canonical_root.is_dir() {
+        return Err(MimikyuError::InvalidConfig(format!(
+            "allowed root '{}' is not a directory",
+            allowed_root.display()
+        )));
+    }
+
+    let candidate = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        canonical_root.join(raw_path)
+    };
+
+    // Walk components incrementally, resolving symlinks as they are encountered so
+    // `symlink/..` and dangling symlinks cannot disguise an escape outside `canonical_root`.
+    let mut resolved = PathBuf::new();
+    for comp in candidate.components() {
+        match comp {
+            Component::Prefix(prefix) => resolved.push(prefix.as_os_str()),
+            Component::RootDir => resolved.push(Component::RootDir.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if resolved.exists()
+                    && let Ok(canon) = fs::canonicalize(&resolved)
+                {
+                    resolved = canon;
+                }
+                resolved.pop();
+            }
+            Component::Normal(seg) => {
+                resolved.push(seg);
+                match fs::symlink_metadata(&resolved) {
+                    Ok(meta) if meta.file_type().is_symlink() => {
+                        let target = fs::canonicalize(&resolved).map_err(|_| {
+                            MimikyuError::InvalidConfig(format!(
+                                "path '{}' traverses or targets a dangling or unreadable symlink",
+                                raw_path.display()
+                            ))
+                        })?;
+                        resolved = target;
+                    }
+                    Ok(_) => {}
+                    Err(e) if e.kind() == ErrorKind::NotFound => {}
+                    Err(e) => {
+                        if !resolved.starts_with(&canonical_root) {
+                            return Err(MimikyuError::InvalidConfig(format!(
+                                "path '{}' escapes allowed root '{}'",
+                                raw_path.display(),
+                                canonical_root.display()
+                            )));
+                        }
+                        return Err(MimikyuError::InvalidConfig(format!(
+                            "path '{}' is not accessible: {e}",
+                            raw_path.display()
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    if resolved.exists()
+        && let Ok(canon) = fs::canonicalize(&resolved)
+    {
+        resolved = canon;
+    }
+
+    if !resolved.starts_with(&canonical_root) {
+        return Err(MimikyuError::InvalidConfig(format!(
+            "path '{}' escapes allowed root '{}'",
+            raw_path.display(),
+            canonical_root.display()
+        )));
+    }
+
+    match mode {
+        PathConfinementMode::ExistingFile => {
+            let meta = fs::metadata(&resolved).map_err(|e| {
+                MimikyuError::InvalidConfig(format!(
+                    "file '{}' is not accessible: {e}",
+                    raw_path.display()
+                ))
+            })?;
+            if !meta.is_file() {
+                return Err(MimikyuError::InvalidConfig(format!(
+                    "path '{}' is not a regular file",
+                    raw_path.display()
+                )));
+            }
+        }
+        PathConfinementMode::OutputFile => {
+            if let Ok(meta) = fs::symlink_metadata(&candidate)
+                && meta.file_type().is_symlink()
+            {
+                return Err(MimikyuError::InvalidConfig(format!(
+                    "output path '{}' cannot be a symlink",
+                    raw_path.display()
+                )));
+            }
+            if resolved == canonical_root {
+                return Err(MimikyuError::InvalidConfig(format!(
+                    "output path '{}' is a directory",
+                    raw_path.display()
+                )));
+            }
+            validate_output_file_path(&resolved)?;
+        }
+        PathConfinementMode::OutputDir => {
+            if let Ok(meta) = fs::symlink_metadata(&candidate)
+                && meta.file_type().is_symlink()
+            {
+                return Err(MimikyuError::InvalidConfig(format!(
+                    "output directory '{}' cannot be a symlink",
+                    raw_path.display()
+                )));
+            }
+            if resolved.exists() && !resolved.is_dir() {
+                return Err(MimikyuError::InvalidConfig(format!(
+                    "output directory '{}' exists and is not a directory",
+                    raw_path.display()
+                )));
+            }
+        }
+    }
+
+    Ok(resolved)
 }
 
 fn default_host_preset() -> PresetKind {
@@ -2007,5 +2403,733 @@ mod tests {
         fs::write(&file, b"hi").unwrap();
         let err = SessionManager::new(file).err().expect("must fail");
         assert!(matches!(err, MimikyuError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn resolve_confined_path_allows_in_root_and_blocks_traversal_and_symlinks() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+
+        let sub = root.path().join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let inside_file = sub.join("ok.txt");
+        fs::write(&inside_file, b"ok").unwrap();
+        let outside_file = outside.path().join("secret.txt");
+        fs::write(&outside_file, b"secret").unwrap();
+
+        // In-root relative & absolute paths succeed
+        let ok_rel = resolve_confined_path(
+            Path::new("sub/ok.txt"),
+            root.path(),
+            PathConfinementMode::ExistingFile,
+        )
+        .unwrap();
+        assert_eq!(ok_rel, fs::canonicalize(&inside_file).unwrap());
+
+        let ok_abs = resolve_confined_path(
+            &inside_file,
+            root.path(),
+            PathConfinementMode::ExistingFile,
+        )
+        .unwrap();
+        assert_eq!(ok_abs, fs::canonicalize(&inside_file).unwrap());
+
+        let ok_out = resolve_confined_path(
+            Path::new("sub/new.png"),
+            root.path(),
+            PathConfinementMode::OutputFile,
+        )
+        .unwrap();
+        assert!(ok_out.ends_with("sub/new.png"));
+
+        let ok_dir = resolve_confined_path(
+            Path::new("frames/run1"),
+            root.path(),
+            PathConfinementMode::OutputDir,
+        )
+        .unwrap();
+        assert!(ok_dir.ends_with("frames/run1"));
+
+        // Traversal & absolute escapes are blocked across all modes
+        for mode in [
+            PathConfinementMode::ExistingFile,
+            PathConfinementMode::OutputFile,
+            PathConfinementMode::OutputDir,
+        ] {
+            assert!(
+                resolve_confined_path(Path::new("../escape.txt"), root.path(), mode).is_err(),
+                "must block ../ traversal in mode {mode:?}"
+            );
+            assert!(
+                resolve_confined_path(Path::new("sub/../../escape.txt"), root.path(), mode)
+                    .is_err(),
+                "must block nested ../ traversal in mode {mode:?}"
+            );
+            assert!(
+                resolve_confined_path(&outside_file, root.path(), mode).is_err(),
+                "must block absolute outside path in mode {mode:?}"
+            );
+            assert!(
+                resolve_confined_path(
+                    &outside.path().join("nonexistent.txt"),
+                    root.path(),
+                    mode
+                )
+                .is_err(),
+                "must block nonexistent outside path in mode {mode:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            // Symlink inside root -> outside file
+            let link_file = root.path().join("link_secret.txt");
+            symlink(&outside_file, &link_file).unwrap();
+            assert!(resolve_confined_path(
+                &link_file,
+                root.path(),
+                PathConfinementMode::ExistingFile
+            )
+            .is_err());
+            assert!(resolve_confined_path(
+                &link_file,
+                root.path(),
+                PathConfinementMode::OutputFile
+            )
+            .is_err());
+
+            // Symlink inside root -> outside directory
+            let link_dir = root.path().join("link_outside");
+            symlink(outside.path(), &link_dir).unwrap();
+            assert!(resolve_confined_path(
+                &link_dir.join("secret.txt"),
+                root.path(),
+                PathConfinementMode::ExistingFile
+            )
+            .is_err());
+            assert!(resolve_confined_path(
+                &link_dir.join("pwn.png"),
+                root.path(),
+                PathConfinementMode::OutputFile
+            )
+            .is_err());
+            assert!(resolve_confined_path(
+                &link_dir.join("frames"),
+                root.path(),
+                PathConfinementMode::OutputDir
+            )
+            .is_err());
+
+            // Dangling symlink inside root -> outside nonexistent target
+            let dangling = root.path().join("dangling.png");
+            symlink(outside.path().join("pwned.png"), &dangling).unwrap();
+            assert!(resolve_confined_path(
+                &dangling,
+                root.path(),
+                PathConfinementMode::OutputFile
+            )
+            .is_err());
+
+            // Symlink leaf pointing inside root still blocked for OutputFile/OutputDir
+            let in_link = root.path().join("in_link.txt");
+            symlink(&inside_file, &in_link).unwrap();
+            assert!(resolve_confined_path(
+                &in_link,
+                root.path(),
+                PathConfinementMode::OutputFile
+            )
+            .is_err());
+        }
+    }
+
+    struct StubGuardDriver {
+        info: crate::driver::SessionInfo,
+    }
+
+    impl StubGuardDriver {
+        fn new() -> Self {
+            Self {
+                info: crate::driver::SessionInfo {
+                    session_id: "stub".to_string(),
+                    engine: EngineKind::Chromium,
+                    browser_version: "0".to_string(),
+                    context_id: None,
+                    target_id: "stub".to_string(),
+                    profile_dir: None,
+                    ws_endpoint: String::new(),
+                    pid: None,
+                },
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DriverSession for StubGuardDriver {
+        fn info(&self) -> &crate::driver::SessionInfo {
+            &self.info
+        }
+        fn capabilities(&self) -> crate::driver::DriverCapabilities {
+            crate::driver::DriverCapabilities {
+                engine: EngineKind::Chromium,
+                protocol: "cdp".to_string(),
+                supports_virtual_context: true,
+                supports_per_context_proxy: true,
+                supports_native_ax_tree: true,
+                supports_isolated_world: true,
+                supports_closed_shadow_dom: true,
+                supports_pdf: true,
+                supports_network_intercept: true,
+                supports_screencast: true,
+            }
+        }
+        async fn new_context(&self, _opts: ContextOptions) -> Result<Arc<dyn DriverSession>> {
+            Err(MimikyuError::Disposed)
+        }
+        async fn new_tab(&self, _url: Option<&str>) -> Result<Arc<dyn DriverSession>> {
+            Err(MimikyuError::Disposed)
+        }
+        async fn list_tabs(&self) -> Result<Vec<crate::driver::TabInfo>> {
+            Ok(Vec::new())
+        }
+        async fn activate_tab(&self, _target_id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn navigate(&self, url: &str) -> Result<NavInfo> {
+            Ok(NavInfo {
+                url: url.to_string(),
+                status: Some(200),
+                title: "Stub".to_string(),
+                frame_id: None,
+            })
+        }
+        async fn reload(&self) -> Result<NavInfo> {
+            self.navigate("https://example.com").await
+        }
+        async fn go_back(&self) -> Result<NavInfo> {
+            self.navigate("https://example.com").await
+        }
+        async fn go_forward(&self) -> Result<NavInfo> {
+            self.navigate("https://example.com").await
+        }
+        async fn current_url(&self) -> Result<String> {
+            Ok("https://example.com".to_string())
+        }
+        async fn title(&self) -> Result<String> {
+            Ok("Stub".to_string())
+        }
+        async fn eval_isolated(&self, _expr: &str) -> Result<Value> {
+            Ok(Value::String("ok".to_string()))
+        }
+        async fn eval_main_world(&self, _expr: &str) -> Result<Value> {
+            Ok(Value::String("ok".to_string()))
+        }
+        async fn list_frames(&self) -> Result<Vec<crate::driver::FrameInfo>> {
+            Ok(Vec::new())
+        }
+        async fn eval_isolated_in_frame(
+            &self,
+            _expr: &str,
+            _frame_id: Option<&str>,
+        ) -> Result<Value> {
+            Ok(Value::Null)
+        }
+        async fn eval_main_world_in_frame(
+            &self,
+            _expr: &str,
+            _frame_id: Option<&str>,
+        ) -> Result<Value> {
+            Ok(Value::Null)
+        }
+        async fn call_function_on_node(
+            &self,
+            _backend_node_id: i64,
+            _frame_id: Option<&str>,
+            _function_declaration: &str,
+            _args: Vec<Value>,
+        ) -> Result<Value> {
+            Ok(Value::Null)
+        }
+        async fn query_shadow(
+            &self,
+            _selector_chain: &[String],
+            _frame_id: Option<&str>,
+        ) -> Result<Vec<crate::driver::ShadowMatch>> {
+            Ok(Vec::new())
+        }
+        async fn closed_shadow_hosts(&self, _frame_id: Option<&str>) -> Result<Vec<i64>> {
+            Ok(Vec::new())
+        }
+        async fn add_init_script(&self, _script: &str) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn remove_init_script(&self, _script_id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn accessibility_tree(&self) -> Result<Vec<crate::driver::AxNode>> {
+            Ok(Vec::new())
+        }
+        async fn resolve_node_box(
+            &self,
+            _backend_node_id: i64,
+            _frame_id: Option<&str>,
+        ) -> Result<crate::driver::BoundingBox> {
+            Err(MimikyuError::ElementNotFound("stub".to_string()))
+        }
+        async fn resolve_selector_box(&self, _selector: &str) -> Result<crate::driver::BoundingBox> {
+            Err(MimikyuError::ElementNotFound("stub".to_string()))
+        }
+        async fn viewport_size(&self) -> Result<(f64, f64)> {
+            Ok((1280.0, 720.0))
+        }
+        async fn scroll_into_view(
+            &self,
+            _backend_node_id: Option<i64>,
+            _frame_id: Option<&str>,
+            _selector: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn clear_node_value(
+            &self,
+            _backend_node_id: Option<i64>,
+            _frame_id: Option<&str>,
+            _selector: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn select_option(
+            &self,
+            _backend_node_id: Option<i64>,
+            _frame_id: Option<&str>,
+            _selector: Option<&str>,
+            _by: SelectBy,
+        ) -> Result<String> {
+            Ok(String::new())
+        }
+        async fn focus_node(
+            &self,
+            _backend_node_id: Option<i64>,
+            _selector: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn set_file_input_files(
+            &self,
+            _backend_node_id: Option<i64>,
+            _frame_id: Option<&str>,
+            _selector: Option<&str>,
+            _files: Vec<PathBuf>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn css_selector_for_node(
+            &self,
+            _backend_node_id: i64,
+            _frame_id: Option<&str>,
+        ) -> Result<Option<String>> {
+            Ok(None)
+        }
+        async fn dispatch_mouse(&self, _ev: crate::driver::MouseEvent) -> Result<()> {
+            Ok(())
+        }
+        async fn dispatch_key(&self, _ev: crate::driver::KeyEvent) -> Result<()> {
+            Ok(())
+        }
+        async fn dispatch_wheel(&self, _ev: crate::driver::WheelEvent) -> Result<()> {
+            Ok(())
+        }
+        async fn insert_text(&self, _text: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn screenshot(&self, _opts: crate::driver::ScreenshotOpts) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+        async fn pdf(&self) -> Result<Vec<u8>> {
+            Ok(b"%PDF-1.4\n".to_vec())
+        }
+        async fn set_instant_animations(&self, _enabled: bool) -> Result<()> {
+            Ok(())
+        }
+        async fn start_screencast(&self, opts: ScreencastOptions) -> Result<ScreencastStatus> {
+            Ok(ScreencastStatus {
+                recording: true,
+                out_dir: opts.out_dir,
+                format: opts.format,
+                frame_count: 0,
+                started_at_ms: now_ms(),
+                stopped_at_ms: None,
+            })
+        }
+        async fn stop_screencast(&self) -> Result<ScreencastStatus> {
+            Ok(ScreencastStatus {
+                recording: false,
+                out_dir: PathBuf::new(),
+                format: crate::driver::ScreencastFormat::Png,
+                frame_count: 0,
+                started_at_ms: 0,
+                stopped_at_ms: Some(now_ms()),
+            })
+        }
+        async fn set_env_overrides(&self, _profile: EnvProfile) -> Result<()> {
+            Ok(())
+        }
+        async fn set_permissions(&self, _permissions: Vec<crate::driver::PermissionGrant>) -> Result<()> {
+            Ok(())
+        }
+        async fn reset_permissions(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn set_block_policy(&self, _policy: BlockPolicy) -> Result<()> {
+            Ok(())
+        }
+        async fn set_blocked_urls(&self, _patterns: Vec<String>) -> Result<()> {
+            Ok(())
+        }
+        async fn set_route_mock(&self, _mock: crate::driver::RouteMock) -> Result<()> {
+            Ok(())
+        }
+        async fn set_route_rule(&self, _rule: crate::network::RouteRule) -> Result<()> {
+            Ok(())
+        }
+        async fn clear_route_mocks(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn cookies(&self) -> Result<Vec<crate::driver::Cookie>> {
+            Ok(Vec::new())
+        }
+        async fn set_cookies(&self, _cookies: Vec<crate::driver::Cookie>) -> Result<()> {
+            Ok(())
+        }
+        async fn clear_cookies(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn storage_state(&self) -> Result<StorageState> {
+            Ok(StorageState::default())
+        }
+        async fn set_storage_state(&self, _state: StorageState) -> Result<()> {
+            Ok(())
+        }
+        async fn console_logs(&self) -> Result<Vec<crate::driver::ConsoleEntry>> {
+            Ok(Vec::new())
+        }
+        async fn page_errors(&self) -> Result<Vec<crate::driver::PageError>> {
+            Ok(Vec::new())
+        }
+        async fn network_events(&self) -> Result<Vec<crate::driver::NetworkEvent>> {
+            Ok(Vec::new())
+        }
+        async fn drain_console_logs(&self) -> Result<Vec<crate::driver::ConsoleEntry>> {
+            Ok(Vec::new())
+        }
+        async fn drain_page_errors(&self) -> Result<Vec<crate::driver::PageError>> {
+            Ok(Vec::new())
+        }
+        async fn drain_network_events(&self) -> Result<Vec<crate::driver::NetworkEvent>> {
+            Ok(Vec::new())
+        }
+        async fn clear_telemetry(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn inflight_requests(&self) -> Result<usize> {
+            Ok(0)
+        }
+        async fn inflight_activity(&self, _ignore_long_lived: bool) -> Result<(usize, u64)> {
+            Ok((0, 0))
+        }
+        async fn document_ready_state(&self) -> Result<String> {
+            Ok("complete".to_string())
+        }
+        async fn dispose(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    fn insert_stub_session(mgr: &SessionManager, session_id: &str) {
+        let driver: Arc<dyn DriverSession> = Arc::new(StubGuardDriver::new());
+        let summary = SessionSummary {
+            session_id: session_id.to_string(),
+            engine: EngineKind::Chromium,
+            mode: "ephemeral".to_string(),
+            url: "https://example.com".to_string(),
+            title: "Stub".to_string(),
+            pid: None,
+            created_at_ms: now_ms(),
+            paused_for_human: false,
+            pause_reason: None,
+        };
+        let meta = Arc::new(parking_lot::RwLock::new(summary.clone()));
+        let managed = ManagedSession {
+            summary,
+            meta: Arc::clone(&meta),
+            driver: Arc::clone(&driver),
+            virtual_ctx: None,
+            persistent_path: None,
+            ephemeral_download_dir: None,
+            chokepoint: ChokepointInput::new(driver),
+            snapshot_state: SnapshotState::default(),
+            default_humanize: false,
+            block_policy: BlockPolicy::default(),
+            privacy_mode: false,
+            instant_animations: false,
+            main_world_eval: true,
+            env_profile: None,
+            coherence_report: None,
+            proxy_redacted: None,
+            paused_for_human: false,
+            pause_reason: None,
+            paused_at_ms: None,
+            takeover_id: None,
+            disposed: false,
+        };
+        mgr.registry.lock().active.insert(
+            session_id.to_string(),
+            SessionEntry {
+                meta,
+                handle: Arc::new(tokio::sync::Mutex::new(managed)),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn paused_for_human_blocks_all_inspection_navigation_media_and_storage_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_config(SessionManagerConfig {
+            state_dir: dir.path().join("state"),
+            allowed_root: Some(dir.path().to_path_buf()),
+            require_oob_resume: false,
+            ..Default::default()
+        })
+        .unwrap();
+        insert_stub_session(&mgr, "sec");
+
+        let state_in = dir.path().join("in.json");
+        fs::write(&state_in, r#"{"cookies":[],"origins":[]}"#).unwrap();
+        let state_out = dir.path().join("out.json");
+        let shot_out = dir.path().join("shot.png");
+        let pdf_out = dir.path().join("out.pdf");
+        let frames_out = dir.path().join("frames");
+
+        let pause = mgr
+            .takeover_session("sec", Some("enter 2FA code".to_string()))
+            .await
+            .unwrap();
+        assert!(pause.paused_for_human);
+        assert!(pause.confirmation_required);
+        let token = pause.takeover_id.expect("takeover_id must be generated");
+        assert!(token.starts_with("tk-"));
+
+        // Every inspection, navigation, script, media, and storage op must return PausedForHuman
+        assert!(matches!(
+            mgr.eval("sec", "1+1", false).await,
+            Err(MimikyuError::PausedForHuman { .. })
+        ));
+        assert!(matches!(
+            mgr.open("sec", "https://example.com/2").await,
+            Err(MimikyuError::PausedForHuman { .. })
+        ));
+        assert!(matches!(
+            mgr.back("sec").await,
+            Err(MimikyuError::PausedForHuman { .. })
+        ));
+        assert!(matches!(
+            mgr.forward("sec").await,
+            Err(MimikyuError::PausedForHuman { .. })
+        ));
+        assert!(matches!(
+            mgr.reload("sec").await,
+            Err(MimikyuError::PausedForHuman { .. })
+        ));
+        assert!(matches!(
+            mgr.snapshot("sec", SnapshotOptions::default()).await,
+            Err(MimikyuError::PausedForHuman { .. })
+        ));
+        assert!(matches!(
+            mgr.extract("sec", ExtractMode::Text).await,
+            Err(MimikyuError::PausedForHuman { .. })
+        ));
+        assert!(matches!(
+            mgr.screenshot("sec", &shot_out, None, false).await,
+            Err(MimikyuError::PausedForHuman { .. })
+        ));
+        assert!(matches!(
+            mgr.screenshot_bytes("sec", None, false).await,
+            Err(MimikyuError::PausedForHuman { .. })
+        ));
+        assert!(matches!(
+            mgr.pdf("sec", &pdf_out).await,
+            Err(MimikyuError::PausedForHuman { .. })
+        ));
+        assert!(matches!(
+            mgr.export_session("sec", &state_out).await,
+            Err(MimikyuError::PausedForHuman { .. })
+        ));
+        assert!(matches!(
+            mgr.import_session("sec", &state_in).await,
+            Err(MimikyuError::PausedForHuman { .. })
+        ));
+        assert!(matches!(
+            mgr.start_screencast(
+                "sec",
+                ScreencastOptions {
+                    out_dir: frames_out,
+                    format: crate::driver::ScreencastFormat::Png,
+                    quality: None,
+                    max_width: None,
+                    max_height: None,
+                    every_nth_frame: None,
+                }
+            )
+            .await,
+            Err(MimikyuError::PausedForHuman { .. })
+        ));
+        assert!(matches!(
+            mgr.wait(
+                "sec",
+                WaitRequest {
+                    idle: true,
+                    ..Default::default()
+                }
+            )
+            .await,
+            Err(MimikyuError::PausedForHuman { .. })
+        ));
+        assert!(matches!(
+            mgr.logs("sec", LogKind::Network).await,
+            Err(MimikyuError::PausedForHuman { .. })
+        ));
+
+        // Unconfirmed or mismatched resume attempts must fail and keep session paused
+        assert!(mgr
+            .resume_session_confirmed("sec", &token, false)
+            .await
+            .is_err());
+        assert!(mgr
+            .resume_session_confirmed("sec", "tk-wrong", true)
+            .await
+            .is_err());
+        assert!(mgr.resume_session_confirmed("sec", "", true).await.is_err());
+        assert!(matches!(
+            mgr.eval("sec", "1+1", false).await,
+            Err(MimikyuError::PausedForHuman { .. })
+        ));
+
+        // Confirmed resume with matching token succeeds and restores eval/open
+        let resumed = mgr
+            .resume_session_confirmed("sec", &token, true)
+            .await
+            .unwrap();
+        assert!(!resumed.paused_for_human);
+        assert!(!resumed.confirmation_required);
+        assert!(resumed.takeover_id.is_none());
+        assert_eq!(mgr.eval("sec", "1+1", false).await.unwrap(), Value::String("ok".to_string()));
+        assert!(mgr.open("sec", "https://example.com/after").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn require_oob_resume_enforces_out_of_band_confirmation_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::with_config(SessionManagerConfig {
+            state_dir: dir.path().join("state"),
+            allowed_root: Some(dir.path().to_path_buf()),
+            require_oob_resume: true,
+            ..Default::default()
+        })
+        .unwrap();
+        insert_stub_session(&mgr, "oob");
+
+        let pause = mgr
+            .takeover_session("oob", Some("enter payment details".to_string()))
+            .await
+            .unwrap();
+        let token = pause.takeover_id.unwrap();
+
+        // Even with matching token + confirmed_by_human=true, missing OOB file blocks resume
+        assert!(mgr
+            .resume_session_confirmed("oob", &token, true)
+            .await
+            .is_err());
+
+        let conf_path = mgr.takeover_confirmation_path("oob");
+        fs::create_dir_all(conf_path.parent().unwrap()).unwrap();
+        fs::write(&conf_path, "tk-wrong-token\n").unwrap();
+        assert!(mgr
+            .resume_session_confirmed("oob", &token, true)
+            .await
+            .is_err());
+
+        // Writing the exact active takeover_id authorizes one-time resume and removes the marker
+        fs::write(&conf_path, format!("{token}\n")).unwrap();
+        let resumed = mgr
+            .resume_session_confirmed("oob", &token, true)
+            .await
+            .unwrap();
+        assert!(!resumed.paused_for_human);
+        assert!(!conf_path.exists(), "OOB confirmation file must be single-use");
+    }
+
+    #[tokio::test]
+    async fn session_manager_allowed_root_blocks_file_escapes_across_all_file_ops() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_file = outside.path().join("secret.json");
+        fs::write(&outside_file, r#"{"cookies":[],"origins":[]}"#).unwrap();
+
+        let mgr = SessionManager::with_config(SessionManagerConfig {
+            state_dir: root.path().join("state"),
+            allowed_root: Some(root.path().to_path_buf()),
+            require_oob_resume: false,
+            ..Default::default()
+        })
+        .unwrap();
+        insert_stub_session(&mgr, "conf");
+
+        assert!(matches!(
+            mgr.upload("conf", "#f", outside_file.clone()).await,
+            Err(MimikyuError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            mgr.screenshot("conf", &outside.path().join("shot.png"), None, false).await,
+            Err(MimikyuError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            mgr.pdf("conf", &outside.path().join("out.pdf")).await,
+            Err(MimikyuError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            mgr.export_session("conf", &outside.path().join("exp.json")).await,
+            Err(MimikyuError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            mgr.import_session("conf", &outside_file).await,
+            Err(MimikyuError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            mgr.start_screencast(
+                "conf",
+                ScreencastOptions {
+                    out_dir: outside.path().join("frames"),
+                    format: crate::driver::ScreencastFormat::Png,
+                    quality: None,
+                    max_width: None,
+                    max_height: None,
+                    every_nth_frame: None,
+                }
+            )
+            .await,
+            Err(MimikyuError::InvalidConfig(_))
+        ));
+        assert!(matches!(
+            mgr.batch(
+                "conf",
+                vec![BatchAction::Upload {
+                    target: "#f".to_string(),
+                    files: vec![outside_file],
+                }]
+            )
+            .await,
+            Err(MimikyuError::InvalidConfig(_))
+        ));
     }
 }

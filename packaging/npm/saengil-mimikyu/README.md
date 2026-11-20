@@ -1,6 +1,6 @@
 # `saengil-mimikyu`
 
-Official **Saengil** CLI & MCP binary distribution for [`mimikyu`](https://github.com/YXZYSME/mimikyu) — fast Rust browser automation, two-tier session/profile isolation, background daemon, and 31-tool MCP server over **Chromium (CDP)** and **Firefox (WebDriver BiDi)**.
+Official **Saengil** CLI & MCP binary distribution for [`mimikyu`](https://github.com/YXZYSME/mimikyu) — fast Rust browser automation, two-tier session/profile isolation, background daemon, and 33-tool MCP server over **Chromium (CDP)** and **Firefox (WebDriver BiDi)**.
 
 ## Install & Usage
 

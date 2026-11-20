@@ -229,6 +229,17 @@ function buildLlmsTxt(release, mcpData, benchmarks) {
 
   const suite = benchmarks.verifiedSuite;
   const token = benchmarks.tokenCompression;
+  const metricById = new Map(benchmarks.latencyMetrics.map((m) => [m.id, m]));
+  const snapMetric = metricById.get('snapshot');
+  const mdMetric = metricById.get('markdown');
+  const vctxMetric = metricById.get('virtual_ctx');
+
+  const snapCdp = snapMetric ? snapMetric.chromiumMs.toFixed(1) : '5.0';
+  const snapBidi = snapMetric ? snapMetric.firefoxMs.toFixed(1) : '19.0';
+  const mdCdp = mdMetric ? mdMetric.chromiumMs.toFixed(1) : '5.4';
+  const mdBidi = mdMetric ? mdMetric.firefoxMs.toFixed(1) : '5.5';
+  const vctxCdp = vctxMetric ? vctxMetric.chromiumMs.toFixed(1) : '67.1';
+  const e2eRuns = suite.e2eRuns ?? suite.e2eTests;
 
   return `# mimikyu (by Saengil)
 
@@ -245,15 +256,15 @@ function buildLlmsTxt(release, mcpData, benchmarks) {
 
 ## Key Capabilities & Measured Performance
 
-- **~5.0 ms semantic \`@eN\` snapshots** (Chromium CDP; \`19.0 ms\` on Firefox BiDi) across open Shadow DOM and nested/cross-origin iframes.
+- **~${snapCdp} ms semantic \`@eN\` snapshots** (Chromium CDP; \`${snapBidi} ms\` on Firefox BiDi; local \`127.0.0.1\` loopback benchmark medians) across open Shadow DOM and nested/cross-origin iframes.
 - **${token.chromium.ratio}x–${token.firefox.ratio}x token compression** (${token.rawTokens} -> ${token.chromium.compressedTokens} est. tokens on Chromium CDP; ${token.rawTokens} -> ${token.firefox.compressedTokens} est. tokens on Firefox BiDi).
-- **~5.4 ms Markdown extraction** (\`5.5 ms\` on Firefox BiDi) and **~67.1 ms warm virtual contexts** (Tier 2 \`VirtualContextPool\`).
+- **~${mdCdp} ms Markdown extraction** (\`${mdBidi} ms\` on Firefox BiDi) and **~${vctxCdp} ms warm virtual contexts** (Tier 2 \`VirtualContextPool\`, local loopback benchmark medians).
 - **Dual-Engine Native Drivers**: Native WebSocket Chromium DevTools Protocol (\`driver::cdp\`) and W3C WebDriver BiDi (\`driver::bidi\`) behind a strict \`DriverSession\` trait boundary.
 - **Managed Browsers & Privacy Vault**: Built-in \`mimikyu browser install\` (SHA-256 verified Chrome-for-Testing & Firefox), \`mimikyu vault launch\`, curated DNS-boundary tracker blocking (\`--block-trackers\`), and headless CDP screencast recording (\`mimikyu record\`).
 - **Two-Tier Isolation**: Tier 1 \`fs2\`-locked persistent profiles (\`--profile\`) or self-cleaning ephemeral directories (\`--ephemeral\`), plus Tier 2 warm pooled virtual browser contexts (\`--virtual\`).
 - **Coherent Environment Profiles & ProxyRelay**: Built-in \`win11\`, \`macos\`, \`linux\` presets, offline GeoIP alignment (\`--geoip\`), and an embedded local \`127.0.0.1:0\` \`ProxyRelay\` (\`--proxy\`) supporting authenticated HTTP/SOCKS5 upstreams without exposing credentials in browser flags.
 - **${release.mcp.total} Turnkey MCP Tools**: ${release.mcp.mimikyu} \`mimikyu_*\` tools (including R3-compliant human-in-the-loop takeover) + ${release.mcp.browser} \`browser_*\` tools over stdio JSON-RPC 2.0.
-- **Verified Suite**: ${suite.rustTests} Rust tests (${suite.clippyWarnings} Clippy warnings) + ${suite.e2eTests} opaque-box Python E2E tests (${suite.workflowsPassed}/${suite.workflowsTotal} agentic workflows passing on both Chromium and Firefox).
+- **Verified Suite**: ${suite.rustTests} Rust tests (${suite.rustCoreTests} mimikyu-core + ${suite.rustCliTests} mimikyu-cli + ${suite.rustFacadeTests ?? 1} mimikyu; ${suite.clippyWarnings} Clippy warnings) + ${suite.e2eTests} opaque-box Python E2E tests / ${e2eRuns} runs (${suite.workflowsPassed}/${suite.workflowsTotal} agentic workflows passing on both Chromium and Firefox).
 
 ## Official Package Registries
 

@@ -8,10 +8,11 @@ This document maps the workspace dependency graph and codifies the **five non-ne
 
 ## Workspace & Module Topology
 
-`mimikyu` is split into two Rust crates (`edition = "2024"`, MSRV `1.88`) and an opaque-box Python 3 stdlib end-to-end verification suite (`e2e/`):
+`mimikyu` is split into three Rust crates (`edition = "2024"`, MSRV `1.88`) and an opaque-box Python 3 stdlib end-to-end verification suite (`e2e/`):
 
-- **`crates/mimikyu-core`**: Pure library crate containing browser discovery, process-group lifecycle, WebSocket CDP & BiDi protocol drivers, two-tier profile/context isolation, coherent environment profiles & `ProxyRelay`, semantic `@eN` accessibility snapshots, structured extraction, `ChokepointInput`, deterministic waits, the warm Unix-socket daemon, the 33-tool stdio MCP server, the dual-origin local HTTP test harness, and the benchmark suite.
-- **`crates/mimikyu-cli`**: Thin binary crate (`mimikyu`) providing `clap` CLI argument parsing, `--json` envelope formatting, auto-spawning daemon client dispatch, and frontends for `mcp`, `daemon`, `doctor`, and `bench`.
+- **`crates/mimikyu`**: Top-level library facade crate published on `crates.io` that re-exports the complete `mimikyu-core` Rust API for downstream callers (`cargo add mimikyu`).
+- **`crates/mimikyu-core`**: Pure library crate containing browser discovery and managed browser installation (`browser_install`), process-group lifecycle, WebSocket CDP & BiDi protocol drivers, two-tier profile/context isolation, coherent environment profiles & `ProxyRelay`, semantic `@eN` accessibility snapshots, structured extraction, `ChokepointInput`, deterministic waits, the warm Unix-socket daemon, the 33-tool stdio MCP server, the dual-origin local HTTP test harness, and the benchmark suite.
+- **`crates/mimikyu-cli`**: Thin binary crate (`mimikyu`) providing `clap` CLI argument parsing, `--json` envelope formatting, auto-spawning daemon client dispatch, and frontends for `mcp`, `daemon`, `doctor`, `bench`, `browser`, `vault`, and `record`.
 - **`e2e/`**: Zero-dependency Python 3 stdlib test suite exercising the compiled `mimikyu` binary across local `127.0.0.1:0` HTTP/proxy servers (Tiers 1–4 + `--self-test`).
 
 ```mermaid
@@ -55,7 +56,8 @@ flowchart TD
 | Module Path | Responsibility |
 | --- | --- |
 | `crates/mimikyu-core/src/error.rs` | Typed `MimikyuError` & `Result<T>` error taxonomy across transport, protocol, timeout, and config faults |
-| `crates/mimikyu-core/src/discovery.rs` | Local Chromium & Firefox discovery (`Override` -> `EnvOverride` -> Playwright/Puppeteer caches -> System/`PATH`) + `run_doctor()` |
+| `crates/mimikyu-core/src/discovery.rs` | Local Chromium & Firefox discovery (`Override` -> `EnvOverride` -> `MimikyuManaged` (`mimikyu browser install` / `MIMIKYU_BROWSERS_DIR`) -> Playwright/Puppeteer caches -> System/`PATH`) + `run_doctor()` |
+| `crates/mimikyu-core/src/browser_install.rs` | Managed browser installer (`mimikyu browser {list, path, install}`) resolving official Chrome-for-Testing and Firefox releases with SHA-256 verification |
 | `crates/mimikyu-core/src/process.rs` | `ProcessGuard` launching debloated browsers in dedicated POSIX process groups (`setpgid(0, 0)`) with crash-dialog suppression |
 | `crates/mimikyu-core/src/driver/mod.rs` | Engine-agnostic `BrowserDriver` & `DriverSession` traits, normalized `ProxyConfig`, protocol JSON surrogate sanitizer |
 | `crates/mimikyu-core/src/driver/cdp.rs` | Native async WebSocket Chromium DevTools Protocol driver (isolated worlds, OOPIF/Shadow DOM traversal, network fetch routing) |
@@ -69,10 +71,11 @@ flowchart TD
 | `crates/mimikyu-core/src/wait/` | Composite `--idle` wait (DOM ready + network quiet + layout stability) plus `--text`, `--url`, and `--selector --state` polling |
 | `crates/mimikyu-core/src/session.rs` | `SessionManager` unifying lifecycle, isolation modes, `@eN` state, `ChokepointInput`, `ProxyRelay`, and telemetry per session ID |
 | `crates/mimikyu-core/src/daemon/` | Warm Unix-socket NDJSON RPC server (`DaemonServer`, `DaemonPool`), idle expiration, lock-safe auto-spawn, short-socket symlinking |
-| `crates/mimikyu-core/src/mcp/` | Stateful stdio JSON-RPC 2.0 MCP server (`2024-11-05`) exposing 11 `mimikyu_*` and 20 `browser_*` tools |
+| `crates/mimikyu-core/src/mcp/` | Stateful stdio JSON-RPC 2.0 MCP server (`2024-11-05`) exposing 13 `mimikyu_*` and 20 `browser_*` tools |
 | `crates/mimikyu-core/src/harness/` | Offline `127.0.0.1:0` primary + cross-origin HTTP test server powering integration tests and reproducible benchmarks |
 | `crates/mimikyu-core/src/bench/` | Reproducible latency, token-compression, process-tree RSS, and 5-workflow agentic benchmark runner |
-| `crates/mimikyu-cli/src/` | `clap` CLI definition (`cli.rs`), daemon auto-connect (`client.rs`), `--json` output envelope (`output.rs`), command handlers (`commands/`) |
+| `crates/mimikyu-cli/src/` | `clap` CLI definition (`cli.rs`), daemon auto-connect (`client.rs`), `--json` output envelope (`output.rs`), command handlers (`commands/`, including `browser`, `vault`, `record`) |
+| `crates/mimikyu/src/lib.rs` | Top-level `mimikyu` library facade crate re-exporting `mimikyu-core` for `crates.io` consumers |
 
 ---
 

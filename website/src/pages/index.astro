@@ -89,7 +89,7 @@ const accentColor = {
         </div>
 
         <h1 class="mt-4 font-mono text-3xl leading-tight font-extrabold tracking-tight text-[#F4EEFF] sm:text-5xl">
-          Sub-5ms Native Rust Browser Runtime for{' '}
+          ~5 ms Snapshots — Native Rust Browser Runtime for{' '}
           <span class="text-[#FFE47A]">AI Agents</span>
         </h1>
 
@@ -121,7 +121,7 @@ const accentColor = {
             <code class="font-mono text-[#4CE0B3]">@e2</code> refs in single-digit milliseconds.
           </p>
           <div class="mt-2 text-[11px] font-semibold text-[#FFE47A]">
-            337 Rust + 244 E2E Tests Passing
+            {benchmarks.verifiedSuite.rustTests} Rust + {benchmarks.verifiedSuite.e2eTests} E2E Tests ({benchmarks.verifiedSuite.e2eRuns} Runs)
           </div>
         </div>
       </div>
@@ -202,7 +202,7 @@ const accentColor = {
           {benchmarks.verifiedSuite.rustTests} Rust Tests
         </span>
         <span class="border border-[#9D80EB] bg-[#180D2E] px-2.5 py-1 text-[#C9B8F5]">
-          {benchmarks.verifiedSuite.e2eTests} Python E2E
+          {benchmarks.verifiedSuite.e2eTests} Python E2E ({benchmarks.verifiedSuite.e2eRuns} Runs)
         </span>
       </div>
     </div>

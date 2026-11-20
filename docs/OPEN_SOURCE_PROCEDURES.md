@@ -12,14 +12,14 @@ All repository metadata, governance rules, and packaging manifests are wired to 
 
 1. **`.github/CODEOWNERS`**: Default and critical-subsystem ownership configured for `@YXZYSME`.
 2. **`.github/ISSUE_TEMPLATE/config.yml`**: Security advisory and Discussions links point to `https://github.com/YXZYSME/mimikyu/...`.
-3. **`Cargo.toml`, `crates/*/Cargo.toml`, `install.sh`, `packaging/homebrew/mimikyu.rb`, `README.md`, `CONTRIBUTING.md`, `RELEASE.md`, `SECURITY.md`, `CHANGELOG.md`**: Configured for `https://github.com/YXZYSME/mimikyu`.
+3. **`Cargo.toml`, `crates/*/Cargo.toml`, `install.sh`, `packaging/homebrew/mimikyu.rb`, `packaging/npm/*/package.json`, `packaging/pypi/pyproject.toml`, `server.json`, `CITATION.cff`, `README.md`, `CONTRIBUTING.md`, `RELEASE.md`, `SECURITY.md`, `CHANGELOG.md`**: Configured for `https://github.com/YXZYSME/mimikyu`.
 
 Verify zero local machine paths, personal usernames, or secrets exist anywhere in tracked history or working tree:
 
 ```bash
 git status
 ./install.sh --dry-run
-./scripts/check-version-sync.sh --tag v0.1.0
+./scripts/check-version-sync.sh --tag v0.2.0
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
@@ -275,9 +275,9 @@ flowchart LR
 
 ### 5.1 Versioning Policy (`0.y.z` -> `1.0.0`)
 
-- **While `0.y.z` (`0.1.x`, `0.2.x`)**:
-  - **Patch (`0.1.1`)**: Bug fixes, engine compatibility fixes, performance wins, dependency security updates, and additive non-breaking flags.
-  - **Minor (`0.2.0`)**: Major new subsystems, MCP protocol version bumps, or breaking changes to `--json` envelopes / `mimikyu-core` Rust traits (clearly called out under `### Changed` / `### Breaking` in `CHANGELOG.md`).
+- **While `0.y.z` (`0.2.x`, `0.3.x`)**:
+  - **Patch (`0.2.1`)**: Bug fixes, engine compatibility fixes, performance wins, dependency security updates, and additive non-breaking flags.
+  - **Minor (`0.3.0`)**: Major new subsystems, MCP protocol version bumps, or breaking changes to `--json` envelopes / `mimikyu-core` Rust traits (clearly called out under `### Changed` / `### Breaking` in `CHANGELOG.md`).
 
 ### 5.2 Step-by-Step Production Release Procedure
 
@@ -288,34 +288,38 @@ flowchart LR
    ```
 2. **Dry-run the release script first** (verifies clean working tree, SemVer validity, version sync, and `CHANGELOG.md` formatting without mutating git history):
    ```bash
-   ./scripts/release.sh --dry-run 0.1.1
+   ./scripts/release.sh --dry-run 0.2.1
    ```
 3. **Cut the release commit and tag**:
    ```bash
-   ./scripts/release.sh 0.1.1
+   ./scripts/release.sh 0.2.1
    ```
    Under the hood, `scripts/release.sh`:
-   - Updates `[workspace.package] version = "0.1.1"` in `Cargo.toml` and syncs `Cargo.lock`,
-   - Stamps `CHANGELOG.md` (`[Unreleased]` -> `[0.1.1] - YYYY-MM-DD`),
-   - Verifies lockstep consistency via `./scripts/check-version-sync.sh --tag v0.1.1`,
-   - Creates `chore(release): v0.1.1` and annotated tag `v0.1.1`.
+   - Updates `[workspace.package] version = "0.2.1"` in `Cargo.toml` and syncs `Cargo.lock`, `packaging/homebrew/mimikyu.rb`, `packaging/npm/{mimikyu-mcp,saengil-mimikyu,mimikyu-cli}/package.json`, `packaging/pypi/pyproject.toml`, `packaging/pypi/src/mimikyu_pypi/__init__.py`, `server.json`, and `CITATION.cff`,
+   - Stamps `CHANGELOG.md` (`[Unreleased]` -> `[0.2.1] - YYYY-MM-DD`),
+   - Verifies lockstep consistency via `./scripts/check-version-sync.sh --tag v0.2.1`,
+   - Creates `chore(release): v0.2.1` and annotated tag `v0.2.1`.
 4. **Land on `main` and push tag to trigger `.github/workflows/release.yml`**:
    - *If maintainer admin bypass is enabled for release commits*:
      ```bash
      git push origin main
-     git push origin v0.1.1
+     git push origin v0.2.1
      ```
-   - *If `protect-main` strictly requires PRs even for admins*: push the `chore(release): v0.1.1` commit on a `release/v0.1.1` branch, squash-merge the PR to `main`, pull `main`, tag the merged commit `git tag -s v0.1.1 -m "Release v0.1.1"`, and run `git push origin v0.1.1`.
-5. **Verify automated release artifacts**:
+   - *If `protect-main` strictly requires PRs even for admins*: push the `chore(release): v0.2.1` commit on a `release/v0.2.1` branch, squash-merge the PR to `main`, pull `main`, tag the merged commit `git tag -s v0.2.1 -m "Release v0.2.1"`, and run `git push origin v0.2.1`.
+5. **Verify automated release artifacts & multi-registry OIDC publication**:
    - Watch `.github/workflows/release.yml` via `gh run watch`.
-   - Confirm `GitHub Release v0.1.1` contains:
+   - Confirm `GitHub Release v0.2.1` contains:
      - `mimikyu-aarch64-apple-darwin.tar.gz`
      - `mimikyu-x86_64-apple-darwin.tar.gz`
      - `mimikyu-x86_64-unknown-linux-gnu.tar.gz`
      - `mimikyu-aarch64-unknown-linux-gnu.tar.gz`
-     - `SHA256SUMS`
+     - `SHA256SUMS` & rendered `mimikyu.rb`
      - Signed GitHub build provenance attestation (`gh attestation verify mimikyu-*.tar.gz --repo "${OWNER}/mimikyu"`).
-   - Update `packaging/homebrew/mimikyu.rb` SHA-256 digests if publishing to a Homebrew tap.
+   - Confirm downstream OIDC jobs succeed:
+     - `publish-crates`: `mimikyu-core`, `mimikyu-cli`, `mimikyu` live on `crates.io`.
+     - `publish-mcp`: `mimikyu-mcp`, `saengil-mimikyu`, `mimikyu-cli` live on `npm` with provenance, and `server.json` published to the Official MCP Registry.
+     - `publish-pypi`: `mimikyu` wheel & sdist live on `PyPI`.
+     - Homebrew tap: `Formula/mimikyu.rb` pushed to `YXZYSME/homebrew-tap` (automatically when `HOMEBREW_TAP_TOKEN` is configured, or manually from the attached `mimikyu.rb` asset).
 
 ### 5.3 End-User Installation & Atomic Update Channels
 
@@ -331,12 +335,12 @@ Once `vX.Y.Z` is live on GitHub Releases, users upgrade seamlessly across all su
   ```
 - **Attestation-verified / pinned CI install**:
   ```bash
-  curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- --version v0.1.0 --verify-attestation
+  curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- --version v0.2.0 --verify-attestation
   ```
 - **Cargo (`binstall` / `--git` / source)**:
   ```bash
   cargo binstall mimikyu-cli
-  cargo install --git https://github.com/YXZYSME/mimikyu --tag v0.1.0 mimikyu-cli
+  cargo install --git https://github.com/YXZYSME/mimikyu --tag v0.2.0 mimikyu-cli
   ```
 
 ---

@@ -12,7 +12,7 @@
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B%20(2024)-f5b841?style=flat-square&labelColor=180d2e)](Cargo.toml)
 [![Engines: CDP + BiDi](https://img.shields.io/badge/engines-Chromium%20CDP%20%2B%20Firefox%20BiDi-4ce0b3?style=flat-square&labelColor=180d2e)](ARCHITECTURE.md)
 [![MCP Server: 33 Tools](https://img.shields.io/badge/MCP%202024--11--05-33%20tools-9d80eb?style=flat-square&labelColor=180d2e)](#mcp-server-configuration)
-[![Verified Suite: 360+ Rust + 244 E2E](https://img.shields.io/badge/tests-360%2B%20Rust%20%7C%20244%20E2E-4ce0b3?style=flat-square&labelColor=180d2e)](#testing--verification)
+[![Verified Suite: 372 Rust + 237 E2E (244 runs)](https://img.shields.io/badge/tests-372%20Rust%20%7C%20237%20E2E%20(244%20runs)-4ce0b3?style=flat-square&labelColor=180d2e)](#testing--verification)
 [![Security Policy](https://img.shields.io/badge/security-R3%20compliant-ff6b8b?style=flat-square&labelColor=180d2e)](SECURITY.md)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-ffe47a?style=flat-square&labelColor=180d2e)](#license--parody-notice)
 
@@ -41,8 +41,8 @@
 
 **Why `mimikyu` exists:**
 - **Coherent Environment & Isolation Foundations:** Built-in OS environment presets (`win11`, `macos`, `linux`), offline GeoIP alignment, authenticated loopback proxy relaying, two-tier browser/context isolation, kinematic input modeling, and granular resource blocking.
-- **Blazing Native Rust Speed:** Compiled into a single native `mimikyu` binary with a warm auto-spawning Unix-socket daemon — delivering **`~5.0 ms` semantic snapshots**, **`~5.4 ms` Markdown extraction**, and **`~67 ms` warm virtual contexts** with zero Node.js or Python runtime overhead.
-- **Token-Efficient `@eN` Agentic Control:** Compresses sprawling DOMs (including open Shadow DOM and nested/cross-origin iframes) by **`2.79x–3.57x`** into deterministic `@e1`, `@e2` interactive element refs, structural diffs, atomic action batches, **33 turnkey MCP tools** (with R3-compliant Human-in-the-Loop session takeover), and built-in headless CDP screencast recording.
+- **Blazing Native Rust Speed:** Compiled into a single native `mimikyu` binary with a warm auto-spawning Unix-socket daemon — delivering **`~5.0 ms` semantic snapshots**, **`~5.4 ms` Markdown extraction**, and **`~67 ms` warm virtual contexts** (local `127.0.0.1` loopback benchmark medians, Chromium CDP) with zero Node.js or Python runtime overhead.
+- **Token-Efficient `@eN` Agentic Control:** Compresses sprawling DOMs (including open Shadow DOM and nested/cross-origin iframes) by **`2.79x–3.57x`** (local `127.0.0.1` loopback `/catalog` benchmark, `bytes/4` token estimate) into deterministic `@e1`, `@e2` interactive element refs, structural diffs, atomic action batches, **33 turnkey MCP tools** (with R3-compliant Human-in-the-Loop session takeover), and built-in headless CDP screencast recording.
 
 </td>
 </tr>
@@ -100,7 +100,7 @@ curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | s
 
 # Pin an exact SemVer tag, custom install directory, or GitHub build provenance attestation check
 curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- \
-  --version v0.1.0 --bin-dir ~/.local/bin --verify-attestation
+  --version v0.2.0 --bin-dir ~/.local/bin --verify-attestation
 
 # Cleanly remove the installed binary
 curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- --uninstall
@@ -182,7 +182,7 @@ cargo build --release
 
 ### Runtime Prerequisites
 
-- **Local Browser:** Chromium/Chrome and/or Firefox installation (auto-discovered via explicit override → `MIMIKYU_CHROMIUM_PATH` / `MIMIKYU_FIREFOX_PATH` → Playwright & Puppeteer local caches → system installs & `PATH`)
+- **Local Browser:** Chromium/Chrome and/or Firefox installation (auto-discovered via explicit override → `MIMIKYU_CHROMIUM_PATH` / `MIMIKYU_FIREFOX_PATH` → Mimikyu-managed installs via `mimikyu browser install` / `MIMIKYU_BROWSERS_DIR` → Playwright & Puppeteer local caches → system installs & `PATH`)
 - **For Building from Source:** Rust toolchain `1.88+` (`cargo`, `rustc`, Edition 2024)
 - **For Running `e2e/`:** Python 3 (standard library only; zero external `pip` packages)
 
@@ -196,23 +196,26 @@ cargo build --release
 
 ```text
 crates/
+├── mimikyu/src/
+│   └── lib.rs            # Top-level library facade re-exporting `mimikyu-core` for crates.io consumers
 ├── mimikyu-core/src/
 │   ├── discovery.rs      # Local Chromium & Firefox discovery + macOS zero-spawn Firefox metadata probe
+│   ├── browser_install.rs # Managed Chrome-for-Testing & Firefox installer (`mimikyu browser install`, SHA-256 verified)
 │   ├── process.rs        # POSIX process-group isolation (setpgid), deterministic reaping, crash suppression
 │   ├── driver/           # Native WebSocket CDP (Chromium) & W3C WebDriver BiDi (Firefox) drivers
 │   ├── isolation/        # Two-tier isolation: persistent/ephemeral profiles (fs2 locks) & virtual contexts
 │   ├── env_profile/      # OS presets (win11|macos|linux), offline GeoIP, coherence checks, ProxyRelay, init scripts
-│   ├── network/          # Resource blocking, request interception/routing, ring-buffer telemetry
+│   ├── network/          # Resource & tracker blocking, request interception/routing, ring-buffer telemetry
 │   ├── snapshot/         # Compact semantic accessibility tree, deterministic @eN ref map, structural diffs
 │   ├── extract/          # Markdown, plain text, links, HTML tables, PNG screenshots, PDF, instant animations
 │   ├── input/            # Serialized ChokepointInput, optional kinematic humanize motion, ActionBatcher
 │   ├── wait/             # Page idle (lifecycle + network quiet + layout stability), text, URL, selector waits
-│   ├── session.rs        # Unified SessionManager orchestrating engines, isolation, state, and telemetry
+│   ├── session.rs        # Unified SessionManager orchestrating engines, isolation, HITL, recording, and telemetry
 │   ├── daemon/           # Warm Unix-socket NDJSON daemon with auto-spawn, idle timeout, and socket symlinking
-│   ├── mcp/              # Stdio JSON-RPC 2.0 MCP server (protocol 2024-11-05, 31 tools)
+│   ├── mcp/              # Stdio JSON-RPC 2.0 MCP server (protocol 2024-11-05, 33 tools: 13 mimikyu_* + 20 browser_*)
 │   ├── harness/          # Embedded 127.0.0.1:0 dual-origin (primary + cross-origin) local HTTP test server
 │   └── bench/            # Reproducible local speed & 5-workflow agentic benchmark suite + live RSS tracking
-└── mimikyu-cli/src/      # Unified `mimikyu` CLI binary (--json envelope, daemon client, MCP & bench frontends)
+└── mimikyu-cli/src/      # Unified `mimikyu` CLI binary (--json envelope, daemon client, mcp, bench, browser, vault, record)
 e2e/                      # Opaque-box Python 3 stdlib E2E test suite (Tiers 1–4 + --self-test) on 127.0.0.1:0
 ```
 
@@ -251,7 +254,7 @@ e2e/                      # Opaque-box Python 3 stdlib E2E test suite (Tiers 1�
 ### Host & macOS Reliability Hardening
 - **Zero-Spawn macOS Firefox Discovery**: Reads `application.ini` and `Contents/Info.plist` directly from disk rather than repeatedly spawning `firefox --version` (preventing macOS `RegisterFonts` exit races and desktop crash dialogs).
 - **Crash-Reporter Suppression & Zero Orphans**: Launches Firefox with `MOZ_CRASHREPORTER_DISABLE=1`, `MOZ_CRASHREPORTER=0`, and `MOZ_CRASHREPORTER_NO_REPORT=1`, isolates every browser process in its own POSIX process group (`setpgid(0, 0)`), and guarantees teardown on shutdown, signal, or `Drop`.
-- **Local Discovery Precedence**: Explicit override path → `MIMIKYU_CHROMIUM_PATH` / `MIMIKYU_FIREFOX_PATH` → Playwright & Puppeteer local caches → system installs & `PATH`.
+- **Local Discovery Precedence**: Explicit override path → `MIMIKYU_CHROMIUM_PATH` / `MIMIKYU_FIREFOX_PATH` → Mimikyu-managed installs (`mimikyu browser install` / `MIMIKYU_BROWSERS_DIR`) → Playwright & Puppeteer local caches → system installs & `PATH`.
 
 <p align="center">
   <img src="https://raw.githubusercontent.com/YXZYSME/mimikyu/main/assets/pixel-divider.svg" alt="" width="100%" />
@@ -366,7 +369,7 @@ Or using a locally installed `mimikyu` binary on your `PATH`:
 | Semantic `@eN` snapshot | `5.0 ms` | `19.0 ms` |
 | Markdown extraction | `5.4 ms` | `5.5 ms` |
 | Atomic 3-step batch | `204.2 ms` | `203.5 ms` |
-| Process-tree RSS | `278.3 MB` | `727.8 MB` |
+| Process-tree RSS (last round) | `278.3 MB` | `727.8 MB` |
 | Snapshot token compression | `2.79x` (`967` → `347` est. tokens) | `3.57x` (`967` → `271` est. tokens) |
 | Agentic workflows passed | **5 / 5 (100%)** | **5 / 5 (100%)** |
 
@@ -385,7 +388,7 @@ cargo test --workspace
 
 Verified workspace results:
 - `cargo clippy --workspace --all-targets -- -D warnings`: **0 warnings**
-- `cargo test --workspace`: **337 passed, 0 failed, 0 ignored** (`mimikyu-core`: 314/314 across unit & integration suites; `mimikyu-cli`: 23/23 across contract, doctor, and bench CLI suites)
+- `cargo test --workspace`: **372 passed, 0 failed, 0 ignored** (`mimikyu-core`: 345/345 across unit & integration suites; `mimikyu-cli`: 26/26 across contract, doctor, and bench CLI suites; `mimikyu`: 1/1 library facade test)
 - Process & crash hygiene: **0 orphan browser/mimikyu processes**, **0 macOS CrashReporter logs**
 
 ### Opaque-Box Python E2E Suite (`e2e/`)
@@ -403,7 +406,7 @@ python3 e2e/run_e2e.py --tier all --bin ./target/release/mimikyu
 python3 e2e/run_e2e.py --tier 4 --engine firefox --bin ./target/release/mimikyu
 ```
 
-Verified E2E results against `./target/release/mimikyu` (**244/244 passed**, 0 failed, 0 errors, 0 skipped):
+Verified E2E results against `./target/release/mimikyu` (**237 unique E2E tests / 244 total runs passed**, 0 failed, 0 errors, 0 skipped; Tier 4's 7 workloads run on both Chromium and Firefox):
 - `--self-test`: **29/29 passed**
 - `--tier all` (Chromium, Tiers 1–4): **208/208 passed** (Tier 1: 86, Tier 2: 96, Tier 3: 19, Tier 4: 7)
 - `--tier 4 --engine firefox`: **7/7 passed**
