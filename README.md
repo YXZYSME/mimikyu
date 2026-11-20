@@ -72,14 +72,24 @@ curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | s
 curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- --uninstall
 ```
 
-### Rust / Cargo & `cargo-binstall`
+### Rust (`crates.io`) & `cargo-binstall`
 
 ```bash
-# Install directly from Git with Cargo (Rust 1.88+)
-cargo install --git https://github.com/YXZYSME/mimikyu mimikyu-cli
+# Install the unified `mimikyu` CLI, daemon & MCP binary from crates.io
+cargo install mimikyu-cli
 
-# Fast prebuilt binary install via cargo-binstall
+# Or download the prebuilt release binary via cargo-binstall
 cargo binstall mimikyu-cli
+
+# Embed the Rust library runtime in your own project
+cargo add mimikyu
+```
+
+### Homebrew (macOS & Linux)
+
+```bash
+brew tap YXZYSME/tap
+brew install mimikyu
 ```
 
 ### Build & Install from Local Source
