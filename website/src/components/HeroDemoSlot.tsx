@@ -80,33 +80,47 @@ const DEMO_STEPS: DemoStep[] = [
   },
 ];
 
+const RELEASE_DEMO_BASE =
+  'https://github.com/YXZYSME/mimikyu/releases/download/v0.2.0';
+
+const VIDEO_CLIPS = [
+  {
+    id: 'raw',
+    label: '100% Raw Live Websites',
+    src: `${RELEASE_DEMO_BASE}/demo-raw-live-browser.mp4`,
+    poster: `${RELEASE_DEMO_BASE}/demo-raw-poster-github.png`,
+    caption: 'LIVE CDP SCREENCAST · GitHub, crates.io, PyPI & Hacker News (Zero Overlays)',
+  },
+  {
+    id: 'hero',
+    label: '5ms Agentic Loop',
+    src: `${RELEASE_DEMO_BASE}/demo-1-hero.mp4`,
+    poster: `${RELEASE_DEMO_BASE}/demo-1-poster.png`,
+    caption: 'SHOWCASE · @eN Snapshot → --humanize Bézier Click → Markdown Extract',
+  },
+  {
+    id: 'parity',
+    label: 'CDP vs BiDi Parity',
+    src: `${RELEASE_DEMO_BASE}/demo-2-dual-engine.mp4`,
+    poster: `${RELEASE_DEMO_BASE}/demo-2-poster.png`,
+    caption: 'DUAL ENGINE · Chromium (CDP) vs Firefox (W3C BiDi) across Shadow DOM + Iframe',
+  },
+];
+
 export default function HeroDemoSlot({ baseUrl }: Props) {
   const [copied, setCopied] = useState(false);
-  const [videoAvailable, setVideoAvailable] = useState(false);
+  const [videoAvailable, setVideoAvailable] = useState(true);
+  const [activeClip, setActiveClip] = useState(0);
   const [activeStep, setActiveStep] = useState(1);
 
-  const normalizedBase = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`;
-  const videoSrc = `${normalizedBase}demos/demo-1-hero.mp4`;
-  const posterSrc = `${normalizedBase}demos/demo-1-poster.png`;
+  void baseUrl;
+  const clip = VIDEO_CLIPS[activeClip];
+  const videoSrc = clip.src;
+  const posterSrc = clip.poster;
 
   useEffect(() => {
-    let cancelled = false;
-    fetch(videoSrc, { method: 'HEAD' })
-      .then((res) => {
-        if (!cancelled && res.ok) {
-          const ct = res.headers.get('content-type') || '';
-          if (ct.includes('video') || ct.includes('octet-stream') || ct === '') {
-            setVideoAvailable(true);
-          }
-        }
-      })
-      .catch(() => {
-        // Fallback HUD stays active cleanly when demo-1-hero.mp4 is not yet bundled
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [videoSrc]);
+    setVideoAvailable(true);
+  }, [activeClip]);
 
   const handleCopy = async () => {
     try {
@@ -162,18 +176,32 @@ export default function HeroDemoSlot({ baseUrl }: Props) {
             <span class="inline-block h-2.5 w-2.5 bg-[#4CE0B3]" />
             <span class="ml-2 font-mono text-xs font-bold tracking-wider text-[#F4EEFF]">
               {videoAvailable
-                ? 'LIVE DEMO · demo-1-hero.mp4 (5ms Agentic Loop)'
+                ? clip.caption
                 : 'INTERACTIVE HUD PREVIEW · The 5ms Agentic Loop (@eN → --humanize → Markdown)'}
             </span>
           </div>
-          <span class="border border-[#563A9E] bg-[#22133F] px-2 py-0.5 font-mono text-[11px] font-semibold text-[#4CE0B3]">
-            DAEMON: WARM · 127.0.0.1
-          </span>
+          <div class="flex flex-wrap items-center gap-1.5">
+            {VIDEO_CLIPS.map((item, idx) => (
+              <button
+                key={item.id}
+                type="button"
+                onClick={() => setActiveClip(idx)}
+                class={`cursor-pointer border px-2 py-0.5 font-mono text-[11px] font-semibold transition ${
+                  activeClip === idx
+                    ? 'border-[#F5B841] bg-[#22133F] text-[#FFE47A]'
+                    : 'border-[#563A9E] bg-[#120924] text-[#C9B8F5] hover:border-[#9D80EB]'
+                }`}
+              >
+                {item.label}
+              </button>
+            ))}
+          </div>
         </div>
 
         {videoAvailable ? (
           <div class="relative bg-[#090414]">
             <video
+              key={videoSrc}
               class="aspect-video w-full object-contain"
               src={videoSrc}
               poster={posterSrc}

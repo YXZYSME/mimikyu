@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Managed Browser Installer & Discovery (`mimikyu browser`)**:
+  - Added `DiscoverySource::MimikyuManaged` (`<data_local_dir>/mimikyu/browsers/`, overridable via `MIMIKYU_BROWSERS_DIR`, prioritized right after `EnvOverride`).
+  - Added `mimikyu browser {list, path, install [--dry-run] [--version] [--sha256]}` resolving official Chrome-for-Testing and Firefox release artifacts with SHA-256 verification.
+- **Hardened Privacy Vault Mode & Tracker Blocklist (`mimikyu vault`, `--block-trackers`, `--privacy-mode`)**:
+  - Added curated DNS-boundary tracker/analytics domain blocklist preset (`--block-trackers`) across both Chromium CDP and Firefox WebDriver BiDi.
+  - Added `mimikyu vault {launch, list}` with `fs2`-locked persistent profiles, headed defaults, WebRTC IP-leak protection, Firefox privacy preferences, and human-safe interactive Chromium flags while preserving zero telemetry and `ProxyRelay` isolation.
+- **R3-Compliant Human-in-the-Loop (HITL) Session Takeover (33 MCP Tools)**:
+  - Added `session pause`, `session resume`, and `session takeover` gating automated input mutations while a human interacts legitimately, invalidating stale `@eN` snapshot refs on resume.
+  - Added MCP tools `mimikyu_request_human_takeover` and `mimikyu_resume_from_human` (expanding the MCP surface from 31 to 33 tools).
+- **Headless CDP Screencast Frame Recording (`mimikyu record`) & Demo Pipelines**:
+  - Added engine-agnostic `DriverSession::{start_screencast, stop_screencast}` implemented over CDP `Page.startScreencast` / `Page.screencastFrameAck` and exposed via `mimikyu record {start, stop}`.
+  - Added `scripts/demos/record_raw_live.py` (100% raw unstylized live-website browser capture) and `scripts/demos/record_demos.py` (offline reproducible showcase demos).
+- **Multi-Ecosystem Publishing, Website (`mimikyu.saengil.ai`) & IP Attribution**:
+  - Added top-level `crates/mimikyu` facade crate (`crates.io`), `saengil-mimikyu` / `mimikyu-cli` / `mimikyu-mcp` (`npm`), `mimikyu` universal wheel/sdist (`PyPI`), `server.json` (Official MCP Registry `io.github.YXZYSME/mimikyu`), and zero-token GitHub OIDC publishing across all registries in `.github/workflows/release.yml`.
+  - Added Astro 7 + Tailwind CSS v4 + Preact Islands showcase & docs site (`website/`, zero `npm audit` vulnerabilities) deployed via `.github/workflows/pages.yml` for `https://mimikyu.saengil.ai`.
+  - Added Apache-2.0 Section 4(d) `NOTICE` (bundled into release tarballs) and `CITATION.cff`.
+
+### Changed
+
+- Updated `README.md` image URLs to absolute `raw.githubusercontent.com` paths so pixel-art branding renders cleanly on `crates.io`, `npm`, and `PyPI`, and embedded live `v0.2.0` demo previews.
+
 ## [0.1.0] - 2026-11-19
 
 ### Added

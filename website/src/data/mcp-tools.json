@@ -1,9 +1,9 @@
 {
   "protocolVersion": "2024-11-05",
   "registryId": "io.github.YXZYSME/mimikyu",
-  "total": 31,
+  "total": 33,
   "namespaces": {
-    "mimikyu": 11,
+    "mimikyu": 13,
     "browser": 20
   },
   "tools": [
@@ -1124,6 +1124,40 @@
       "name": "browser_env_report",
       "namespace": "browser",
       "description": "Inspect environment profile, coherence, proxy, and resource policy for a session",
+      "required": [],
+      "params": [
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "mimikyu_request_human_takeover",
+      "namespace": "mimikyu",
+      "description": "Pause automated input mutations on a session so a human can legitimately complete login, 2FA, payment, or verification in the browser window",
+      "required": [],
+      "params": [
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        },
+        {
+          "name": "reason",
+          "type": "string",
+          "required": false,
+          "description": "Human-readable explanation shown for why takeover is needed"
+        }
+      ]
+    },
+    {
+      "name": "mimikyu_resume_from_human",
+      "namespace": "mimikyu",
+      "description": "Resume automated session execution after human takeover completes and invalidate stale snapshot refs",
       "required": [],
       "params": [
         {
