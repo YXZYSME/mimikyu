@@ -1,0 +1,314 @@
+---
+import BaseLayout from '../layouts/BaseLayout.astro';
+import HeroDemoSlot from '../components/HeroDemoSlot';
+import InstallTabs from '../components/InstallTabs';
+import BenchmarkChart from '../components/BenchmarkChart';
+import McpExplorer from '../components/McpExplorer';
+import ArchitectureSection from '../components/ArchitectureSection.astro';
+import benchmarks from '../data/benchmarks.json';
+import { DOCS_MANIFEST } from '../lib/docs';
+
+const base = import.meta.env.BASE_URL.endsWith('/')
+  ? import.meta.env.BASE_URL
+  : `${import.meta.env.BASE_URL}/`;
+
+const kpis = [
+  {
+    value: '5.0 ms',
+    label: 'Semantic @eN Snapshots',
+    sub: 'Chromium CDP · 19.0 ms BiDi',
+    accent: '#FFE47A',
+    border: '#F5B841',
+  },
+  {
+    value: '2.8×–3.6×',
+    label: 'Token Compression',
+    sub: '967 → 271–347 est. tokens',
+    accent: '#9EFCE4',
+    border: '#4CE0B3',
+  },
+  {
+    value: '31 Tools',
+    label: 'Stdio MCP Server',
+    sub: '11 mimikyu_* · 20 browser_*',
+    accent: '#C9B8F5',
+    border: '#9D80EB',
+  },
+  {
+    value: 'CDP + BiDi',
+    label: 'Dual Native Drivers',
+    sub: 'Local Chromium & Firefox',
+    accent: '#FF6B8B',
+    border: '#FF6B8B',
+  },
+];
+
+const accentColor = {
+  gold: 'border-[#F5B841] text-[#FFE47A]',
+  mint: 'border-[#4CE0B3] text-[#9EFCE4]',
+  violet: 'border-[#9D80EB] text-[#C9B8F5]',
+  coral: 'border-[#FF6B8B] text-[#FF6B8B]',
+};
+---
+
+<BaseLayout activeNav="home" canonicalPath="/">
+  <!-- HERO SECTION -->
+  <section class="mx-auto max-w-6xl px-4 pt-8 pb-12 sm:px-6 sm:pt-12">
+    <!-- Crisp 16-bit Pixel Banner HUD -->
+    <div class="hud-frame-bright overflow-hidden p-2 sm:p-3">
+      <img
+        src={`${base}assets/mimikyu-banner.svg`}
+        alt="mimikyu — 16-bit pixel-art banner featuring an original rag-disguise browser sprite mascot, MIMIKYU logo, and runtime HUD"
+        width="960"
+        height="280"
+        class="pixel-art h-auto w-full"
+      />
+    </div>
+
+    <!-- Identity & Positioning Block -->
+    <div class="mt-8 grid items-center gap-6 lg:grid-cols-12">
+      <div class="lg:col-span-8">
+        <div class="flex flex-wrap items-center gap-2 font-mono text-xs">
+          <span class="border border-[#F5B841] bg-[#22133F] px-2.5 py-0.5 font-bold text-[#FFE47A]">
+            AGENTDEX // ENTRY NO. 031
+          </span>
+          <span class="border border-[#4CE0B3] bg-[#180D2E] px-2.5 py-0.5 font-semibold text-[#9EFCE4]">
+            v0.1.0 · RUST 1.88+ (EDITION 2024)
+          </span>
+          <span class="border border-[#563A9E] bg-[#180D2E] px-2.5 py-0.5 text-[#C9B8F5]">
+            MIT OR Apache-2.0
+          </span>
+        </div>
+
+        <h1 class="mt-4 font-mono text-3xl leading-tight font-extrabold tracking-tight text-[#F4EEFF] sm:text-5xl">
+          Sub-5ms Native Rust Browser Runtime for{' '}
+          <span class="text-[#FFE47A]">AI Agents</span>
+        </h1>
+
+        <p class="mt-4 max-w-2xl text-base leading-relaxed text-[#C9B8F5] sm:text-lg">
+          <strong class="text-[#F4EEFF]">mimikyu</strong> by <strong class="text-[#9D80EB]">Saengil</strong> is a
+          single-binary native Rust browser runtime, two-tier session &amp; profile isolation layer,
+          warm Unix-socket daemon, and <strong class="text-[#FFE47A]">31-tool MCP control plane</strong> driving
+          local <strong class="text-[#F4EEFF]">Chromium (CDP)</strong> and{' '}
+          <strong class="text-[#F4EEFF]">Firefox (W3C WebDriver BiDi)</strong> — with zero Node.js or Python runtime overhead.
+        </p>
+      </div>
+
+      <!-- Compact Mascot Entry Card -->
+      <div class="hud-card flex items-center gap-4 p-4 lg:col-span-4">
+        <img
+          src={`${base}assets/mimikyu-mascot.svg`}
+          alt="mimikyu rag-disguise browser sprite mascot"
+          width="88"
+          height="88"
+          class="pixel-art h-22 w-22 shrink-0"
+        />
+        <div class="font-mono text-xs">
+          <div class="text-[10px] font-bold uppercase tracking-widest text-[#9D80EB]">
+            TYPE: SHADOW / BROWSER
+          </div>
+          <p class="mt-1.5 font-sans text-xs leading-relaxed text-[#E8DEFF]">
+            Compresses open Shadow DOM &amp; cross-origin iframes into deterministic{' '}
+            <code class="font-mono text-[#4CE0B3]">@e1</code>,{' '}
+            <code class="font-mono text-[#4CE0B3]">@e2</code> refs in single-digit milliseconds.
+          </p>
+          <div class="mt-2 text-[11px] font-semibold text-[#FFE47A]">
+            337 Rust + 244 E2E Tests Passing
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- KPI Strip -->
+    <div class="mt-8 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+      {kpis.map((kpi) => (
+        <div
+          class="hud-card p-4"
+          style={`border-top: 3px solid ${kpi.border};`}
+        >
+          <div class="font-mono text-2xl font-extrabold sm:text-3xl" style={`color: ${kpi.accent};`}>
+            {kpi.value}
+          </div>
+          <div class="mt-1 font-mono text-xs font-bold text-[#F4EEFF]">{kpi.label}</div>
+          <div class="mt-0.5 font-mono text-[11px] text-[#C9B8F5]">{kpi.sub}</div>
+        </div>
+      ))}
+    </div>
+
+    <!-- Primary 1-Click Install CTA + Styled Demo Preview Slot (Preact Island) -->
+    <div class="mt-8">
+      <HeroDemoSlot client:load baseUrl={base} />
+    </div>
+  </section>
+
+  <!-- Pixel Divider -->
+  <div class="mx-auto max-w-6xl px-4 sm:px-6">
+    <img src={`${base}assets/pixel-divider.svg`} alt="" aria-hidden="true" width="960" height="24" class="pixel-art h-auto w-full opacity-90" />
+  </div>
+
+  <!-- SECTION 01: INTERACTIVE PACKAGE REGISTRY SWITCHER -->
+  <section id="install" class="mx-auto max-w-6xl px-4 py-14 sm:px-6">
+    <div class="mb-8 flex flex-wrap items-end justify-between gap-4">
+      <div>
+        <p class="font-mono text-xs font-bold uppercase tracking-widest text-[#F5B841]">
+          01 // INSTALL EVERYWHERE
+        </p>
+        <h2 class="mt-1 font-mono text-2xl font-extrabold text-[#F4EEFF] sm:text-3xl">
+          Six Official Ecosystems, One Native Binary
+        </h2>
+        <p class="mt-2 max-w-2xl text-sm text-[#C9B8F5]">
+          Install via Shell, Homebrew, crates.io, npm (<code class="font-mono text-[#4CE0B3]">saengil-mimikyu</code>),
+          PyPI, or drop straight into any MCP 2024-11-05 host with zero global install.
+        </p>
+      </div>
+      <span class="border border-[#563A9E] bg-[#180D2E] px-3 py-1.5 font-mono text-xs text-[#C9B8F5]">
+        SHA256SUMS + SLSA v1 Provenance
+      </span>
+    </div>
+
+    <InstallTabs client:load />
+  </section>
+
+  <!-- Pixel Divider -->
+  <div class="mx-auto max-w-6xl px-4 sm:px-6">
+    <img src={`${base}assets/pixel-divider.svg`} alt="" aria-hidden="true" width="960" height="24" class="pixel-art h-auto w-full opacity-90" />
+  </div>
+
+  <!-- SECTION 02: INTERACTIVE BENCHMARK VISUALIZER -->
+  <section id="benchmarks" class="mx-auto max-w-6xl px-4 py-14 sm:px-6">
+    <div class="mb-8 flex flex-wrap items-end justify-between gap-4">
+      <div>
+        <p class="font-mono text-xs font-bold uppercase tracking-widest text-[#4CE0B3]">
+          02 // MEASURED LOCAL BENCHMARKS
+        </p>
+        <h2 class="mt-1 font-mono text-2xl font-extrabold text-[#F4EEFF] sm:text-3xl">
+          Chromium CDP vs Firefox WebDriver BiDi
+        </h2>
+        <p class="mt-2 max-w-2xl text-sm text-[#C9B8F5]">
+          Real release numbers captured offline against the embedded{' '}
+          <code class="font-mono text-[#FFE47A]">127.0.0.1:0</code> dual-origin harness — zero external network jitter.
+        </p>
+      </div>
+      <div class="flex flex-wrap gap-2 font-mono text-xs">
+        <span class="border border-[#4CE0B3] bg-[#180D2E] px-2.5 py-1 text-[#9EFCE4]">
+          {benchmarks.verifiedSuite.rustTests} Rust Tests
+        </span>
+        <span class="border border-[#9D80EB] bg-[#180D2E] px-2.5 py-1 text-[#C9B8F5]">
+          {benchmarks.verifiedSuite.e2eTests} Python E2E
+        </span>
+      </div>
+    </div>
+
+    <BenchmarkChart client:load />
+
+    <!-- Verified 5 Agentic Workflows Strip -->
+    <div class="mt-6 hud-card p-5">
+      <div class="flex flex-wrap items-center justify-between gap-2 font-mono text-xs">
+        <span class="font-bold uppercase tracking-wider text-[#FFE47A]">
+          5 / 5 End-to-End Agentic Benchmark Workflows Passing (Chromium + Firefox)
+        </span>
+        <span class="text-[#4CE0B3]">0 Clippy Warnings · 0 Orphan Processes · 0 R3 Violations</span>
+      </div>
+      <div class="mt-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-5">
+        {benchmarks.workflows.map((wf, idx) => (
+          <div class="border border-[#563A9E]/70 bg-[#120924] p-3 font-mono text-[11px] text-[#E8DEFF]">
+            <span class="font-bold text-[#4CE0B3]">W{idx + 1} ✓</span>
+            <p class="mt-1 font-sans text-xs text-[#C9B8F5]">{wf}</p>
+          </div>
+        ))}
+      </div>
+    </div>
+  </section>
+
+  <!-- Pixel Divider -->
+  <div class="mx-auto max-w-6xl px-4 sm:px-6">
+    <img src={`${base}assets/pixel-divider.svg`} alt="" aria-hidden="true" width="960" height="24" class="pixel-art h-auto w-full opacity-90" />
+  </div>
+
+  <!-- SECTION 03: 31-TOOL MCP REFERENCE EXPLORER -->
+  <section id="mcp" class="mx-auto max-w-6xl px-4 py-14 sm:px-6">
+    <div class="mb-8 flex flex-wrap items-end justify-between gap-4">
+      <div>
+        <p class="font-mono text-xs font-bold uppercase tracking-widest text-[#9D80EB]">
+          03 // MCP 2024-11-05 CONTROL PLANE
+        </p>
+        <h2 class="mt-1 font-mono text-2xl font-extrabold text-[#F4EEFF] sm:text-3xl">
+          Interactive 31-Tool MCP Reference Explorer
+        </h2>
+        <p class="mt-2 max-w-2xl text-sm text-[#C9B8F5]">
+          Search, filter by namespace (<code class="font-mono text-[#FFE47A]">mimikyu_*</code> or{' '}
+          <code class="font-mono text-[#4CE0B3]">browser_*</code>), inspect exact parameter schemas extracted from Rust source,
+          and copy JSON-RPC 2.0 payloads in one click.
+        </p>
+      </div>
+      <a
+        href="https://registry.modelcontextprotocol.io/v0/servers?search=io.github.YXZYSME/mimikyu"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="hud-btn-ghost px-3.5 py-2 font-mono text-xs font-semibold text-[#9D80EB]"
+      >
+        MCP Registry ↗
+      </a>
+    </div>
+
+    <McpExplorer client:load />
+  </section>
+
+  <!-- Pixel Divider -->
+  <div class="mx-auto max-w-6xl px-4 sm:px-6">
+    <img src={`${base}assets/pixel-divider.svg`} alt="" aria-hidden="true" width="960" height="24" class="pixel-art h-auto w-full opacity-90" />
+  </div>
+
+  <!-- SECTION 04: ARCHITECTURE & R3 SECURITY BOUNDARY -->
+  <ArchitectureSection />
+
+  <!-- Pixel Divider -->
+  <div class="mx-auto max-w-6xl px-4 sm:px-6">
+    <img src={`${base}assets/pixel-divider.svg`} alt="" aria-hidden="true" width="960" height="24" class="pixel-art h-auto w-full opacity-90" />
+  </div>
+
+  <!-- SECTION 05: LIVE REPO DOCS HUB -->
+  <section class="mx-auto max-w-6xl px-4 py-14 sm:px-6">
+    <div class="mb-8 flex flex-wrap items-end justify-between gap-4">
+      <div>
+        <p class="font-mono text-xs font-bold uppercase tracking-widest text-[#FFE47A]">
+          05 // ZERO-DRIFT DOCUMENTATION HUB
+        </p>
+        <h2 class="mt-1 font-mono text-2xl font-extrabold text-[#F4EEFF] sm:text-3xl">
+          Rendered Live from Repo Root at Build Time
+        </h2>
+        <p class="mt-2 max-w-2xl text-sm text-[#C9B8F5]">
+          Every specification below is read directly from the canonical Markdown files in the repository root — zero duplicated copies, zero doc drift.
+        </p>
+      </div>
+      <a href={`${base}docs`} class="hud-btn-gold px-4 py-2 font-mono text-xs font-extrabold uppercase">
+        Open Docs Hub →
+      </a>
+    </div>
+
+    <div class="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+      {DOCS_MANIFEST.map((doc) => (
+        <a
+          href={`${base}docs/${doc.slug}`}
+          class="hud-card group flex flex-col justify-between p-5 transition-transform hover:-translate-y-0.5 hover:border-[#9D80EB]"
+        >
+          <div>
+            <div class="flex items-center justify-between gap-2">
+              <span class={`border px-2 py-0.5 font-mono text-[10px] font-bold uppercase ${accentColor[doc.accent]}`}>
+                {doc.badge}
+              </span>
+              <span class="font-mono text-[11px] text-[#C9B8F5]">{doc.filename}</span>
+            </div>
+            <h3 class="mt-3 font-mono text-base font-bold text-[#F4EEFF] group-hover:text-[#FFE47A]">
+              {doc.title}
+            </h3>
+            <p class="mt-2 text-xs leading-relaxed text-[#C9B8F5]">{doc.summary}</p>
+          </div>
+          <div class="mt-4 font-mono text-xs font-bold text-[#4CE0B3] group-hover:text-[#9EFCE4]">
+            Read document →
+          </div>
+        </a>
+      ))}
+    </div>
+  </section>
+</BaseLayout>

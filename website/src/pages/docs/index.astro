@@ -1,0 +1,111 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import { loadAllDocs } from '../../lib/docs';
+
+const base = import.meta.env.BASE_URL.endsWith('/')
+  ? import.meta.env.BASE_URL
+  : `${import.meta.env.BASE_URL}/`;
+
+const docs = loadAllDocs(base);
+
+const accentStyles = {
+  gold: 'border-[#F5B841] text-[#FFE47A]',
+  mint: 'border-[#4CE0B3] text-[#9EFCE4]',
+  violet: 'border-[#9D80EB] text-[#C9B8F5]',
+  coral: 'border-[#FF6B8B] text-[#FF6B8B]',
+};
+---
+
+<BaseLayout
+  title="Documentation Hub — mimikyu by Saengil"
+  description="Canonical architecture, security policy, SemVer release process, changelog, and contributing guides rendered directly from the mimikyu repository."
+  canonicalPath="/docs"
+  activeNav="docs"
+>
+  <section class="mx-auto max-w-6xl px-4 py-12 sm:px-6">
+    <div class="hud-frame-bright p-6 sm:p-8">
+      <div class="flex flex-wrap items-center gap-2 font-mono text-xs">
+        <span class="border border-[#4CE0B3] bg-[#120924] px-2.5 py-0.5 font-bold text-[#9EFCE4]">
+          DOCS HUB // ZERO DRIFT
+        </span>
+        <span class="border border-[#563A9E] bg-[#120924] px-2.5 py-0.5 text-[#C9B8F5]">
+          5 Canonical Root Specifications
+        </span>
+      </div>
+      <h1 class="mt-4 font-mono text-3xl font-extrabold text-[#FFE47A] sm:text-4xl">
+        mimikyu Technical Documentation
+      </h1>
+      <p class="mt-3 max-w-2xl text-sm leading-relaxed text-[#C9B8F5] sm:text-base">
+        Every guide here is compiled directly from the root Markdown files in{' '}
+        <a
+          href="https://github.com/YXZYSME/mimikyu"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="font-mono text-[#4CE0B3] underline"
+        >
+          YXZYSME/mimikyu
+        </a>{' '}
+        at static build time so website docs and repository source stay 100% synchronized.
+      </p>
+    </div>
+
+    <div class="mt-8 grid gap-5 md:grid-cols-2">
+      {docs.map((doc) => (
+        <a
+          href={`${base}docs/${doc.slug}`}
+          class="hud-card group flex flex-col justify-between p-6 transition-transform hover:-translate-y-0.5 hover:border-[#9D80EB]"
+        >
+          <div>
+            <div class="flex flex-wrap items-center justify-between gap-2">
+              <span class={`border px-2 py-0.5 font-mono text-[11px] font-bold uppercase ${accentStyles[doc.accent]}`}>
+                {doc.badge}
+              </span>
+              <span class="font-mono text-xs text-[#C9B8F5]">
+                {doc.filename} · ~{doc.readingMinutes} min read
+              </span>
+            </div>
+            <h2 class="mt-4 font-mono text-xl font-bold text-[#F4EEFF] group-hover:text-[#FFE47A]">
+              {doc.title}
+            </h2>
+            <p class="mt-2 text-sm leading-relaxed text-[#C9B8F5]">{doc.summary}</p>
+            <div class="mt-4 font-mono text-[11px] text-[#9D80EB]">
+              {doc.headings.length} indexed sections
+            </div>
+          </div>
+
+          <div class="mt-5 flex items-center justify-between border-t border-[#563A9E]/60 pt-4 font-mono text-xs">
+            <span class="font-bold text-[#4CE0B3] group-hover:text-[#9EFCE4]">Open Spec →</span>
+            <span class="text-[#C9B8F5]/80">/docs/{doc.slug}</span>
+          </div>
+        </a>
+      ))}
+    </div>
+
+    <!-- Machine-Readable & Legal Quick Links -->
+    <div class="mt-10 hud-frame flex flex-wrap items-center justify-between gap-4 p-5 font-mono text-xs">
+      <div>
+        <span class="font-bold text-[#FFE47A]">AI / Agent Discovery:</span>
+        <span class="ml-2 text-[#C9B8F5]">Structured context index for coding &amp; browsing agents</span>
+      </div>
+      <div class="flex flex-wrap gap-2">
+        <a href={`${base}llms.txt`} class="hud-btn-ghost px-3 py-1.5 font-semibold text-[#4CE0B3]">
+          /llms.txt
+        </a>
+        <a
+          href="https://github.com/YXZYSME/mimikyu/blob/main/NOTICE"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="hud-btn-ghost px-3 py-1.5 font-semibold text-[#C9B8F5]"
+        >
+          NOTICE ↗
+        </a>
+        <a
+          href={`${base}#mcp`}
+          class="hud-btn-ghost px-3 py-1.5 font-semibold text-[#9D80EB]"
+        >
+          31 MCP Tools Explorer
+        </a>
+      </div>
+    </div>
+  </section>
+</BaseLayout>

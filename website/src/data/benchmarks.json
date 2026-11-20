@@ -1,0 +1,100 @@
+{
+  "command": "mimikyu bench --iterations 3 --warmup 1 --suite all",
+  "firefoxCommand": "mimikyu bench --engine firefox --suite all --json",
+  "harness": "127.0.0.1:0 dual-origin local HTTP harness (offline, reproducible)",
+  "verifiedSuite": {
+    "rustTests": 337,
+    "rustCoreTests": 314,
+    "rustCliTests": 23,
+    "e2eTests": 244,
+    "e2eChromium": 208,
+    "e2eFirefox": 7,
+    "e2eSelfTest": 29,
+    "clippyWarnings": 0,
+    "r3Violations": 0,
+    "workflowsPassed": 5,
+    "workflowsTotal": 5
+  },
+  "latencyMetrics": [
+    {
+      "id": "snapshot",
+      "label": "Semantic @eN snapshot",
+      "detail": "Compact accessibility tree + Shadow DOM & iframe refs",
+      "chromiumMs": 5.0,
+      "firefoxMs": 19.0,
+      "unit": "ms",
+      "highlight": true
+    },
+    {
+      "id": "markdown",
+      "label": "Markdown extraction",
+      "detail": "Structured Markdown distillation from live DOM",
+      "chromiumMs": 5.4,
+      "firefoxMs": 5.5,
+      "unit": "ms",
+      "highlight": true
+    },
+    {
+      "id": "virtual_ctx",
+      "label": "Warm virtual context",
+      "detail": "Tier 2 isolated VirtualContextPool allocation",
+      "chromiumMs": 67.1,
+      "firefoxMs": 124.2,
+      "unit": "ms",
+      "highlight": false
+    },
+    {
+      "id": "batch_3step",
+      "label": "Atomic 3-step batch",
+      "detail": "Fill + click + wait in a single daemon round trip",
+      "chromiumMs": 204.2,
+      "firefoxMs": 203.5,
+      "unit": "ms",
+      "highlight": false
+    },
+    {
+      "id": "nav_idle",
+      "label": "Navigation + idle wait",
+      "detail": "Page load + network quiet + layout stability",
+      "chromiumMs": 276.9,
+      "firefoxMs": 286.7,
+      "unit": "ms",
+      "highlight": false
+    },
+    {
+      "id": "cold_launch",
+      "label": "Cold ephemeral launch",
+      "detail": "Tier 1 full process launch + isolated temp profile",
+      "chromiumMs": 203.0,
+      "firefoxMs": 1179.3,
+      "unit": "ms",
+      "highlight": false
+    }
+  ],
+  "memory": {
+    "label": "Process-tree RSS (median)",
+    "chromiumMb": 278.3,
+    "firefoxMb": 727.8,
+    "unit": "MB"
+  },
+  "tokenCompression": {
+    "rawTokens": 967,
+    "chromium": {
+      "ratio": 2.79,
+      "compressedTokens": 347,
+      "reductionPct": 64.1
+    },
+    "firefox": {
+      "ratio": 3.57,
+      "compressedTokens": 271,
+      "reductionPct": 72.0
+    }
+  },
+  "workflows": [
+    "Multi-step wizard flow",
+    "Form echo & validation",
+    "Catalog filter + structural diff + table extraction",
+    "Dynamic DOM hydration + atomic batch",
+    "Open Shadow DOM + nested/cross-origin iframes"
+  ]
+}
