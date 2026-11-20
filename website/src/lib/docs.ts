@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { Marked } from 'marked';
+import release from '../data/release.json';
 
 export interface DocMeta {
   slug: string;
@@ -61,7 +62,7 @@ export const DOCS_MANIFEST: DocMeta[] = [
     badge: 'HISTORY',
     accent: 'violet',
     summary:
-      'Keep-a-Changelog release history covering dual-engine drivers, two-tier isolation, @eN snapshots, and 31 MCP tools.',
+      `Keep-a-Changelog release history covering dual-engine drivers, two-tier isolation, @eN snapshots, and ${release.mcp.total} MCP tools.`,
   },
   {
     slug: 'contributing',

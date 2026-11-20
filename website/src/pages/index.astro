@@ -6,11 +6,14 @@ import BenchmarkChart from '../components/BenchmarkChart';
 import McpExplorer from '../components/McpExplorer';
 import ArchitectureSection from '../components/ArchitectureSection.astro';
 import benchmarks from '../data/benchmarks.json';
+import release from '../data/release.json';
 import { DOCS_MANIFEST } from '../lib/docs';
 
 const base = import.meta.env.BASE_URL.endsWith('/')
   ? import.meta.env.BASE_URL
   : `${import.meta.env.BASE_URL}/`;
+
+const agentdexEntry = String(release.mcp.total).padStart(3, '0');
 
 const kpis = [
   {
@@ -28,9 +31,9 @@ const kpis = [
     border: '#4CE0B3',
   },
   {
-    value: '31 Tools',
+    value: `${release.mcp.total} Tools`,
     label: 'Stdio MCP Server',
-    sub: '11 mimikyu_* · 20 browser_*',
+    sub: `${release.mcp.mimikyu} mimikyu_* · ${release.mcp.browser} browser_*`,
     accent: '#C9B8F5',
     border: '#9D80EB',
   },
@@ -70,13 +73,18 @@ const accentColor = {
       <div class="lg:col-span-8">
         <div class="flex flex-wrap items-center gap-2 font-mono text-xs">
           <span class="border border-[#F5B841] bg-[#22133F] px-2.5 py-0.5 font-bold text-[#FFE47A]">
-            AGENTDEX // ENTRY NO. 031
+            AGENTDEX // ENTRY NO. {agentdexEntry}
           </span>
-          <span class="border border-[#4CE0B3] bg-[#180D2E] px-2.5 py-0.5 font-semibold text-[#9EFCE4]">
-            v0.1.0 · RUST 1.88+ (EDITION 2024)
-          </span>
+          <a
+            href={release.releaseUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            class="border border-[#4CE0B3] bg-[#180D2E] px-2.5 py-0.5 font-semibold text-[#9EFCE4] transition-colors hover:bg-[#22133F]"
+          >
+            {release.tag} · RUST {release.rustVersion}+ (EDITION {release.edition})
+          </a>
           <span class="border border-[#563A9E] bg-[#180D2E] px-2.5 py-0.5 text-[#C9B8F5]">
-            MIT OR Apache-2.0
+            {release.license}
           </span>
         </div>
 
@@ -88,7 +96,7 @@ const accentColor = {
         <p class="mt-4 max-w-2xl text-base leading-relaxed text-[#C9B8F5] sm:text-lg">
           <strong class="text-[#F4EEFF]">mimikyu</strong> by <strong class="text-[#9D80EB]">Saengil</strong> is a
           single-binary native Rust browser runtime, two-tier session &amp; profile isolation layer,
-          warm Unix-socket daemon, and <strong class="text-[#FFE47A]">31-tool MCP control plane</strong> driving
+          warm Unix-socket daemon, and <strong class="text-[#FFE47A]">{release.mcp.total}-tool MCP control plane</strong> driving
           local <strong class="text-[#F4EEFF]">Chromium (CDP)</strong> and{' '}
           <strong class="text-[#F4EEFF]">Firefox (W3C WebDriver BiDi)</strong> — with zero Node.js or Python runtime overhead.
         </p>
@@ -225,15 +233,15 @@ const accentColor = {
     <img src={`${base}assets/pixel-divider.svg`} alt="" aria-hidden="true" width="960" height="24" class="pixel-art h-auto w-full opacity-90" />
   </div>
 
-  <!-- SECTION 03: 31-TOOL MCP REFERENCE EXPLORER -->
+  <!-- SECTION 03: MCP REFERENCE EXPLORER -->
   <section id="mcp" class="mx-auto max-w-6xl px-4 py-14 sm:px-6">
     <div class="mb-8 flex flex-wrap items-end justify-between gap-4">
       <div>
         <p class="font-mono text-xs font-bold uppercase tracking-widest text-[#9D80EB]">
-          03 // MCP 2024-11-05 CONTROL PLANE
+          03 // MCP {release.mcp.protocolVersion} CONTROL PLANE
         </p>
         <h2 class="mt-1 font-mono text-2xl font-extrabold text-[#F4EEFF] sm:text-3xl">
-          Interactive 31-Tool MCP Reference Explorer
+          Interactive {release.mcp.total}-Tool MCP Reference Explorer
         </h2>
         <p class="mt-2 max-w-2xl text-sm text-[#C9B8F5]">
           Search, filter by namespace (<code class="font-mono text-[#FFE47A]">mimikyu_*</code> or{' '}

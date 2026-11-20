@@ -1,6 +1,7 @@
 ---
 import BaseLayout from '../../layouts/BaseLayout.astro';
 import { loadAllDocs } from '../../lib/docs';
+import release from '../../data/release.json';
 
 const base = import.meta.env.BASE_URL.endsWith('/')
   ? import.meta.env.BASE_URL
@@ -103,7 +104,7 @@ const accentStyles = {
           href={`${base}#mcp`}
           class="hud-btn-ghost px-3 py-1.5 font-semibold text-[#9D80EB]"
         >
-          31 MCP Tools Explorer
+          {release.mcp.total} MCP Tools Explorer
         </a>
       </div>
     </div>

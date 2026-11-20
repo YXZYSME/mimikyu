@@ -1,0 +1,18 @@
+{
+  "version": "0.2.0",
+  "tag": "v0.2.0",
+  "date": "2026-11-20",
+  "rustVersion": "1.88",
+  "edition": "2024",
+  "license": "MIT OR Apache-2.0",
+  "releaseUrl": "https://github.com/YXZYSME/mimikyu/releases/tag/v0.2.0",
+  "demoReleaseTag": "v0.2.0",
+  "demoBaseUrl": "https://github.com/YXZYSME/mimikyu/releases/download/v0.2.0",
+  "mcp": {
+    "total": 33,
+    "mimikyu": 13,
+    "browser": 20,
+    "protocolVersion": "2024-11-05",
+    "registryId": "io.github.YXZYSME/mimikyu"
+  }
+}

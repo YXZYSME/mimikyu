@@ -1,7 +1,9 @@
 # mimikyu (by Saengil)
 
-> High-speed native Rust agentic browser runtime, two-tier session/profile isolation layer, warm Unix-socket daemon, and 31-tool MCP control plane driving local Chromium (CDP) and Firefox (W3C WebDriver BiDi).
+> High-speed native Rust agentic browser runtime, two-tier session/profile isolation layer, warm Unix-socket daemon, and 33-tool MCP control plane driving local Chromium (CDP) and Firefox (W3C WebDriver BiDi).
 
+- Latest Release: v0.2.0 (2026-11-20)
+- Release Notes: https://github.com/YXZYSME/mimikyu/releases/tag/v0.2.0
 - Website: https://mimikyu.saengil.ai
 - Repository: https://github.com/YXZYSME/mimikyu
 - License: MIT OR Apache-2.0
@@ -15,9 +17,10 @@
 - **2.79x–3.57x token compression** (967 -> 347 est. tokens on Chromium CDP; 967 -> 271 est. tokens on Firefox BiDi).
 - **~5.4 ms Markdown extraction** (`5.5 ms` on Firefox BiDi) and **~67.1 ms warm virtual contexts** (Tier 2 `VirtualContextPool`).
 - **Dual-Engine Native Drivers**: Native WebSocket Chromium DevTools Protocol (`driver::cdp`) and W3C WebDriver BiDi (`driver::bidi`) behind a strict `DriverSession` trait boundary.
+- **Managed Browsers & Privacy Vault**: Built-in `mimikyu browser install` (SHA-256 verified Chrome-for-Testing & Firefox), `mimikyu vault launch`, curated DNS-boundary tracker blocking (`--block-trackers`), and headless CDP screencast recording (`mimikyu record`).
 - **Two-Tier Isolation**: Tier 1 `fs2`-locked persistent profiles (`--profile`) or self-cleaning ephemeral directories (`--ephemeral`), plus Tier 2 warm pooled virtual browser contexts (`--virtual`).
 - **Coherent Environment Profiles & ProxyRelay**: Built-in `win11`, `macos`, `linux` presets, offline GeoIP alignment (`--geoip`), and an embedded local `127.0.0.1:0` `ProxyRelay` (`--proxy`) supporting authenticated HTTP/SOCKS5 upstreams without exposing credentials in browser flags.
-- **31 Turnkey MCP Tools**: 11 `mimikyu_*` tools + 20 `browser_*` tools over stdio JSON-RPC 2.0.
+- **33 Turnkey MCP Tools**: 13 `mimikyu_*` tools (including R3-compliant human-in-the-loop takeover) + 20 `browser_*` tools over stdio JSON-RPC 2.0.
 - **Verified Suite**: 337 Rust tests (0 Clippy warnings) + 244 opaque-box Python E2E tests (5/5 agentic workflows passing on both Chromium and Firefox).
 
 ## Official Package Registries
@@ -66,27 +69,29 @@
 }
 ```
 
-## 31 MCP Tools
+## 33 MCP Tools
 
-### `mimikyu_*` Namespace (11 tools)
+### `mimikyu_*` Namespace (13 tools)
 - `mimikyu_session_new`: Create a new isolated browser session
 - `mimikyu_session_close`: Close an active browser session and clean up its resources
 - `mimikyu_open`: Navigate an existing session to a URL
-- `mimikyu_snapshot`: Capture a compact `@eN` semantic accessibility tree snapshot
-- `mimikyu_click`: Click an element by `@eN` ref or CSS selector
-- `mimikyu_fill`: Clear and fill a form field by `@eN` ref or CSS selector
-- `mimikyu_extract`: Extract structured content (`markdown`, `text`, `links`, or `tables`)
+- `mimikyu_snapshot`: Capture a compact @eN semantic accessibility tree snapshot
+- `mimikyu_click`: Click an element by @eN ref or CSS selector
+- `mimikyu_fill`: Clear and fill a form field by @eN ref or CSS selector
+- `mimikyu_extract`: Extract structured content (markdown, text, links, or tables) from the current page
 - `mimikyu_wait`: Wait for page idle, text, URL substring, or selector state
 - `mimikyu_batch`: Execute an ordered sequence of browser actions in a single call
 - `mimikyu_eval`: Evaluate JavaScript in isolated world or opt-in main world
 - `mimikyu_screenshot`: Capture a PNG screenshot of the viewport, full page, or target element
+- `mimikyu_request_human_takeover`: Pause automated input mutations on a session so a human can legitimately complete login, 2FA, payment, or verification in the browser window
+- `mimikyu_resume_from_human`: Resume automated session execution after human takeover completes and invalidate stale snapshot refs
 
 ### `browser_*` Namespace (20 tools)
 - `browser_open`, `browser_close`, `browser_snapshot`, `browser_click`, `browser_fill`, `browser_type`, `browser_press`, `browser_select`, `browser_upload`, `browser_scroll`, `browser_eval`, `browser_extract`, `browser_screenshot`, `browser_wait`, `browser_batch`, `browser_context_list`, `browser_context_close`, `browser_profile_export`, `browser_profile_import`, `browser_env_report`
 
 ## Scope & R3 Compliance Boundary
 
-`mimikyu` is strictly a general-purpose AI-agent browser automation, session/profile isolation, and environment consistency runtime. It intentionally excludes any CAPTCHA solver, human-verification challenge bypass, proof-of-work circumvention, or anti-bot gate bypass functionality.
+`mimikyu` is strictly a general-purpose AI-agent browser automation, session/profile isolation, and environment consistency runtime. It intentionally excludes any CAPTCHA solver, human-verification challenge bypass, proof-of-work circumvention, or anti-bot gate bypass functionality. Human-in-the-loop takeover (`mimikyu_request_human_takeover` / `mimikyu_resume_from_human`) pauses automation so a human can complete legitimate login, 2FA, payment, or verification steps directly.
 
 ## Documentation URLs
 

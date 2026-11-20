@@ -1,18 +1,30 @@
 name: Deploy Website to GitHub Pages
 
 on:
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
   push:
     branches:
       - main
     paths:
       - "website/**"
       - ".github/workflows/pages.yml"
+      - "scripts/verify-release-registries.sh"
+      - "Cargo.toml"
+      - "server.json"
       - "ARCHITECTURE.md"
       - "SECURITY.md"
       - "RELEASE.md"
       - "CHANGELOG.md"
       - "CONTRIBUTING.md"
   workflow_dispatch:
+    inputs:
+      verify_registries:
+        description: "Verify all 10 public release channels before deploying"
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -25,11 +37,21 @@ concurrency:
 
 jobs:
   build:
-    name: Build Astro Website
+    name: Verify & Build Astro Website
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Verify all 10 release channels are live
+        if: ${{ github.event_name == 'workflow_run' || (github.event_name == 'workflow_dispatch' && inputs.verify_registries) }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          sh scripts/verify-release-registries.sh --retries 8 --delay 15
 
       - name: Set up Node.js 24
         uses: actions/setup-node@v4
@@ -45,14 +67,29 @@ jobs:
         working-directory: website
         run: npm ci
 
+      - name: Security audit website dependencies
+        working-directory: website
+        run: npm audit --audit-level=high
+
+      - name: Sync release metadata & llms.txt
+        working-directory: website
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm run sync
+
+      - name: TypeScript typecheck
+        working-directory: website
+        run: npx tsc --noEmit
+
       - name: Build static site
         working-directory: website
         env:
           SITE_URL: https://mimikyu.saengil.ai
           BASE_PATH: /
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm run build
 
-      - name: Verify required build artifacts
+      - name: Verify required build artifacts & synced version
         working-directory: website
         run: |
           test -f dist/index.html
@@ -60,6 +97,15 @@ jobs:
           test -f dist/og-card.png
           test -f dist/llms.txt
           test -f dist/CNAME
+          grep -Fqx "mimikyu.saengil.ai" dist/CNAME
+          SYNCED_TAG=$(node --input-type=module -e 'import fs from "node:fs"; console.log(JSON.parse(fs.readFileSync("./src/data/release.json", "utf8")).tag)')
+          SYNCED_TOOLS=$(node --input-type=module -e 'import fs from "node:fs"; console.log(JSON.parse(fs.readFileSync("./src/data/release.json", "utf8")).mcp.total)')
+          echo "Verifying rendered output for ${SYNCED_TAG} (${SYNCED_TOOLS} MCP tools)"
+          grep -Fq "${SYNCED_TAG}" dist/index.html
+          grep -Fq "${SYNCED_TOOLS} Tools" dist/index.html
+          grep -Fq "MCP (${SYNCED_TOOLS})" dist/index.html
+          grep -Fq "${SYNCED_TAG}" dist/llms.txt
+          grep -Fq "${SYNCED_TOOLS} MCP Tools" dist/llms.txt
 
       - name: Upload GitHub Pages artifact
         uses: actions/upload-pages-artifact@v3
@@ -67,7 +113,7 @@ jobs:
           path: website/dist
 
   deploy:
-    name: Deploy to GitHub Pages
+    name: Deploy Website (GitHub Pages + Cloudflare Hook)
     needs: build
     runs-on: ubuntu-latest
     environment:
@@ -77,3 +123,23 @@ jobs:
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
+
+      - name: Trigger Cloudflare Pages deploy hook (mimikyu.saengil.ai)
+        env:
+          CLOUDFLARE_DEPLOY_HOOK_URL: ${{ secrets.CLOUDFLARE_DEPLOY_HOOK_URL }}
+        run: |
+          if [ -n "${CLOUDFLARE_DEPLOY_HOOK_URL:-}" ]; then
+            echo "Triggering Cloudflare Pages production rebuild for mimikyu.saengil.ai..."
+            curl -fsS -X POST "${CLOUDFLARE_DEPLOY_HOOK_URL}" >/dev/null
+            echo "Cloudflare Pages deploy hook triggered successfully."
+          else
+            echo "Note: CLOUDFLARE_DEPLOY_HOOK_URL secret is not configured; Cloudflare Pages builds via its Git integration."
+          fi
+
+      - name: Post-deploy health check (mimikyu.saengil.ai)
+        run: |
+          STATUS=$(curl -fsS -o /dev/null -w '%{http_code}' --max-time 20 https://mimikyu.saengil.ai || echo "000")
+          echo "https://mimikyu.saengil.ai HTTP status: ${STATUS}"
+          if [ "${STATUS}" != "200" ]; then
+            echo "::warning::https://mimikyu.saengil.ai returned HTTP ${STATUS}"
+          fi

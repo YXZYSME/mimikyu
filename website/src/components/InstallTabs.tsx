@@ -1,4 +1,5 @@
 import { useState } from 'preact/hooks';
+import release from '../data/release.json';
 
 interface RegistryOption {
   id: string;
@@ -38,7 +39,7 @@ const REGISTRIES: RegistryOption[] = [
       {
         id: 'attest',
         label: 'Verify SLSA Attestation',
-        code: 'curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- --version v0.1.0 --verify-attestation',
+        code: `curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- --version ${release.tag} --verify-attestation`,
       },
     ],
     code: 'curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh',
@@ -148,8 +149,8 @@ mimikyu doctor`,
   {
     id: 'mcp',
     label: 'MCP JSON',
-    sublabel: '31 Stdio Tools',
-    badge: 'MCP 2024-11-05',
+    sublabel: `${release.mcp.total} Stdio Tools`,
+    badge: `MCP ${release.mcp.protocolVersion}`,
     accent: '#9D80EB',
     registryUrl:
       'https://registry.modelcontextprotocol.io/v0/servers?search=io.github.YXZYSME/mimikyu',
