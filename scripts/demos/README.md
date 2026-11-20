@@ -9,6 +9,7 @@ Self-contained, offline, reproducible demo video and animated WebP pipeline driv
   - `/parity` + `/iframe-panel`: Light DOM + Open Shadow DOM (`<mimikyu-vault>`) + embedded `<iframe>` workbench.
   - Both routes include a lightweight demo-only glowing SVG cursor, curved Bézier trail, and click-ripple overlay triggered by real `pointermove` / `pointerdown` events from `mimikyu --humanize`.
 - [`record_demos.py`](record_demos.py): Live capture + 1280×720 HUD compositor driving real Chromium (CDP) and Firefox (W3C WebDriver BiDi) sessions via `mimikyu`, rendering synchronized dark `#0E071C` terminal panes + real measured latencies + live browser frames, and encoding H.264 `.mp4`, looping `.webp`, and `.png` posters.
+- [`record_raw_live.py`](record_raw_live.py): **100% raw, unstylized browser screencast** using `mimikyu record start/stop` (CDP `Page.startScreencast`) with zero HUD overlays or synthetic cursors across real public websites (`github.com/YXZYSME/mimikyu`, `crates.io/crates/mimikyu`, `pypi.org/project/mimikyu/`, `news.ycombinator.com`).
 
 ## Prerequisites
 
