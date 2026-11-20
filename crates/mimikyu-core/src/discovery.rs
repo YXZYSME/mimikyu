@@ -16,6 +16,7 @@ use crate::error::{MimikyuError, Result};
 
 pub const ENV_CHROMIUM_PATH: &str = "MIMIKYU_CHROMIUM_PATH";
 pub const ENV_FIREFOX_PATH: &str = "MIMIKYU_FIREFOX_PATH";
+pub const ENV_MANAGED_BROWSERS_DIR: &str = "MIMIKYU_BROWSERS_DIR";
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_millis(5000);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,10 +34,26 @@ pub enum ChromiumFlavor {
 pub enum DiscoverySource {
     Override,
     EnvOverride,
+    MimikyuManaged,
     PlaywrightCache,
     PuppeteerCache,
     SystemInstall,
     Path,
+}
+
+/// Return the directory where `mimikyu browser install` stores managed browser runtimes.
+///
+/// Defaults to `<data_local_dir>/mimikyu/browsers` (or `MIMIKYU_BROWSERS_DIR` when set).
+pub fn managed_browsers_dir() -> PathBuf {
+    if let Ok(custom) = env::var(ENV_MANAGED_BROWSERS_DIR) {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    dirs::data_local_dir()
+        .map(|d| d.join("mimikyu").join("browsers"))
+        .unwrap_or_else(|| env::temp_dir().join("mimikyu").join("browsers"))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -72,7 +89,8 @@ pub struct DoctorReport {
 /// Precedence:
 /// 1. Explicit `override_path` (from `LaunchOptions.binary_path`)
 /// 2. `MIMIKYU_CHROMIUM_PATH` / `MIMIKYU_FIREFOX_PATH` env override
-/// 3. Local caches (Playwright, Puppeteer) and system/PATH installs sorted newest-first
+/// 3. Mimikyu-managed browser installs (`<data_local_dir>/mimikyu/browsers/`, newest-first)
+/// 4. Local caches (Playwright, Puppeteer) and system/PATH installs sorted newest-first
 ///
 /// Never passes `--help` (which hangs `chrome-headless-shell`); probes only `--version`
 /// inside an isolated process group (`setpgid(0, 0)`) with a 5000ms timeout.
@@ -146,7 +164,7 @@ pub fn discover_browser(
     }
 
     Err(MimikyuError::BrowserNotFound(format!(
-        "no local {engine} binary found (checked Playwright/Puppeteer caches, standard install paths, and PATH; set {env_var} to override)"
+        "no local {engine} binary found (checked Mimikyu managed dir, Playwright/Puppeteer caches, standard install paths, and PATH; run `mimikyu browser install {engine}` or set {env_var})"
     )))
 }
 
@@ -792,8 +810,122 @@ fn system_firefox_paths() -> &'static [&'static str] {
     }
 }
 
+fn managed_chromium_subpaths() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        if cfg!(target_arch = "aarch64") {
+            &[
+                "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "Chromium.app/Contents/MacOS/Chromium",
+                "chrome-headless-shell-mac-arm64/chrome-headless-shell",
+                "chrome-headless-shell-mac-x64/chrome-headless-shell",
+                "chrome",
+            ]
+        } else {
+            &[
+                "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "chrome-mac/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                "Chromium.app/Contents/MacOS/Chromium",
+                "chrome-headless-shell-mac-x64/chrome-headless-shell",
+                "chrome-headless-shell-mac-arm64/chrome-headless-shell",
+                "chrome",
+            ]
+        }
+    } else if cfg!(target_arch = "aarch64") {
+        &[
+            "chrome-linux64/chrome",
+            "chrome-linux/chrome",
+            "chrome-headless-shell-linux-arm64/chrome-headless-shell",
+            "chrome-headless-shell-linux64/chrome-headless-shell",
+            "chrome",
+        ]
+    } else {
+        &[
+            "chrome-linux64/chrome",
+            "chrome-linux/chrome",
+            "chrome-headless-shell-linux64/chrome-headless-shell",
+            "chrome-headless-shell-linux-arm64/chrome-headless-shell",
+            "chrome",
+        ]
+    }
+}
+
+fn managed_firefox_subpaths() -> &'static [&'static str] {
+    if cfg!(target_os = "macos") {
+        &[
+            "Firefox.app/Contents/MacOS/firefox",
+            "Nightly.app/Contents/MacOS/firefox",
+            "firefox/Firefox.app/Contents/MacOS/firefox",
+            "firefox/Nightly.app/Contents/MacOS/firefox",
+            "firefox/firefox",
+            "firefox",
+        ]
+    } else {
+        &[
+            "firefox/firefox",
+            "firefox",
+            "Firefox.app/Contents/MacOS/firefox",
+            "Nightly.app/Contents/MacOS/firefox",
+        ]
+    }
+}
+
+/// Collect candidate binary paths under a Mimikyu-managed browsers directory, sorted newest-first.
+pub fn collect_managed_candidates(root: &Path, engine: EngineKind) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    match engine {
+        EngineKind::Chromium => {
+            for dir in sorted_prefixed_dirs(root, "chromium-") {
+                for sub in managed_chromium_subpaths() {
+                    out.push(dir.join(sub));
+                }
+            }
+            for dir in sorted_versioned_dirs(&root.join("chromium")) {
+                for sub in managed_chromium_subpaths() {
+                    out.push(dir.join(sub));
+                }
+            }
+            for dir in sorted_prefixed_dirs(root, "chrome-headless-shell-") {
+                for sub in puppeteer_headless_shell_subpaths() {
+                    out.push(dir.join(sub));
+                }
+                out.push(dir.join("chrome-headless-shell"));
+            }
+            for dir in sorted_versioned_dirs(&root.join("chrome-headless-shell")) {
+                for sub in puppeteer_headless_shell_subpaths() {
+                    out.push(dir.join(sub));
+                }
+                out.push(dir.join("chrome-headless-shell"));
+            }
+        }
+        EngineKind::Firefox => {
+            for dir in sorted_prefixed_dirs(root, "firefox-") {
+                for sub in managed_firefox_subpaths() {
+                    out.push(dir.join(sub));
+                }
+            }
+            for dir in sorted_versioned_dirs(&root.join("firefox")) {
+                for sub in managed_firefox_subpaths() {
+                    out.push(dir.join(sub));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn collect_candidates(engine: EngineKind) -> Vec<(PathBuf, DiscoverySource)> {
     let mut out = Vec::new();
+
+    // 0. Mimikyu-managed browser installs (<data_local_dir>/mimikyu/browsers/), prioritized right after EnvOverride.
+    let managed_root = managed_browsers_dir();
+    for path in collect_managed_candidates(&managed_root, engine) {
+        out.push((path, DiscoverySource::MimikyuManaged));
+    }
 
     match engine {
         EngineKind::Chromium => {
@@ -1111,6 +1243,31 @@ Version=99.9.9
         assert_eq!(
             parse_firefox_info_plist(plist_info_only).as_deref(),
             Some("Firefox & Nightly 1.0")
+        );
+    }
+
+    #[test]
+    fn collect_managed_candidates_orders_newest_first_for_chromium_and_firefox() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("chromium-134.0.6998.35")).unwrap();
+        fs::create_dir_all(dir.path().join("chromium-136.0.7103.92")).unwrap();
+        fs::create_dir_all(dir.path().join("firefox-137.0")).unwrap();
+        fs::create_dir_all(dir.path().join("firefox-138.0.1")).unwrap();
+
+        let cr = collect_managed_candidates(dir.path(), EngineKind::Chromium);
+        assert!(!cr.is_empty());
+        assert!(
+            cr[0].to_string_lossy().contains("chromium-136.0.7103.92"),
+            "expected newest chromium version first, got {:?}",
+            cr[0]
+        );
+
+        let ff = collect_managed_candidates(dir.path(), EngineKind::Firefox);
+        assert!(!ff.is_empty());
+        assert!(
+            ff[0].to_string_lossy().contains("firefox-138.0.1"),
+            "expected newest firefox version first, got {:?}",
+            ff[0]
         );
     }
 }

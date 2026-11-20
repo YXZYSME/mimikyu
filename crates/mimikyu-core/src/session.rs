@@ -11,8 +11,8 @@ use serde_json::Value;
 
 use crate::driver::{
     driver_for, now_ms, ContextOptions, DriverSession, EngineKind, EnvProfile, LaunchOptions,
-    NavInfo, OriginStorage, ProfileMode, ProxyConfig, ScreenshotFormat, SelectBy, StorageState,
-    WebRtcPolicy,
+    NavInfo, OriginStorage, ProfileMode, ProxyConfig, ScreencastOptions, ScreencastStatus,
+    ScreenshotFormat, SelectBy, StorageState, WebRtcPolicy,
 };
 use crate::env_profile::{validate_profile, CoherenceReport, EnvProfileBuilder, PresetKind};
 use crate::error::{MimikyuError, Result};
@@ -94,6 +94,10 @@ pub struct SessionCreateOpts {
     #[serde(default)]
     pub block_fonts: bool,
     #[serde(default)]
+    pub block_trackers: bool,
+    #[serde(default)]
+    pub privacy_mode: bool,
+    #[serde(default)]
     pub instant_animations: bool,
     #[serde(default)]
     pub humanize: bool,
@@ -120,6 +124,8 @@ impl Default for SessionCreateOpts {
             block_images: false,
             block_media: false,
             block_fonts: false,
+            block_trackers: false,
+            privacy_mode: false,
             instant_animations: false,
             humanize: false,
             main_world_eval: false,
@@ -137,6 +143,22 @@ pub struct SessionSummary {
     pub title: String,
     pub pid: Option<u32>,
     pub created_at_ms: u64,
+    #[serde(default)]
+    pub paused_for_human: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PauseStatus {
+    pub session_id: String,
+    pub paused_for_human: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paused_at_ms: Option<u64>,
+    pub url: String,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -260,15 +282,35 @@ struct ManagedSession {
     snapshot_state: SnapshotState,
     default_humanize: bool,
     block_policy: BlockPolicy,
+    privacy_mode: bool,
     instant_animations: bool,
     main_world_eval: bool,
     env_profile: Option<EnvProfile>,
     coherence_report: Option<CoherenceReport>,
     proxy_redacted: Option<String>,
+    paused_for_human: bool,
+    pause_reason: Option<String>,
+    paused_at_ms: Option<u64>,
     disposed: bool,
 }
 
 impl ManagedSession {
+    fn ensure_not_paused(&self) -> Result<()> {
+        if self.paused_for_human {
+            return Err(MimikyuError::PausedForHuman {
+                session_id: self.summary.session_id.clone(),
+                reason: self.pause_reason.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    fn sync_pause_meta(&mut self) {
+        self.summary.paused_for_human = self.paused_for_human;
+        self.summary.pause_reason = self.pause_reason.clone();
+        *self.meta.write() = self.summary.clone();
+    }
+
     fn sync_nav_meta(&mut self, url: String, title: String) {
         self.summary.url = url;
         self.summary.title = title;
@@ -445,10 +487,12 @@ impl SessionManager {
             }
         };
 
+        let effective_block_trackers = opts.block_trackers || opts.privacy_mode;
         let block_policy = BlockPolicy {
             block_images: opts.block_images,
             block_media: opts.block_media,
             block_fonts: opts.block_fonts,
+            block_trackers: effective_block_trackers,
             blocked_urls: Vec::new(),
         };
 
@@ -472,6 +516,8 @@ impl SessionManager {
                 block_images: opts.block_images,
                 block_media: opts.block_media,
                 block_fonts: opts.block_fonts,
+                block_trackers: effective_block_trackers,
+                privacy_mode: opts.privacy_mode,
                 instant_animations: opts.instant_animations,
                 main_world_eval: opts.main_world_eval,
                 permissions: Vec::new(),
@@ -507,6 +553,8 @@ impl SessionManager {
                 block_images: opts.block_images,
                 block_media: opts.block_media,
                 block_fonts: opts.block_fonts,
+                block_trackers: effective_block_trackers,
+                privacy_mode: opts.privacy_mode,
                 instant_animations: opts.instant_animations,
                 main_world_eval: opts.main_world_eval,
                 telemetry_capacity: self.config.default_telemetry_capacity,
@@ -567,6 +615,8 @@ impl SessionManager {
             title,
             pid: dedicated_pid,
             created_at_ms: now_ms(),
+            paused_for_human: false,
+            pause_reason: None,
         };
 
         let mut chokepoint = ChokepointInput::new(Arc::clone(&driver));
@@ -586,11 +636,15 @@ impl SessionManager {
             snapshot_state: SnapshotState::default(),
             default_humanize: opts.humanize,
             block_policy,
+            privacy_mode: opts.privacy_mode,
             instant_animations: opts.instant_animations,
             main_world_eval: opts.main_world_eval,
             env_profile,
             coherence_report,
             proxy_redacted,
+            paused_for_human: false,
+            pause_reason: None,
+            paused_at_ms: None,
             disposed: false,
         };
 
@@ -735,6 +789,103 @@ impl SessionManager {
         .ok_or_else(|| MimikyuError::NotFound(format!("session '{session_id}' not found")))?;
 
         dispose_session_entry(entry).await
+    }
+
+    pub async fn pause_session(
+        &self,
+        session_id: &str,
+        reason: Option<String>,
+    ) -> Result<PauseStatus> {
+        let entry = self.lookup_session(session_id)?;
+        let mut managed = entry.handle.lock().await;
+        if managed.disposed {
+            return Err(MimikyuError::Disposed);
+        }
+        let cleaned_reason = reason
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty());
+        let ts = now_ms();
+        managed.paused_for_human = true;
+        managed.pause_reason = cleaned_reason.clone();
+        managed.paused_at_ms = Some(ts);
+        managed.refresh_meta_best_effort().await;
+        managed.sync_pause_meta();
+        Ok(PauseStatus {
+            session_id: managed.summary.session_id.clone(),
+            paused_for_human: true,
+            pause_reason: cleaned_reason,
+            paused_at_ms: Some(ts),
+            url: managed.summary.url.clone(),
+            title: managed.summary.title.clone(),
+        })
+    }
+
+    pub async fn takeover_session(
+        &self,
+        session_id: &str,
+        reason: Option<String>,
+    ) -> Result<PauseStatus> {
+        let effective_reason = reason
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .or_else(|| Some("human takeover requested".to_string()));
+        self.pause_session(session_id, effective_reason).await
+    }
+
+    pub async fn resume_session(&self, session_id: &str) -> Result<PauseStatus> {
+        let entry = self.lookup_session(session_id)?;
+        let mut managed = entry.handle.lock().await;
+        if managed.disposed {
+            return Err(MimikyuError::Disposed);
+        }
+        managed.paused_for_human = false;
+        managed.pause_reason = None;
+        managed.paused_at_ms = None;
+        // Invalidate snapshot refs because the human operator may have navigated or mutated the DOM.
+        managed.snapshot_state.active_ref_map.clear();
+        managed.refresh_meta_best_effort().await;
+        managed.sync_pause_meta();
+        Ok(PauseStatus {
+            session_id: managed.summary.session_id.clone(),
+            paused_for_human: false,
+            pause_reason: None,
+            paused_at_ms: None,
+            url: managed.summary.url.clone(),
+            title: managed.summary.title.clone(),
+        })
+    }
+
+    pub async fn start_screencast(
+        &self,
+        session_id: &str,
+        opts: ScreencastOptions,
+    ) -> Result<ScreencastStatus> {
+        if opts.out_dir.as_os_str().is_empty() {
+            return Err(MimikyuError::InvalidConfig(
+                "screencast out_dir cannot be empty".to_string(),
+            ));
+        }
+        if opts.out_dir.exists() && !opts.out_dir.is_dir() {
+            return Err(MimikyuError::InvalidConfig(format!(
+                "screencast out_dir '{}' exists and is not a directory",
+                opts.out_dir.display()
+            )));
+        }
+        let entry = self.lookup_session(session_id)?;
+        let managed = entry.handle.lock().await;
+        if managed.disposed {
+            return Err(MimikyuError::Disposed);
+        }
+        managed.driver.start_screencast(opts).await
+    }
+
+    pub async fn stop_screencast(&self, session_id: &str) -> Result<ScreencastStatus> {
+        let entry = self.lookup_session(session_id)?;
+        let managed = entry.handle.lock().await;
+        if managed.disposed {
+            return Err(MimikyuError::Disposed);
+        }
+        managed.driver.stop_screencast().await
     }
 
     pub async fn export_session(&self, session_id: &str, out_path: &Path) -> Result<()> {
@@ -889,6 +1040,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         let use_humanize = humanize.unwrap_or(managed.default_humanize);
         let tgt = InputTarget::parse(target);
         let opts = ClickOptions {
@@ -918,6 +1070,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         let use_humanize = humanize.unwrap_or(managed.default_humanize);
         let tgt = InputTarget::parse(target);
         let opts = FillOptions {
@@ -950,6 +1103,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         let use_humanize = humanize.unwrap_or(managed.default_humanize);
         let tgt = InputTarget::parse(target);
         let opts = TypeOptions {
@@ -976,6 +1130,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         let tgt = InputTarget::parse(target);
         managed
             .chokepoint
@@ -1007,6 +1162,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         let tgt = InputTarget::parse(target);
         managed
             .chokepoint
@@ -1036,6 +1192,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         let use_humanize = humanize.unwrap_or(managed.default_humanize);
         let opts = ScrollOptions {
             humanize: HumanizeConfig {
@@ -1062,6 +1219,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
         managed
             .chokepoint
             .press(key, &InputOptions::default())
@@ -1127,6 +1285,7 @@ impl SessionManager {
         if managed.disposed {
             return Err(MimikyuError::Disposed);
         }
+        managed.ensure_not_paused()?;
 
         let driver = Arc::clone(&managed.driver);
         let ManagedSession {
@@ -1381,6 +1540,9 @@ impl SessionManager {
             "profile": managed.env_profile,
             "proxy": managed.proxy_redacted,
             "block_policy": managed.block_policy,
+            "privacy_mode": managed.privacy_mode,
+            "paused_for_human": managed.paused_for_human,
+            "pause_reason": managed.pause_reason,
             "instant_animations": managed.instant_animations,
             "main_world_eval": managed.main_world_eval,
         }))
@@ -1748,7 +1910,7 @@ fn build_env_profile(
     if let Some((w, h)) = opts.viewport {
         builder = builder.viewport(w, h);
     }
-    if has_proxy {
+    if has_proxy || opts.privacy_mode {
         builder = builder.webrtc(WebRtcPolicy::DisableNonProxiedUdp);
     }
 

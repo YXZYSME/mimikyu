@@ -95,6 +95,10 @@ impl NetworkInterceptor {
             .set_categories(block_images, block_media, block_fonts);
     }
 
+    pub fn set_block_trackers(&mut self, enabled: bool) {
+        self.blocker.set_block_trackers(enabled);
+    }
+
     pub fn add_rule(&mut self, rule: RouteRule) -> Result<()> {
         let matcher = UrlPattern::parse(&rule.url_pattern)?;
         self.rules.retain(|r| r.rule.id != rule.id);
@@ -256,6 +260,7 @@ impl NetworkInterceptor {
             "blockImages": pol.block_images,
             "blockMedia": pol.block_media,
             "blockFonts": pol.block_fonts,
+            "blockTrackers": pol.block_trackers,
             "blockedUrls": self.blocker.compiled_url_matchers_json(),
             "rules": rules_json,
         })
@@ -336,6 +341,7 @@ mod tests {
             block_images: true,
             block_media: false,
             block_fonts: false,
+            block_trackers: false,
             blocked_urls: vec!["exact:http://127.0.0.1/deny".to_string()],
         })
         .unwrap();

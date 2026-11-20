@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::cli::{
     ContextArgs, ContextSubcommand, ProfileArgs, ProfileSubcommand, SessionArgs, SessionNewArgs,
-    SessionSubcommand,
+    SessionSubcommand, VaultArgs, VaultLaunchArgs, VaultSubcommand,
 };
 use crate::client::ExecClient;
 use crate::commands::absolutize_cli_path;
@@ -94,6 +94,148 @@ pub async fn handle_session(
                 );
             })
         }
+        SessionSubcommand::Pause { reason, session_id } => {
+            let target = session_id.as_deref().unwrap_or(global_session);
+            let data = client
+                .call(DaemonOp::SessionPause {
+                    session_id: target.to_string(),
+                    reason,
+                })
+                .await?;
+            emit_value(json_mode, &data, || {
+                let r = data["pause_reason"].as_str().unwrap_or("human interaction");
+                println!("paused session '{target}' for human takeover ({r})");
+            })
+        }
+        SessionSubcommand::Resume { session_id } => {
+            let target = session_id.as_deref().unwrap_or(global_session);
+            let data = client
+                .call(DaemonOp::SessionResume {
+                    session_id: target.to_string(),
+                })
+                .await?;
+            emit_value(json_mode, &data, || {
+                println!("resumed automated control for session '{target}'");
+            })
+        }
+        SessionSubcommand::Takeover { reason, session_id } => {
+            let target = session_id.as_deref().unwrap_or(global_session);
+            let data = client
+                .call(DaemonOp::SessionTakeover {
+                    session_id: target.to_string(),
+                    reason,
+                })
+                .await?;
+            emit_value(json_mode, &data, || {
+                let r = data["pause_reason"]
+                    .as_str()
+                    .unwrap_or("human takeover requested");
+                println!("handed session '{target}' to human operator ({r})");
+            })
+        }
+    }
+}
+
+pub fn build_vault_launch_opts(
+    args: &VaultLaunchArgs,
+    global_session: &str,
+    global_engine: Option<EngineKind>,
+) -> anyhow::Result<SessionCreateOpts> {
+    mimikyu_core::isolation::validate_profile_name(&args.name)?;
+    let preset = args
+        .preset
+        .as_deref()
+        .map(str::parse::<PresetKind>)
+        .transpose()?;
+    let viewport = args.viewport.as_deref().map(parse_viewport).transpose()?;
+    let session_id = if global_session == "default" {
+        args.name.clone()
+    } else {
+        global_session.to_string()
+    };
+    let _explicit_trackers = args.block_trackers;
+    Ok(SessionCreateOpts {
+        session_id: Some(session_id),
+        engine: global_engine,
+        profile: Some(args.name.clone()),
+        ephemeral: false,
+        virtual_ctx: false,
+        preset,
+        locale: args.locale.clone(),
+        timezone: args.timezone.clone(),
+        proxy: args.proxy.clone(),
+        geoip: args.geoip.clone(),
+        viewport,
+        block_images: false,
+        block_media: false,
+        block_fonts: false,
+        block_trackers: true,
+        privacy_mode: true,
+        instant_animations: false,
+        humanize: false,
+        main_world_eval: true,
+        headless: args.headless,
+    })
+}
+
+pub async fn handle_vault(
+    client: &ExecClient,
+    args: VaultArgs,
+    global_session: &str,
+    global_engine: Option<EngineKind>,
+    json_mode: bool,
+) -> anyhow::Result<()> {
+    match args.action {
+        VaultSubcommand::Launch(launch_args) => {
+            if let Some(ref raw_url) = launch_args.url {
+                mimikyu_core::session::validate_nav_url(raw_url)?;
+            }
+            let opts = build_vault_launch_opts(&launch_args, global_session, global_engine)?;
+            let sid = opts
+                .session_id
+                .clone()
+                .unwrap_or_else(|| launch_args.name.clone());
+            let mut data = client.call(DaemonOp::SessionNew(opts)).await?;
+            if let Some(url) = launch_args.url {
+                let nav = client
+                    .call(DaemonOp::Open {
+                        session_id: sid.clone(),
+                        url,
+                    })
+                    .await?;
+                if let Some(obj) = data.as_object_mut() {
+                    obj.insert("navigation".to_string(), nav);
+                }
+            }
+            emit_value(json_mode, &data, || {
+                println!(
+                    "launched privacy vault '{}' (session={}, engine={}, headed={})",
+                    launch_args.name,
+                    data["session_id"].as_str().unwrap_or(&sid),
+                    data["engine"].as_str().unwrap_or("unknown"),
+                    !launch_args.headless,
+                );
+            })
+        }
+        VaultSubcommand::List => {
+            let data = client.call(DaemonOp::ProfileList).await?;
+            emit_value(json_mode, &data, || {
+                if let Some(arr) = data.as_array() {
+                    if arr.is_empty() {
+                        println!("no privacy vaults");
+                    } else {
+                        for item in arr {
+                            println!(
+                                "{}\tlocked={}\t{}",
+                                item["name"].as_str().unwrap_or("-"),
+                                item["locked"].as_bool().unwrap_or(false),
+                                item["path"].as_str().unwrap_or(""),
+                            );
+                        }
+                    }
+                }
+            })
+        }
     }
 }
 
@@ -141,6 +283,8 @@ async fn run_session_new(
         block_images: args.block_images,
         block_media: args.block_media,
         block_fonts: args.block_fonts,
+        block_trackers: args.block_trackers || args.privacy_mode,
+        privacy_mode: args.privacy_mode,
         instant_animations: args.instant_animations,
         humanize: args.humanize,
         main_world_eval: true,
@@ -358,4 +502,44 @@ fn emit_value(json_mode: bool, data: &Value, human: impl FnOnce()) -> anyhow::Re
         human();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::{Cli, Commands, VaultSubcommand};
+    use clap::Parser;
+
+    #[test]
+    fn vault_launch_cli_parsing_enables_privacy_mode_headed_and_block_trackers() {
+        let cli = Cli::try_parse_from([
+            "mimikyu",
+            "vault",
+            "launch",
+            "personal",
+            "--block-trackers",
+            "--proxy",
+            "http://127.0.0.1:8080",
+            "--viewport",
+            "1440x900",
+        ])
+        .expect("parse vault launch");
+
+        let Commands::Vault(vault_args) = cli.command else {
+            panic!("expected Vault command");
+        };
+        let VaultSubcommand::Launch(launch) = vault_args.action else {
+            panic!("expected VaultSubcommand::Launch");
+        };
+
+        let opts = build_vault_launch_opts(&launch, &cli.session, cli.engine)
+            .expect("build_vault_launch_opts");
+        assert_eq!(opts.session_id.as_deref(), Some("personal"));
+        assert_eq!(opts.profile.as_deref(), Some("personal"));
+        assert!(!opts.headless, "vault launch must default to headed");
+        assert!(opts.privacy_mode);
+        assert!(opts.block_trackers);
+        assert_eq!(opts.proxy.as_deref(), Some("http://127.0.0.1:8080"));
+        assert_eq!(opts.viewport, Some((1440, 900)));
+    }
 }

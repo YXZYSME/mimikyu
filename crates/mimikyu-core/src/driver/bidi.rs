@@ -22,8 +22,8 @@ use crate::driver::{
     DriverSession, EngineKind, EnvProfile, FrameInfo, KeyEvent, KeyEventType, LaunchOptions,
     MOD_ALT, MOD_CONTROL, MOD_META, MOD_SHIFT, MouseButton, MouseEvent, MouseEventType, NavInfo,
     NetworkEvent, OriginStorage, PageError, PermissionGrant, PermissionState, ProfileMode,
-    ProxyConfig, RouteMock, ScreenshotFormat, ScreenshotOpts, SelectBy, SessionInfo, ShadowMatch,
-    StorageState, TabInfo, WheelEvent, now_ms,
+    ProxyConfig, RouteMock, ScreencastOptions, ScreencastStatus, ScreenshotFormat, ScreenshotOpts,
+    SelectBy, SessionInfo, ShadowMatch, StorageState, TabInfo, WheelEvent, now_ms,
 };
 use crate::env_profile::{
     ProxyRelay, build_firefox_shared_worker_network_clear_script,
@@ -270,6 +270,7 @@ impl BrowserDriver for BidiDriver {
                 opts.block_images,
                 opts.block_media,
                 opts.block_fonts,
+                opts.block_trackers || opts.privacy_mode,
                 opts.instant_animations,
             )
             .await
@@ -293,6 +294,7 @@ fn bidi_capabilities() -> DriverCapabilities {
         supports_closed_shadow_dom: false,
         supports_pdf: true,
         supports_network_intercept: true,
+        supports_screencast: false,
     }
 }
 
@@ -2780,6 +2782,7 @@ impl BidiSession {
         Arc::new(Self { conn, info, state })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn apply_initial_options(
         &self,
         env_profile: Option<EnvProfile>,
@@ -2787,6 +2790,7 @@ impl BidiSession {
         block_images: bool,
         block_media: bool,
         block_fonts: bool,
+        block_trackers: bool,
         instant_animations: bool,
     ) -> Result<()> {
         if let Some(profile) = env_profile {
@@ -2796,11 +2800,12 @@ impl BidiSession {
             self.set_permissions(permissions).await?;
         }
 
-        if block_images || block_media || block_fonts {
-            self.state
-                .interceptor
-                .lock()
-                .set_categories(block_images, block_media, block_fonts);
+        if block_images || block_media || block_fonts || block_trackers {
+            {
+                let mut guard = self.state.interceptor.lock();
+                guard.set_categories(block_images, block_media, block_fonts);
+                guard.set_block_trackers(block_trackers);
+            }
             self.sync_intercept().await?;
         }
         if instant_animations {
@@ -3555,6 +3560,7 @@ impl DriverSession for BidiSession {
                 opts.block_images,
                 opts.block_media,
                 opts.block_fonts,
+                opts.block_trackers || opts.privacy_mode,
                 opts.instant_animations,
             )
             .await
@@ -5424,6 +5430,24 @@ impl DriverSession for BidiSession {
         BASE64.decode(b64).map_err(|e| MimikyuError::Protocol {
             code: -1,
             message: format!("invalid base64 PDF data: {e}"),
+        })
+    }
+
+    async fn start_screencast(&self, _opts: ScreencastOptions) -> Result<ScreencastStatus> {
+        self.ensure_alive()?;
+        Err(MimikyuError::Unsupported {
+            engine: "firefox".to_string(),
+            feature: "screencast recording (use Chromium engine or periodic screenshots)"
+                .to_string(),
+        })
+    }
+
+    async fn stop_screencast(&self) -> Result<ScreencastStatus> {
+        self.ensure_alive()?;
+        Err(MimikyuError::Unsupported {
+            engine: "firefox".to_string(),
+            feature: "screencast recording (use Chromium engine or periodic screenshots)"
+                .to_string(),
         })
     }
 

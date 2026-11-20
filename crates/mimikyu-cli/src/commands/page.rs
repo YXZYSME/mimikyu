@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use mimikyu_core::daemon::DaemonOp;
+use mimikyu_core::driver::{ScreencastFormat, ScreencastOptions};
 use mimikyu_core::error::MimikyuError;
 use mimikyu_core::input::BatchReport;
 use mimikyu_core::session::{ExtractMode, LogKind, WaitRequest};
@@ -9,7 +10,7 @@ use mimikyu_core::wait::WaitSelectorState;
 use serde_json::Value;
 
 use crate::batch::load_normalized_batch_actions;
-use crate::cli::{BatchArgs, SnapshotArgs, WaitArgs};
+use crate::cli::{BatchArgs, RecordArgs, RecordSubcommand, SnapshotArgs, WaitArgs};
 use crate::client::ExecClient;
 use crate::commands::absolutize_cli_path;
 use crate::output::{format_batch_failure, print_json_ok, CliError};
@@ -435,6 +436,78 @@ pub async fn run_pdf(
             data["bytes"].as_u64().unwrap_or(0),
         );
     })
+}
+
+pub async fn handle_record(
+    client: &ExecClient,
+    session_id: &str,
+    args: RecordArgs,
+    json_mode: bool,
+) -> anyhow::Result<()> {
+    match args.action {
+        RecordSubcommand::Start {
+            out_dir,
+            format,
+            quality,
+            max_width,
+            max_height,
+            every_nth_frame,
+        } => {
+            let parsed_format = format.parse::<ScreencastFormat>()?;
+            if let Some(q) = quality
+                && (q == 0 || q > 100)
+            {
+                return Err(MimikyuError::InvalidConfig(format!(
+                    "--quality must be 1..=100, got {q}"
+                ))
+                .into());
+            }
+            if every_nth_frame == Some(0) {
+                return Err(MimikyuError::InvalidConfig(
+                    "--every-nth-frame must be >= 1".to_string(),
+                )
+                .into());
+            }
+            let out_dir = absolutize_cli_path(out_dir)?;
+            let options = ScreencastOptions {
+                out_dir,
+                format: parsed_format,
+                quality,
+                max_width,
+                max_height,
+                every_nth_frame,
+            };
+            let data = client
+                .call(DaemonOp::RecordStart {
+                    session_id: session_id.to_string(),
+                    options,
+                })
+                .await?;
+            emit_value(json_mode, &data, || {
+                println!(
+                    "recording screencast for session '{}' -> {} (format={})",
+                    session_id,
+                    data["out_dir"].as_str().unwrap_or(""),
+                    data["format"].as_str().unwrap_or("png"),
+                );
+            })
+        }
+        RecordSubcommand::Stop => {
+            let data = client
+                .call(DaemonOp::RecordStop {
+                    session_id: session_id.to_string(),
+                })
+                .await?;
+            emit_value(json_mode, &data, || {
+                println!(
+                    "stopped screencast for session '{}' ({} frames in {})",
+                    session_id,
+                    data["frame_count"].as_u64().unwrap_or(0),
+                    data["out_dir"].as_str().unwrap_or(""),
+                );
+            })
+        }
+    }
 }
 
 pub async fn run_logs(

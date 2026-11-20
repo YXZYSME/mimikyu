@@ -21,6 +21,8 @@ const EXPECTED_MIMIKYU_TOOLS: &[&str] = &[
     "mimikyu_batch",
     "mimikyu_eval",
     "mimikyu_screenshot",
+    "mimikyu_request_human_takeover",
+    "mimikyu_resume_from_human",
 ];
 
 const EXPECTED_BROWSER_TOOLS: &[&str] = &[
@@ -95,7 +97,7 @@ fn parse_tool_json(resp: &Value) -> Value {
 }
 
 #[tokio::test]
-async fn mcp_initialize_notifications_and_tools_list_31_tools() {
+async fn mcp_initialize_notifications_and_tools_list_33_tools() {
     let tmp = tempfile::tempdir().unwrap();
     let mgr = Arc::new(SessionManager::new(tmp.path().join("state")).unwrap());
 
@@ -152,7 +154,7 @@ async fn mcp_initialize_notifications_and_tools_list_31_tools() {
     let tools = list_resp["result"]["tools"]
         .as_array()
         .expect("tools array");
-    assert_eq!(tools.len(), 31, "expected 11 mimikyu_* + 20 browser_* tools");
+    assert_eq!(tools.len(), 33, "expected 13 mimikyu_* + 20 browser_* tools");
 
     let names: HashSet<&str> = tools
         .iter()
@@ -857,6 +859,129 @@ async fn mcp_browser_open_validates_url_before_session_creation_and_skips_recrea
             assert!(txt.contains("unknown ref '@e999'"), "resp={resp}");
         }
     }
+
+    drop(w);
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn mcp_human_takeover_gates_automated_input_and_resumes_cleanly() {
+    let srv = TestServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let mgr = Arc::new(SessionManager::new(tmp.path().join("state")).unwrap());
+
+    let (mut w, server_in) = tokio::io::duplex(64 * 1024);
+    let (server_out, client_out) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        serve_rw(mgr, BufReader::new(server_in), server_out).await
+    });
+    let mut r = BufReader::new(client_out);
+
+    send_line(
+        &mut w,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "browser_open",
+                "arguments": {
+                    "session": "hitl",
+                    "ephemeral": true,
+                    "privacy_mode": true,
+                    "url": srv.url("/")
+                }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(read_json_line(&mut r).await["result"]["isError"], false);
+
+    // Pause session for human takeover
+    send_line(
+        &mut w,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "mimikyu_request_human_takeover",
+                "arguments": { "session": "hitl", "reason": "complete interactive sign-in" }
+            }
+        }),
+    )
+    .await;
+    let paused_resp = read_json_line(&mut r).await;
+    assert_eq!(paused_resp["result"]["isError"], false);
+    let paused_data = parse_tool_json(&paused_resp);
+    assert_eq!(paused_data["paused_for_human"], true);
+    assert_eq!(paused_data["pause_reason"], "complete interactive sign-in");
+
+    // Automated input must fail cleanly with actionable pause error
+    send_line(
+        &mut w,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "mimikyu_click",
+                "arguments": { "session": "hitl", "target": "#btn" }
+            }
+        }),
+    )
+    .await;
+    let blocked_click = read_json_line(&mut r).await;
+    assert_eq!(blocked_click["result"]["isError"], true);
+    let err_payload = parse_tool_json(&blocked_click);
+    let err_msg = err_payload["error"].as_str().unwrap_or("");
+    assert!(
+        err_msg.contains("paused for human takeover") && err_msg.contains("complete interactive sign-in"),
+        "unexpected paused error: {err_msg}"
+    );
+
+    // Read-only snapshot remains allowed while paused
+    send_line(
+        &mut w,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": { "name": "mimikyu_snapshot", "arguments": { "session": "hitl" } }
+        }),
+    )
+    .await;
+    assert_eq!(read_json_line(&mut r).await["result"]["isError"], false);
+
+    // Resume from human and verify automated input succeeds again
+    send_line(
+        &mut w,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": { "name": "mimikyu_resume_from_human", "arguments": { "session": "hitl" } }
+        }),
+    )
+    .await;
+    let resumed_resp = read_json_line(&mut r).await;
+    assert_eq!(resumed_resp["result"]["isError"], false);
+    assert_eq!(parse_tool_json(&resumed_resp)["paused_for_human"], false);
+
+    send_line(
+        &mut w,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "mimikyu_click",
+                "arguments": { "session": "hitl", "target": "#btn" }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(read_json_line(&mut r).await["result"]["isError"], false);
 
     drop(w);
     server_task.await.unwrap().unwrap();

@@ -43,6 +43,12 @@ pub enum Commands {
     /// Discover local Chromium & Firefox binaries and check host readiness
     Doctor,
 
+    /// List, locate, or install Mimikyu-managed Chromium & Firefox browser runtimes
+    Browser(BrowserArgs),
+
+    /// Launch and manage hardened privacy browser vaults
+    Vault(VaultArgs),
+
     /// Manage or run the warm background Unix-socket daemon
     Daemon(DaemonArgs),
 
@@ -190,6 +196,9 @@ pub enum Commands {
         out: PathBuf,
     },
 
+    /// Start or stop headless screencast frame capture for a session
+    Record(RecordArgs),
+
     /// Inspect console or network telemetry logs for a session
     Logs {
         /// Log stream kind (console | network)
@@ -252,6 +261,30 @@ pub enum SessionSubcommand {
         /// Source JSON file path
         file: PathBuf,
     },
+    /// Pause automated input on a session for human interaction
+    Pause {
+        /// Reason shown to operators and automated callers while paused
+        #[arg(long)]
+        reason: Option<String>,
+        /// Optional session identifier (defaults to global --session)
+        #[arg(value_name = "SESSION_ID")]
+        session_id: Option<String>,
+    },
+    /// Resume automated input on a paused session
+    Resume {
+        /// Optional session identifier (defaults to global --session)
+        #[arg(value_name = "SESSION_ID")]
+        session_id: Option<String>,
+    },
+    /// Hand session control to a human operator (pauses automated input)
+    Takeover {
+        /// Actionable reason describing what the human operator should complete
+        #[arg(long)]
+        reason: Option<String>,
+        /// Optional session identifier (defaults to global --session)
+        #[arg(value_name = "SESSION_ID")]
+        session_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -303,6 +336,14 @@ pub struct SessionNewArgs {
     /// Block web font requests
     #[arg(long)]
     pub block_fonts: bool,
+
+    /// Block curated tracker, analytics, and ad-beacon domains
+    #[arg(long)]
+    pub block_trackers: bool,
+
+    /// Enable hardened privacy mode (tracker blocking, WebRTC IP leak protection, human-safe window flags)
+    #[arg(long)]
+    pub privacy_mode: bool,
 
     /// Accelerate CSS animations and transitions
     #[arg(long)]
@@ -447,4 +488,129 @@ pub struct BenchArgs {
     /// Benchmark suite selection (all | speed | agentic)
     #[arg(long, default_value = "all")]
     pub suite: String,
+}
+
+#[derive(Debug, Args)]
+pub struct BrowserArgs {
+    #[command(subcommand)]
+    pub action: BrowserSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BrowserSubcommand {
+    /// List all discovered local and Mimikyu-managed browser binaries
+    List,
+    /// Print the resolved binary path for an engine (chromium | firefox)
+    Path {
+        /// Browser engine (chromium | firefox)
+        #[arg(value_parser = parse_engine)]
+        engine: EngineKind,
+        /// Require a binary capable of headed GUI windows
+        #[arg(long)]
+        headed: bool,
+    },
+    /// Download and verify an official managed browser runtime into Mimikyu's local cache
+    Install {
+        /// Browser engine (chromium | firefox)
+        #[arg(value_parser = parse_engine)]
+        engine: EngineKind,
+        /// Resolve target URLs and install path without downloading or modifying disk
+        #[arg(long)]
+        dry_run: bool,
+        /// Pin a specific official release version
+        #[arg(long)]
+        version: Option<String>,
+        /// Verify archive against an explicit 64-char hex SHA-256 digest
+        #[arg(long)]
+        sha256: Option<String>,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct VaultArgs {
+    #[command(subcommand)]
+    pub action: VaultSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum VaultSubcommand {
+    /// Launch a headed privacy-hardened browser session backed by a persistent locked profile
+    Launch(VaultLaunchArgs),
+    /// List named persistent privacy vault profiles under --state-dir
+    List,
+}
+
+#[derive(Debug, Args)]
+pub struct VaultLaunchArgs {
+    /// Persistent vault profile name
+    pub name: String,
+
+    /// Optional initial URL to open after launching the vault
+    #[arg(long)]
+    pub url: Option<String>,
+
+    /// HTTP or SOCKS5 proxy URL (authenticated proxies automatically use local ProxyRelay)
+    #[arg(long)]
+    pub proxy: Option<String>,
+
+    /// Environment profile preset (win11 | macos | linux)
+    #[arg(long)]
+    pub preset: Option<String>,
+
+    /// BCP 47 locale identifier (e.g. en-US, de-DE)
+    #[arg(long)]
+    pub locale: Option<String>,
+
+    /// IANA timezone identifier (e.g. America/Chicago)
+    #[arg(long)]
+    pub timezone: Option<String>,
+
+    /// IP address for local GeoIP region alignment
+    #[arg(long)]
+    pub geoip: Option<String>,
+
+    /// Viewport dimensions in WxH format (e.g. 1280x800)
+    #[arg(long)]
+    pub viewport: Option<String>,
+
+    /// Enable built-in tracker and telemetry domain blocking (always enabled in privacy vault mode)
+    #[arg(long)]
+    pub block_trackers: bool,
+
+    /// Run headless instead of opening a visible headed browser window
+    #[arg(long)]
+    pub headless: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct RecordArgs {
+    #[command(subcommand)]
+    pub action: RecordSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecordSubcommand {
+    /// Start capturing screencast frames into an output directory
+    Start {
+        /// Directory where captured PNG/JPEG frames are written
+        #[arg(long)]
+        out_dir: PathBuf,
+        /// Frame image format (png | jpeg)
+        #[arg(long, default_value = "png")]
+        format: String,
+        /// JPEG compression quality (1..=100)
+        #[arg(long)]
+        quality: Option<u8>,
+        /// Maximum captured frame width in pixels
+        #[arg(long)]
+        max_width: Option<u32>,
+        /// Maximum captured frame height in pixels
+        #[arg(long)]
+        max_height: Option<u32>,
+        /// Capture every Nth compositor frame
+        #[arg(long)]
+        every_nth_frame: Option<u32>,
+    },
+    /// Stop an active screencast recording and report captured frame count
+    Stop,
 }

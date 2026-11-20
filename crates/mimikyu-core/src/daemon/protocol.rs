@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+use crate::driver::ScreencastOptions;
 use crate::error::{MimikyuError, Result};
 use crate::input::BatchAction;
 use crate::session::{ExtractMode, LogKind, SessionCreateOpts, SessionSummary, WaitRequest};
@@ -33,6 +34,31 @@ pub enum DaemonOp {
     SessionImport {
         session_id: String,
         in_path: PathBuf,
+    },
+    #[serde(rename = "session.pause", alias = "session_pause")]
+    SessionPause {
+        session_id: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    #[serde(rename = "session.resume", alias = "session_resume")]
+    SessionResume {
+        session_id: String,
+    },
+    #[serde(rename = "session.takeover", alias = "session_takeover")]
+    SessionTakeover {
+        session_id: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    #[serde(rename = "record.start", alias = "record_start")]
+    RecordStart {
+        session_id: String,
+        options: ScreencastOptions,
+    },
+    #[serde(rename = "record.stop", alias = "record_stop")]
+    RecordStop {
+        session_id: String,
     },
     ProfileList,
     ProfileDelete {
@@ -195,6 +221,7 @@ pub enum DaemonErrorKind {
     EvalFailed,
     MainWorldDisabled,
     Unsupported,
+    PausedForHuman,
     Disposed,
     Io,
     Internal,
@@ -266,6 +293,9 @@ impl DaemonError {
             MimikyuError::Unsupported { .. } => {
                 Self::simple(DaemonErrorKind::Unsupported, err.to_string())
             }
+            MimikyuError::PausedForHuman { .. } => {
+                Self::simple(DaemonErrorKind::PausedForHuman, err.to_string())
+            }
             MimikyuError::Disposed => Self::simple(DaemonErrorKind::Disposed, err.to_string()),
             MimikyuError::Io(e) => Self::simple(DaemonErrorKind::Io, e.to_string()),
             MimikyuError::Json(e) => Self::simple(DaemonErrorKind::InvalidConfig, e.to_string()),
@@ -320,6 +350,25 @@ impl DaemonError {
                 engine: "daemon".to_string(),
                 feature: self.message,
             },
+            DaemonErrorKind::PausedForHuman => {
+                if let Some(rest) = self.message.strip_prefix("session '")
+                    && let Some((sid, after_sid)) = rest.split_once("' is paused for human takeover")
+                {
+                    let reason = after_sid
+                        .strip_prefix(" (")
+                        .and_then(|r| r.split_once(");"))
+                        .map(|(inner, _)| inner.to_string());
+                    MimikyuError::PausedForHuman {
+                        session_id: sid.to_string(),
+                        reason,
+                    }
+                } else {
+                    MimikyuError::PausedForHuman {
+                        session_id: "unknown".to_string(),
+                        reason: Some(self.message),
+                    }
+                }
+            }
             DaemonErrorKind::Disposed => MimikyuError::Disposed,
             DaemonErrorKind::Io => MimikyuError::Io(std::io::Error::other(self.message)),
             DaemonErrorKind::Internal => MimikyuError::Transport(self.message),
@@ -523,5 +572,54 @@ mod tests {
             legacy.into_mimikyu().to_string(),
             "operation timed out after 150ms: wait_idle"
         );
+    }
+
+    #[test]
+    fn hitl_and_record_daemon_ops_and_paused_error_round_trip() {
+        let pause_req = DaemonRequest {
+            id: 7,
+            op: DaemonOp::SessionPause {
+                session_id: "s1".to_string(),
+                reason: Some("complete 2FA".to_string()),
+            },
+        };
+        let encoded = serde_json::to_string(&pause_req).unwrap();
+        assert!(encoded.contains("\"method\":\"session.pause\""), "{encoded}");
+        let decoded: DaemonRequest = serde_json::from_str(&encoded).unwrap();
+        assert!(matches!(decoded.op, DaemonOp::SessionPause { .. }));
+
+        // Also accept snake_case alias
+        let alias_dec: DaemonRequest = serde_json::from_str(
+            r#"{"id":8,"method":"session_resume","params":{"session_id":"s1"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(alias_dec.op, DaemonOp::SessionResume { .. }));
+
+        let takeover_dec: DaemonRequest = serde_json::from_str(
+            r#"{"id":9,"method":"session.takeover","params":{"session_id":"s1","reason":"login"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(takeover_dec.op, DaemonOp::SessionTakeover { .. }));
+
+        let rec_stop: DaemonRequest = serde_json::from_str(
+            r#"{"id":10,"method":"record.stop","params":{"session_id":"s1"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(rec_stop.op, DaemonOp::RecordStop { .. }));
+
+        let orig = MimikyuError::PausedForHuman {
+            session_id: "vault-1".to_string(),
+            reason: Some("confirm sign-in".to_string()),
+        };
+        let wire = DaemonError::from_mimikyu(&orig);
+        assert_eq!(wire.kind, DaemonErrorKind::PausedForHuman);
+        let roundtrip = wire.into_mimikyu();
+        match roundtrip {
+            MimikyuError::PausedForHuman { session_id, reason } => {
+                assert_eq!(session_id, "vault-1");
+                assert_eq!(reason.as_deref(), Some("confirm sign-in"));
+            }
+            other => panic!("expected PausedForHuman, got {other:?}"),
+        }
     }
 }

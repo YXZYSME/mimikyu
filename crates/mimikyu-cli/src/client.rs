@@ -90,6 +90,24 @@ async fn dispatch_direct(manager: &SessionManager, op: DaemonOp) -> Result<Value
             manager.import_session(&session_id, &in_path).await?;
             Ok(json!({ "session_id": session_id, "path": in_path }))
         }
+        DaemonOp::SessionPause { session_id, reason } => Ok(serde_json::to_value(
+            manager.pause_session(&session_id, reason).await?,
+        )?),
+        DaemonOp::SessionResume { session_id } => Ok(serde_json::to_value(
+            manager.resume_session(&session_id).await?,
+        )?),
+        DaemonOp::SessionTakeover { session_id, reason } => Ok(serde_json::to_value(
+            manager.takeover_session(&session_id, reason).await?,
+        )?),
+        DaemonOp::RecordStart {
+            session_id,
+            options,
+        } => Ok(serde_json::to_value(
+            manager.start_screencast(&session_id, options).await?,
+        )?),
+        DaemonOp::RecordStop { session_id } => Ok(serde_json::to_value(
+            manager.stop_screencast(&session_id).await?,
+        )?),
         DaemonOp::ProfileList => Ok(serde_json::to_value(manager.profile_list()?)?),
         DaemonOp::ProfileDelete { name } => {
             manager.profile_delete(&name)?;

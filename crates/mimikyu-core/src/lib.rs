@@ -1,3 +1,4 @@
+pub mod browser_install;
 pub mod discovery;
 pub mod driver;
 pub mod error;

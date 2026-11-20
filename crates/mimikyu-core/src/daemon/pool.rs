@@ -235,6 +235,29 @@ impl DaemonPool {
                 self.manager.import_session(&session_id, &in_path).await?;
                 Ok(json!({ "session_id": session_id, "path": in_path }))
             }
+            DaemonOp::SessionPause { session_id, reason } => {
+                let status = self.manager.pause_session(&session_id, reason).await?;
+                Ok(serde_json::to_value(status)?)
+            }
+            DaemonOp::SessionResume { session_id } => {
+                let status = self.manager.resume_session(&session_id).await?;
+                Ok(serde_json::to_value(status)?)
+            }
+            DaemonOp::SessionTakeover { session_id, reason } => {
+                let status = self.manager.takeover_session(&session_id, reason).await?;
+                Ok(serde_json::to_value(status)?)
+            }
+            DaemonOp::RecordStart {
+                session_id,
+                options,
+            } => {
+                let status = self.manager.start_screencast(&session_id, options).await?;
+                Ok(serde_json::to_value(status)?)
+            }
+            DaemonOp::RecordStop { session_id } => {
+                let status = self.manager.stop_screencast(&session_id).await?;
+                Ok(serde_json::to_value(status)?)
+            }
             DaemonOp::ProfileList => {
                 let profiles = self.manager.profile_list()?;
                 Ok(serde_json::to_value(profiles)?)

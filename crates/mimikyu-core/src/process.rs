@@ -454,10 +454,13 @@ pub fn build_chromium_args(
         // Mandatory on macOS so full Chrome / Chrome for Testing does not block on Keychain prompt
         "--password-store=basic".to_string(),
         "--use-mock-keychain".to_string(),
-        "--hide-scrollbars".to_string(),
-        "--mute-audio".to_string(),
         format!("--window-size={win_w},{win_h}"),
     ];
+
+    if !opts.privacy_mode {
+        args.push("--hide-scrollbars".to_string());
+        args.push("--mute-audio".to_string());
+    }
 
     if opts.headless && browser.kind != ChromiumFlavor::HeadlessShell {
         args.push("--headless=new".to_string());
@@ -589,7 +592,10 @@ pub(crate) fn append_linux_chromium_sandbox_args(
 fn effective_webrtc_policy(opts: &LaunchOptions) -> WebRtcPolicy {
     match opts.env_profile.as_ref().map(|e| e.webrtc_policy) {
         Some(policy) => policy,
-        None if opts.profile_mode == ProfileMode::VirtualContext || opts.proxy.is_some() => {
+        None if opts.privacy_mode
+            || opts.profile_mode == ProfileMode::VirtualContext
+            || opts.proxy.is_some() =>
+        {
             WebRtcPolicy::DisableNonProxiedUdp
         }
         None => WebRtcPolicy::Default,
@@ -867,6 +873,13 @@ fn strip_managed_firefox_prefs_js(profile_dir: &Path) -> Result<()> {
         "user_pref(\"browser.download.alwaysOpenPanel\",",
         "user_pref(\"browser.download.manager.showWhenStarting\",",
         "user_pref(\"browser.helperApps.neverAsk.saveToDisk\",",
+        "user_pref(\"privacy.trackingprotection.",
+        "user_pref(\"privacy.donottrackheader.enabled\",",
+        "user_pref(\"privacy.globalprivacycontrol.enabled\",",
+        "user_pref(\"network.cookie.cookieBehavior\",",
+        "user_pref(\"network.http.referer.XOriginTrimmingPolicy\",",
+        "user_pref(\"beacon.enabled\",",
+        "user_pref(\"dom.battery.enabled\",",
     ];
     let prefs_path = profile_dir.join("prefs.js");
     let content = match fs::read_to_string(&prefs_path) {
@@ -931,6 +944,17 @@ pub fn write_firefox_user_js(profile_dir: &Path, opts: &LaunchOptions) -> Result
         WebRtcPolicy::DisableAll => {
             prefs.push_str("user_pref(\"media.peerconnection.enabled\", false);\n");
         }
+    }
+
+    if opts.privacy_mode {
+        prefs.push_str("user_pref(\"privacy.trackingprotection.enabled\", true);\n");
+        prefs.push_str("user_pref(\"privacy.trackingprotection.socialtracking.enabled\", true);\n");
+        prefs.push_str("user_pref(\"privacy.donottrackheader.enabled\", true);\n");
+        prefs.push_str("user_pref(\"privacy.globalprivacycontrol.enabled\", true);\n");
+        prefs.push_str("user_pref(\"network.cookie.cookieBehavior\", 5);\n");
+        prefs.push_str("user_pref(\"network.http.referer.XOriginTrimmingPolicy\", 2);\n");
+        prefs.push_str("user_pref(\"beacon.enabled\", false);\n");
+        prefs.push_str("user_pref(\"dom.battery.enabled\", false);\n");
     }
 
     if let Some(ref proxy) = opts.proxy
@@ -1647,6 +1671,55 @@ mod tests {
         let extra = vec!["--no-sandbox".to_string()];
         append_linux_chromium_sandbox_args(&mut via_extra, &extra, true);
         assert!(!via_extra.iter().any(|a| a == "--no-sandbox"));
+    }
+
+    #[test]
+    fn privacy_mode_preserves_human_scrollbars_audio_and_hardens_webrtc_and_firefox_prefs() {
+        let cft = DiscoveredBrowser {
+            engine: EngineKind::Chromium,
+            kind: ChromiumFlavor::ChromeForTesting,
+            path: PathBuf::from("/tmp/chrome"),
+            version: "136.0".to_string(),
+            source: DiscoverySource::MimikyuManaged,
+            supports_headed: true,
+            supports_headless: true,
+        };
+        let opts_priv = LaunchOptions {
+            engine: EngineKind::Chromium,
+            headless: false,
+            privacy_mode: true,
+            ..Default::default()
+        };
+        let args = build_chromium_args(&cft, &opts_priv, Path::new("/tmp/vault"));
+        assert!(!args.contains(&"--hide-scrollbars".to_string()));
+        assert!(!args.contains(&"--mute-audio".to_string()));
+        assert!(!args.contains(&"--headless=new".to_string()));
+        assert!(args.contains(&"--disable-background-networking".to_string()));
+        assert!(args.contains(&"--disable-sync".to_string()));
+        assert!(args.contains(
+            &"--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string()
+        ));
+        assert!(args.contains(&"--enforce-webrtc-ip-permission-check".to_string()));
+
+        // Default non-privacy mode retains --hide-scrollbars and --mute-audio
+        let args_default = build_chromium_args(&cft, &LaunchOptions::default(), Path::new("/tmp/p"));
+        assert!(args_default.contains(&"--hide-scrollbars".to_string()));
+        assert!(args_default.contains(&"--mute-audio".to_string()));
+
+        // Firefox privacy_mode writes privacy hardening & ICE prefs
+        let dir = tempfile::tempdir().unwrap();
+        let ff_priv = LaunchOptions {
+            engine: EngineKind::Firefox,
+            headless: false,
+            privacy_mode: true,
+            ..Default::default()
+        };
+        write_firefox_user_js(dir.path(), &ff_priv).unwrap();
+        let content = fs::read_to_string(dir.path().join("user.js")).unwrap();
+        assert!(content.contains("user_pref(\"privacy.trackingprotection.enabled\", true);"));
+        assert!(content.contains("user_pref(\"privacy.globalprivacycontrol.enabled\", true);"));
+        assert!(content.contains("user_pref(\"network.cookie.cookieBehavior\", 5);"));
+        assert!(content.contains("user_pref(\"media.peerconnection.ice.no_host\", true);"));
     }
 }
 
