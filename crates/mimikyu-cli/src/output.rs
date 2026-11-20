@@ -105,6 +105,21 @@ pub fn print_doctor_human(report: &DoctorReport) {
             );
         }
     }
+    if !report.skipped_candidates.is_empty() {
+        println!(
+            "\nSkipped candidates ({}):",
+            report.skipped_candidates.len()
+        );
+        for s in &report.skipped_candidates {
+            println!(
+                "  - [{} / {:?}] {} (skipped: {})",
+                s.engine,
+                s.source,
+                s.path.display(),
+                s.reason
+            );
+        }
+    }
     if !report.warnings.is_empty() {
         println!("\nWarnings:");
         for w in &report.warnings {
