@@ -8,7 +8,12 @@ use crate::daemon::{parse_batch_actions, SessionListEntry};
 use crate::driver::EngineKind;
 use crate::env_profile::PresetKind;
 use crate::error::MimikyuError;
-use crate::session::{ExtractMode, SessionCreateOpts, SessionManager, WaitRequest};
+use crate::input::BatchAction;
+use crate::isolation::validate_profile_name;
+use crate::session::{
+    resolve_confined_path, ExtractMode, PathConfinementMode, SessionCreateOpts, SessionManager,
+    WaitRequest, ENV_ALLOWED_ROOT,
+};
 use crate::snapshot::SnapshotOptions;
 use crate::wait::WaitSelectorState;
 
@@ -28,7 +33,7 @@ fn session_creation_properties() -> Map<String, Value> {
     props.insert("session".into(), session_prop());
     props.insert(
         "profile".into(),
-        json!({ "type": "string", "description": "Named profile or directory path for persistent storage" }),
+        json!({ "type": "string", "description": "Named profile identifier for persistent storage (alphanumeric, '.', '_', '-'; paths not allowed)" }),
     );
     props.insert(
         "ephemeral".into(),
@@ -242,7 +247,7 @@ pub fn tool_definitions() -> Vec<Value> {
     });
 
     vec![
-        // 11 mimikyu_* tools
+        // 13 mimikyu_* tools
         json!({
             "name": "mimikyu_session_new",
             "description": "Create a new isolated browser session",
@@ -311,7 +316,7 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mimikyu_request_human_takeover",
-            "description": "Pause automated input on a session and hand control to a human operator (for interactive login, 2FA, or manual review)",
+            "description": "Pause all automated session operations and hand control to a human operator (for interactive login, 2FA, or manual review); returns a takeover_id required to resume",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -323,13 +328,15 @@ pub fn tool_definitions() -> Vec<Value> {
         }),
         json!({
             "name": "mimikyu_resume_from_human",
-            "description": "Resume automated input on a session after a human operator hands back control",
+            "description": "Resume automated session operations after a human operator confirms takeover completion with the active takeover_id",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "session": session_prop()
+                    "session": session_prop(),
+                    "takeover_id": { "type": "string", "description": "Active takeover token returned by mimikyu_request_human_takeover" },
+                    "confirmed_by_human": { "type": "boolean", "description": "Explicit confirmation (must be true) that the human operator finished takeover and handed control back" }
                 },
-                "required": []
+                "required": ["takeover_id", "confirmed_by_human"]
             }
         }),
         // 20 browser_* tools
@@ -694,10 +701,50 @@ fn parse_viewport_arg(val: &Value) -> std::result::Result<(u32, u32), (i64, Stri
     }
 }
 
+fn mcp_allowed_root(manager: &SessionManager) -> std::result::Result<PathBuf, (i64, String)> {
+    if let Some(root) = manager.allowed_root() {
+        return Ok(root.to_path_buf());
+    }
+    if let Some(env_root) = std::env::var_os(ENV_ALLOWED_ROOT).filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(env_root));
+    }
+    std::env::current_dir().map_err(|e| {
+        (
+            INVALID_PARAMS,
+            format!("failed to resolve allowed workspace root: {e}"),
+        )
+    })
+}
+
+fn confine_mcp_path(
+    manager: &SessionManager,
+    raw: &str,
+    mode: PathConfinementMode,
+) -> std::result::Result<PathBuf, (i64, String)> {
+    let root = mcp_allowed_root(manager)?;
+    resolve_confined_path(Path::new(raw), &root, mode)
+        .map_err(|e| (INVALID_PARAMS, e.to_string()))
+}
+
 fn build_session_opts(
     args: &Map<String, Value>,
     session_id: String,
 ) -> std::result::Result<SessionCreateOpts, (i64, String)> {
+    let profile = match opt_str(args, "profile")? {
+        Some(raw) => {
+            let trimmed = raw.trim();
+            validate_profile_name(trimmed).map_err(|e| {
+                (
+                    INVALID_PARAMS,
+                    format!(
+                        "invalid MCP 'profile' '{raw}': only named profiles are permitted over MCP ({e})"
+                    ),
+                )
+            })?;
+            Some(trimmed.to_string())
+        }
+        None => None,
+    };
     let engine = match opt_str(args, "engine")? {
         Some(raw) => Some(
             raw.parse::<EngineKind>()
@@ -720,7 +767,7 @@ fn build_session_opts(
     Ok(SessionCreateOpts {
         session_id: Some(session_id),
         engine,
-        profile: opt_str(args, "profile")?.map(str::to_string),
+        profile,
         ephemeral: opt_bool(args, "ephemeral")?.unwrap_or(false),
         virtual_ctx: opt_bool(args, "virtual")?.unwrap_or(false),
         preset,
@@ -812,7 +859,8 @@ async fn handle_batch_tool(
             .map_err(|e| (INVALID_PARAMS, format!("invalid JSON in 'ops': {e}")))?,
         (Some(v), None) => v.clone(),
         (None, Some(path)) => {
-            let text = std::fs::read_to_string(path).map_err(|e| {
+            let safe_file = confine_mcp_path(manager, path, PathConfinementMode::ExistingFile)?;
+            let text = std::fs::read_to_string(&safe_file).map_err(|e| {
                 (
                     INVALID_PARAMS,
                     format!("failed to read batch file '{path}': {e}"),
@@ -827,7 +875,17 @@ async fn handle_batch_tool(
         }
     };
 
-    let actions = parse_batch_actions(raw).map_err(|e| (INVALID_PARAMS, e.to_string()))?;
+    let mut actions = parse_batch_actions(raw).map_err(|e| (INVALID_PARAMS, e.to_string()))?;
+    let mcp_root = mcp_allowed_root(manager)?;
+    for action in &mut actions {
+        if let BatchAction::Upload { files, .. } = action {
+            for file in files.iter_mut() {
+                *file = resolve_confined_path(file, &mcp_root, PathConfinementMode::ExistingFile)
+                    .map_err(|e| (INVALID_PARAMS, e.to_string()))?;
+            }
+        }
+    }
+
     match manager.batch(session_id, actions).await {
         Ok(report) => {
             let is_err = !report.ok;
@@ -852,37 +910,21 @@ async fn handle_screenshot_tool(
     let full_page = opt_bool(args, "full_page")?.unwrap_or(false);
 
     if let Some(path) = out_path {
+        let safe_out = confine_mcp_path(manager, path, PathConfinementMode::OutputFile)?;
         return map_session_result(
             manager
-                .screenshot(session_id, Path::new(path), target, full_page)
+                .screenshot(session_id, &safe_out, target, full_page)
                 .await,
         );
     }
 
-    let tmp = tempfile::Builder::new()
-        .prefix("mimikyu-mcp-shot-")
-        .suffix(".png")
-        .tempfile()
-        .map_err(|e| (INVALID_PARAMS, format!("failed to allocate temp screenshot file: {e}")))?;
-    let tmp_path = tmp.path().to_path_buf();
-    let res = manager
-        .screenshot(session_id, &tmp_path, target, full_page)
-        .await;
-
-    match res {
-        Ok(info) => {
-            let bytes = std::fs::read(&tmp_path).map_err(|e| {
-                (
-                    INVALID_PARAMS,
-                    format!("failed to read captured screenshot: {e}"),
-                )
-            })?;
-            drop(tmp);
+    match manager.screenshot_bytes(session_id, target, full_page).await {
+        Ok((bytes, width, height)) => {
             let b64 = BASE64.encode(&bytes);
             let meta = json!({
-                "width": info.width,
-                "height": info.height,
-                "bytes": info.bytes
+                "width": width,
+                "height": height,
+                "bytes": bytes.len()
             });
             Ok(json!({
                 "content": [
@@ -1037,7 +1079,8 @@ pub async fn call_tool(manager: &SessionManager, name: &str, arguments: Value) -
             let session_id = resolve_session_id(&args)?;
             let target = req_str(&args, "target")?;
             let path = req_str(&args, "path")?;
-            match manager.upload(&session_id, target, PathBuf::from(path)).await {
+            let safe_path = confine_mcp_path(manager, path, PathConfinementMode::ExistingFile)?;
+            match manager.upload(&session_id, target, safe_path).await {
                 Ok(()) => call_ok_json(json!({ "uploaded": target })),
                 Err(MimikyuError::InvalidConfig(msg)) => Err((INVALID_PARAMS, msg)),
                 Err(err) => call_err_text(err.to_string()),
@@ -1096,7 +1139,27 @@ pub async fn call_tool(manager: &SessionManager, name: &str, arguments: Value) -
         }
         "mimikyu_resume_from_human" => {
             let session_id = resolve_session_id(&args)?;
-            map_session_result(manager.resume_session(&session_id).await)
+            let takeover_id = req_str(&args, "takeover_id")?;
+            let confirmed_by_human = match args.get("confirmed_by_human") {
+                Some(Value::Bool(b)) => *b,
+                Some(_) => {
+                    return Err((
+                        INVALID_PARAMS,
+                        "'confirmed_by_human' must be a boolean".to_string(),
+                    ));
+                }
+                None => {
+                    return Err((
+                        INVALID_PARAMS,
+                        "missing required argument 'confirmed_by_human'".to_string(),
+                    ));
+                }
+            };
+            map_session_result(
+                manager
+                    .resume_session_confirmed(&session_id, takeover_id, confirmed_by_human)
+                    .await,
+            )
         }
         "browser_context_list" => {
             let entries: Vec<SessionListEntry> = manager
@@ -1133,7 +1196,8 @@ pub async fn call_tool(manager: &SessionManager, name: &str, arguments: Value) -
                 .or(opt_str(&args, "path")?)
                 .or(opt_str(&args, "file")?)
                 .ok_or_else(|| (INVALID_PARAMS, "missing required argument 'out_path'".to_string()))?;
-            match manager.export_session(&session_id, Path::new(out_path)).await {
+            let safe_out = confine_mcp_path(manager, out_path, PathConfinementMode::OutputFile)?;
+            match manager.export_session(&session_id, &safe_out).await {
                 Ok(()) => call_ok_json(json!({ "session_id": session_id, "out_path": out_path })),
                 Err(MimikyuError::InvalidConfig(msg)) => Err((INVALID_PARAMS, msg)),
                 Err(err) => call_err_text(err.to_string()),
@@ -1145,7 +1209,8 @@ pub async fn call_tool(manager: &SessionManager, name: &str, arguments: Value) -
                 .or(opt_str(&args, "path")?)
                 .or(opt_str(&args, "file")?)
                 .ok_or_else(|| (INVALID_PARAMS, "missing required argument 'in_path'".to_string()))?;
-            match manager.import_session(&session_id, Path::new(in_path)).await {
+            let safe_in = confine_mcp_path(manager, in_path, PathConfinementMode::ExistingFile)?;
+            match manager.import_session(&session_id, &safe_in).await {
                 Ok(()) => call_ok_json(json!({ "session_id": session_id, "in_path": in_path })),
                 Err(MimikyuError::InvalidConfig(msg)) => Err((INVALID_PARAMS, msg)),
                 Err(err) => call_err_text(err.to_string()),

@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -164,16 +164,27 @@ pub struct NamedProfileInfo {
     pub locked: bool,
 }
 
-/// Validates a named profile identifier (prevents path traversal or flag-like names).
+/// Validates a named profile identifier (prevents path traversal, path separators,
+/// absolute paths, or flag-like names).
 pub fn validate_profile_name(name: &str) -> Result<()> {
     if name.is_empty() || name.len() > 128 {
         return Err(MimikyuError::InvalidConfig(
             "profile name must be 1..=128 characters".to_string(),
         ));
     }
-    if name == "." || name == ".." || name.starts_with('-') {
+    if name.contains('\0') {
+        return Err(MimikyuError::InvalidConfig(
+            "profile name cannot contain NUL bytes".to_string(),
+        ));
+    }
+    if name.contains('/') || name.contains('\\') || Path::new(name).is_absolute() {
         return Err(MimikyuError::InvalidConfig(format!(
-            "invalid profile name '{name}'"
+            "profile name '{name}' cannot be an absolute path or contain path separators ('/' or '\\')"
+        )));
+    }
+    if name == "." || name == ".." || name.contains("..") || name.starts_with('-') {
+        return Err(MimikyuError::InvalidConfig(format!(
+            "invalid profile name '{name}': path traversal ('..') and flag-like names are not allowed"
         )));
     }
     if !name
@@ -185,6 +196,66 @@ pub fn validate_profile_name(name: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+fn contains_parent_traversal(spec: &str) -> bool {
+    spec.split(['/', '\\']).any(|seg| seg == "..")
+        || Path::new(spec)
+            .components()
+            .any(|c| matches!(c, Component::ParentDir))
+}
+
+fn canonicalize_base_dir(base: &Path) -> Result<PathBuf> {
+    if base.exists() {
+        let canonical = fs::canonicalize(base)?;
+        if !canonical.is_dir() {
+            return Err(MimikyuError::InvalidConfig(format!(
+                "profile store root '{}' is not a directory",
+                base.display()
+            )));
+        }
+        return Ok(canonical);
+    }
+
+    let abs = if base.is_absolute() {
+        base.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(base)
+    };
+
+    let mut existing = abs.clone();
+    let mut missing_tail = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name() else {
+            break;
+        };
+        missing_tail.push(name.to_os_string());
+        if !existing.pop() {
+            break;
+        }
+    }
+
+    let mut resolved = if existing.exists() {
+        fs::canonicalize(&existing)?
+    } else {
+        existing
+    };
+    for seg in missing_tail.into_iter().rev() {
+        resolved.push(seg);
+    }
+    Ok(resolved)
+}
+
+fn reject_symlink_leaf(path: &Path, label: &str) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(MimikyuError::InvalidConfig(format!(
+            "{label} '{}' cannot be a symlink",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(MimikyuError::Io(e)),
+    }
 }
 
 /// Manages named and path-based persistent browser profile directories.
@@ -221,6 +292,44 @@ impl ProfileStore {
         std::env::temp_dir().join("mimikyu-profiles")
     }
 
+    fn verify_named_confinement(&self, name: &str) -> Result<PathBuf> {
+        validate_profile_name(name)?;
+        let canonical_base = canonicalize_base_dir(&self.base_dir)?;
+        let candidate = self.base_dir.join(name);
+
+        reject_symlink_leaf(&candidate, &format!("named profile '{name}'"))?;
+
+        match fs::symlink_metadata(&candidate) {
+            Ok(_) => {
+                let canonical_cand = fs::canonicalize(&candidate)?;
+                if !canonical_cand.starts_with(&canonical_base)
+                    || canonical_cand == canonical_base
+                    || canonical_cand.parent() != Some(canonical_base.as_path())
+                {
+                    return Err(MimikyuError::InvalidConfig(format!(
+                        "profile '{name}' escapes profile store root '{}'",
+                        canonical_base.display()
+                    )));
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                let expected = canonical_base.join(name);
+                if !expected.starts_with(&canonical_base)
+                    || expected == canonical_base
+                    || expected.parent() != Some(canonical_base.as_path())
+                {
+                    return Err(MimikyuError::InvalidConfig(format!(
+                        "profile '{name}' escapes profile store root '{}'",
+                        canonical_base.display()
+                    )));
+                }
+            }
+            Err(e) => return Err(MimikyuError::Io(e)),
+        }
+
+        Ok(candidate)
+    }
+
     pub fn resolve(&self, name_or_path: &str) -> Result<ResolvedProfile> {
         let trimmed = name_or_path.trim();
         if trimmed.is_empty() || trimmed.contains('\0') {
@@ -228,9 +337,9 @@ impl ProfileStore {
                 "profile specifier cannot be empty or contain NUL bytes".to_string(),
             ));
         }
-        if trimmed == "." || trimmed == ".." {
+        if trimmed == "." || trimmed == ".." || contains_parent_traversal(trimmed) {
             return Err(MimikyuError::InvalidConfig(format!(
-                "invalid profile path '{trimmed}': refusing '.' or '..' as profile directory"
+                "invalid profile path '{trimmed}': path traversal ('..') and '.' are not allowed"
             )));
         }
 
@@ -252,14 +361,20 @@ impl ProfileStore {
                 .or_else(|| trimmed.strip_prefix("~\\"))
                 .unwrap_or("");
             let trimmed_rest = rest.trim_end_matches(['/', '\\']);
-            if trimmed_rest.is_empty() || trimmed_rest == "." || trimmed_rest == ".." {
+            if trimmed_rest.is_empty()
+                || trimmed_rest == "."
+                || trimmed_rest == ".."
+                || contains_parent_traversal(trimmed_rest)
+            {
                 return Err(MimikyuError::InvalidConfig(format!(
                     "invalid '~' profile path '{trimmed}'"
                 )));
             }
+            let target = home.join(rest);
+            reject_symlink_leaf(&target, "profile path")?;
             return Ok(ResolvedProfile {
                 name: None,
-                path: home.join(rest),
+                path: target,
                 is_named: false,
             });
         }
@@ -275,6 +390,7 @@ impl ProfileStore {
             } else {
                 std::env::current_dir()?.join(p)
             };
+            reject_symlink_leaf(&abs, "profile path")?;
             return Ok(ResolvedProfile {
                 name: None,
                 path: abs,
@@ -282,26 +398,43 @@ impl ProfileStore {
             });
         }
 
-        validate_profile_name(trimmed)?;
+        self.resolve_named(trimmed)
+    }
+
+    pub fn resolve_named(&self, name: &str) -> Result<ResolvedProfile> {
+        let path = self.verify_named_confinement(name)?;
         Ok(ResolvedProfile {
-            name: Some(trimmed.to_string()),
-            path: self.base_dir.join(trimmed),
+            name: Some(name.to_string()),
+            path,
             is_named: true,
         })
     }
 
-    pub fn resolve_named(&self, name: &str) -> Result<ResolvedProfile> {
-        validate_profile_name(name)?;
-        Ok(ResolvedProfile {
-            name: Some(name.to_string()),
-            path: self.base_dir.join(name),
-            is_named: true,
-        })
+    /// Resolves a strictly named profile confined inside the canonicalized profile store root.
+    /// Rejects path traversal (`..`), absolute paths, `~`, path separators (`/` / `\`), and symlinks.
+    pub fn resolve_confined_named(&self, name: &str) -> Result<ResolvedProfile> {
+        let trimmed = name.trim();
+        self.resolve_named(trimmed)
     }
 
     pub fn prepare_persistent(&self, name_or_path: &str) -> Result<PathBuf> {
         let resolved = self.resolve(name_or_path)?;
+        reject_symlink_leaf(&resolved.path, "profile path")?;
         fs::create_dir_all(&resolved.path)?;
+        if resolved.is_named {
+            let canonical_base = fs::canonicalize(&self.base_dir)?;
+            let canonical_path = fs::canonicalize(&resolved.path)?;
+            if !canonical_path.starts_with(&canonical_base)
+                || canonical_path == canonical_base
+                || canonical_path.parent() != Some(canonical_base.as_path())
+            {
+                return Err(MimikyuError::InvalidConfig(format!(
+                    "prepared profile '{}' escapes profile store root '{}'",
+                    resolved.path.display(),
+                    canonical_base.display()
+                )));
+            }
+        }
         Ok(resolved.path)
     }
 
@@ -312,10 +445,11 @@ impl ProfileStore {
         let mut out = Vec::new();
         for entry in fs::read_dir(&self.base_dir)? {
             let entry = entry?;
-            let path = entry.path();
-            if !path.is_dir() {
+            let ftype = entry.file_type()?;
+            if ftype.is_symlink() || !ftype.is_dir() {
                 continue;
             }
+            let path = entry.path();
             let Some(name) = entry.file_name().to_str().map(ToString::to_string) else {
                 continue;
             };
@@ -802,5 +936,102 @@ mod tests {
         )
         .unwrap();
         assert!(load_session_origins(dir.path()).is_err());
+    }
+
+    #[test]
+    fn profile_store_blocks_traversal_separators_and_symlink_escapes() {
+        let base = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let store = ProfileStore::new(base.path().to_path_buf());
+
+        for bad_named in [
+            "",
+            ".",
+            "..",
+            "../escape",
+            "a..b",
+            "/etc/passwd",
+            "foo/bar",
+            "foo\\bar",
+            "~/home-prof",
+            "~",
+            "-flag",
+            "bad\0name",
+        ] {
+            assert!(
+                validate_profile_name(bad_named).is_err(),
+                "validate_profile_name should reject {bad_named:?}"
+            );
+            assert!(
+                store.resolve_named(bad_named).is_err(),
+                "resolve_named should reject {bad_named:?}"
+            );
+            assert!(
+                store.resolve_confined_named(bad_named).is_err(),
+                "resolve_confined_named should reject {bad_named:?}"
+            );
+        }
+
+        // Parent traversal must also be rejected by ProfileStore::resolve for path-based specs
+        for bad_path in [
+            "../escape",
+            "./sub/../escape",
+            "~/../escape",
+            "/tmp/../etc",
+            "sub\\..\\escape",
+        ] {
+            assert!(
+                store.resolve(bad_path).is_err(),
+                "resolve should reject traversal path {bad_path:?}"
+            );
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            // Plant symlink inside profile store pointing outside
+            let escape_link = base.path().join("escape_link");
+            symlink(outside.path(), &escape_link).unwrap();
+            assert!(
+                store.resolve("escape_link").is_err(),
+                "resolve must reject symlink inside profile store"
+            );
+            assert!(
+                store.resolve_named("escape_link").is_err(),
+                "resolve_named must reject symlink inside profile store"
+            );
+            assert!(
+                store.resolve_confined_named("escape_link").is_err(),
+                "resolve_confined_named must reject symlink inside profile store"
+            );
+            assert!(
+                store.prepare_persistent("escape_link").is_err(),
+                "prepare_persistent must reject symlink inside profile store"
+            );
+            assert!(
+                store.delete_named("escape_link").is_err(),
+                "delete_named must reject symlink inside profile store"
+            );
+            assert!(
+                outside.path().exists(),
+                "outside directory must not be touched by delete_named"
+            );
+            assert!(
+                store.list_named().unwrap().is_empty(),
+                "list_named must ignore symlinks"
+            );
+
+            // Dangling symlink inside profile store pointing outside must also be rejected
+            let dangling = base.path().join("dangling_link");
+            symlink(outside.path().join("nonexistent-target"), &dangling).unwrap();
+            assert!(store.resolve_named("dangling_link").is_err());
+            assert!(store.prepare_persistent("dangling_link").is_err());
+
+            // Symlink at path-based profile leaf must also be rejected
+            let path_link = outside.path().join("path_link");
+            symlink(base.path(), &path_link).unwrap();
+            assert!(store.resolve(&path_link.to_string_lossy()).is_err());
+        }
     }
 }

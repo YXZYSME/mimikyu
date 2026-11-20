@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use mimikyu_core::mcp::serve_rw;
-use mimikyu_core::session::SessionManager;
+use mimikyu_core::session::{SessionManager, SessionManagerConfig};
 use serde_json::{json, Value};
 use support::{assert_pgid_gone, TestServer};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -239,7 +239,14 @@ async fn mcp_malformed_jsonrpc_error_codes_and_recovery() {
 async fn mcp_mimikyu_tools_end_to_end_with_default_session_and_batch_op_normalization() {
     let srv = TestServer::start().await;
     let tmp = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(SessionManager::new(tmp.path().join("state")).unwrap());
+    let mgr = Arc::new(
+        SessionManager::with_config(SessionManagerConfig {
+            state_dir: tmp.path().join("state"),
+            allowed_root: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
 
     let (mut w, server_in) = tokio::io::duplex(128 * 1024);
     let (server_out, client_out) = tokio::io::duplex(128 * 1024);
@@ -444,7 +451,14 @@ async fn mcp_mimikyu_tools_end_to_end_with_default_session_and_batch_op_normaliz
 async fn mcp_browser_tools_end_to_end_context_profile_and_env_report() {
     let srv = TestServer::start().await;
     let tmp = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(SessionManager::new(tmp.path().join("state")).unwrap());
+    let mgr = Arc::new(
+        SessionManager::with_config(SessionManagerConfig {
+            state_dir: tmp.path().join("state"),
+            allowed_root: Some(tmp.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
 
     let (mut w, server_in) = tokio::io::duplex(128 * 1024);
     let (server_out, client_out) = tokio::io::duplex(128 * 1024);
@@ -868,7 +882,15 @@ async fn mcp_browser_open_validates_url_before_session_creation_and_skips_recrea
 async fn mcp_human_takeover_gates_automated_input_and_resumes_cleanly() {
     let srv = TestServer::start().await;
     let tmp = tempfile::tempdir().unwrap();
-    let mgr = Arc::new(SessionManager::new(tmp.path().join("state")).unwrap());
+    let mgr = Arc::new(
+        SessionManager::with_config(SessionManagerConfig {
+            state_dir: tmp.path().join("state"),
+            allowed_root: Some(tmp.path().to_path_buf()),
+            require_oob_resume: false,
+            ..Default::default()
+        })
+        .unwrap(),
+    );
 
     let (mut w, server_in) = tokio::io::duplex(64 * 1024);
     let (server_out, client_out) = tokio::io::duplex(64 * 1024);
@@ -897,7 +919,7 @@ async fn mcp_human_takeover_gates_automated_input_and_resumes_cleanly() {
     .await;
     assert_eq!(read_json_line(&mut r).await["result"]["isError"], false);
 
-    // Pause session for human takeover
+    // Pause session for human takeover and capture the active takeover_id
     send_line(
         &mut w,
         &json!({
@@ -916,51 +938,90 @@ async fn mcp_human_takeover_gates_automated_input_and_resumes_cleanly() {
     let paused_data = parse_tool_json(&paused_resp);
     assert_eq!(paused_data["paused_for_human"], true);
     assert_eq!(paused_data["pause_reason"], "complete interactive sign-in");
+    assert_eq!(paused_data["confirmation_required"], true);
+    let takeover_id = paused_data["takeover_id"]
+        .as_str()
+        .expect("takeover_id returned on takeover")
+        .to_string();
+    assert!(!takeover_id.is_empty());
 
-    // Automated input must fail cleanly with actionable pause error
+    // All interaction, inspection, navigation, screenshot, and storage export calls must be blocked while paused
+    let blocked_shot_path = tmp.path().join("blocked-shot.png");
+    let blocked_export_path = tmp.path().join("blocked-export.json");
+    for (req_id, tool_name, arguments) in [
+        (3, "mimikyu_click", json!({ "session": "hitl", "target": "#btn" })),
+        (4, "mimikyu_eval", json!({ "session": "hitl", "js": "document.title" })),
+        (5, "mimikyu_snapshot", json!({ "session": "hitl" })),
+        (6, "mimikyu_extract", json!({ "session": "hitl", "mode": "text" })),
+        (7, "mimikyu_screenshot", json!({ "session": "hitl" })),
+        (8, "mimikyu_screenshot", json!({ "session": "hitl", "out_path": blocked_shot_path })),
+        (9, "mimikyu_open", json!({ "session": "hitl", "url": srv.url("/target") })),
+        (10, "browser_profile_export", json!({ "session": "hitl", "out_path": blocked_export_path })),
+    ] {
+        send_line(
+            &mut w,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": { "name": tool_name, "arguments": arguments }
+            }),
+        )
+        .await;
+        let blocked = read_json_line(&mut r).await;
+        assert_eq!(
+            blocked["result"]["isError"], true,
+            "tool {tool_name} must be blocked while paused: {blocked}"
+        );
+        let err_payload = parse_tool_json(&blocked);
+        let err_msg = err_payload["error"].as_str().unwrap_or("");
+        assert!(
+            err_msg.contains("paused for human takeover")
+                && err_msg.contains("complete interactive sign-in"),
+            "unexpected paused error for {tool_name}: {err_msg}"
+        );
+    }
+    assert!(!blocked_shot_path.exists());
+    assert!(!blocked_export_path.exists());
+
+    // Unconfirmed / missing-token / mismatched-token resume calls must fail with -32602
+    for (req_id, bad_args) in [
+        (11, json!({ "session": "hitl" })),
+        (12, json!({ "session": "hitl", "takeover_id": takeover_id, "confirmed_by_human": false })),
+        (13, json!({ "session": "hitl", "takeover_id": "tk-wrong", "confirmed_by_human": true })),
+    ] {
+        send_line(
+            &mut w,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": { "name": "mimikyu_resume_from_human", "arguments": bad_args }
+            }),
+        )
+        .await;
+        let bad_resume = read_json_line(&mut r).await;
+        assert_eq!(
+            bad_resume["error"]["code"], -32602,
+            "expected -32602 for bad resume args: {bad_resume}"
+        );
+    }
+
+    // Confirmed resume with matching takeover_id succeeds and restores operations
     send_line(
         &mut w,
         &json!({
             "jsonrpc": "2.0",
-            "id": 3,
+            "id": 14,
             "method": "tools/call",
             "params": {
-                "name": "mimikyu_click",
-                "arguments": { "session": "hitl", "target": "#btn" }
+                "name": "mimikyu_resume_from_human",
+                "arguments": {
+                    "session": "hitl",
+                    "takeover_id": takeover_id,
+                    "confirmed_by_human": true
+                }
             }
-        }),
-    )
-    .await;
-    let blocked_click = read_json_line(&mut r).await;
-    assert_eq!(blocked_click["result"]["isError"], true);
-    let err_payload = parse_tool_json(&blocked_click);
-    let err_msg = err_payload["error"].as_str().unwrap_or("");
-    assert!(
-        err_msg.contains("paused for human takeover") && err_msg.contains("complete interactive sign-in"),
-        "unexpected paused error: {err_msg}"
-    );
-
-    // Read-only snapshot remains allowed while paused
-    send_line(
-        &mut w,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": 4,
-            "method": "tools/call",
-            "params": { "name": "mimikyu_snapshot", "arguments": { "session": "hitl" } }
-        }),
-    )
-    .await;
-    assert_eq!(read_json_line(&mut r).await["result"]["isError"], false);
-
-    // Resume from human and verify automated input succeeds again
-    send_line(
-        &mut w,
-        &json!({
-            "jsonrpc": "2.0",
-            "id": 5,
-            "method": "tools/call",
-            "params": { "name": "mimikyu_resume_from_human", "arguments": { "session": "hitl" } }
         }),
     )
     .await;
@@ -972,7 +1033,7 @@ async fn mcp_human_takeover_gates_automated_input_and_resumes_cleanly() {
         &mut w,
         &json!({
             "jsonrpc": "2.0",
-            "id": 6,
+            "id": 15,
             "method": "tools/call",
             "params": {
                 "name": "mimikyu_click",
@@ -982,6 +1043,147 @@ async fn mcp_human_takeover_gates_automated_input_and_resumes_cleanly() {
     )
     .await;
     assert_eq!(read_json_line(&mut r).await["result"]["isError"], false);
+
+    send_line(
+        &mut w,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 16,
+            "method": "tools/call",
+            "params": { "name": "mimikyu_snapshot", "arguments": { "session": "hitl" } }
+        }),
+    )
+    .await;
+    assert_eq!(read_json_line(&mut r).await["result"]["isError"], false);
+
+    drop(w);
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn mcp_filesystem_confinement_blocks_traversal_symlink_and_path_profile() {
+    let srv = TestServer::start().await;
+    let allowed = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+
+    let secret_file = outside.path().join("secret.txt");
+    std::fs::write(&secret_file, b"top-secret").unwrap();
+    let outside_batch = outside.path().join("ops.json");
+    std::fs::write(&outside_batch, r#"[{"op":"press","key":"Tab"}]"#).unwrap();
+
+    let mgr = Arc::new(
+        SessionManager::with_config(SessionManagerConfig {
+            state_dir: allowed.path().join("state"),
+            allowed_root: Some(allowed.path().to_path_buf()),
+            ..Default::default()
+        })
+        .unwrap(),
+    );
+
+    let (mut w, server_in) = tokio::io::duplex(64 * 1024);
+    let (server_out, client_out) = tokio::io::duplex(64 * 1024);
+    let server_task = tokio::spawn(async move {
+        serve_rw(mgr, BufReader::new(server_in), server_out).await
+    });
+    let mut r = BufReader::new(client_out);
+
+    // 1. Path-based profiles are rejected on MCP session creation
+    for (req_id, bad_prof) in [
+        (1, "../escape"),
+        (2, "/tmp/evil-profile"),
+        (3, "~/evil-profile"),
+        (4, "nested/profile"),
+    ] {
+        send_line(
+            &mut w,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": {
+                    "name": "mimikyu_session_new",
+                    "arguments": { "session": "badprof", "profile": bad_prof }
+                }
+            }),
+        )
+        .await;
+        let resp = read_json_line(&mut r).await;
+        assert_eq!(
+            resp["error"]["code"], -32602,
+            "expected -32602 for MCP profile {bad_prof:?}: {resp}"
+        );
+    }
+
+    // Open a clean ephemeral session for file-confinement tests
+    send_line(
+        &mut w,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "browser_open",
+                "arguments": { "session": "conf", "ephemeral": true, "url": srv.url("/forms-rich") }
+            }
+        }),
+    )
+    .await;
+    assert_eq!(read_json_line(&mut r).await["result"]["isError"], false);
+
+    // 2. Block traversal & outside-root paths for upload, batch file, batch upload op, screenshot, export, import
+    let outside_shot = outside.path().join("escaped.png");
+    let outside_export = outside.path().join("escaped.json");
+    let mut cases: Vec<(i64, &str, Value)> = vec![
+        (11, "browser_upload", json!({ "session": "conf", "target": "#upload", "path": secret_file })),
+        (12, "browser_upload", json!({ "session": "conf", "target": "#upload", "path": "../secret.txt" })),
+        (13, "mimikyu_batch", json!({ "session": "conf", "file": outside_batch })),
+        (14, "mimikyu_batch", json!({ "session": "conf", "ops": [{ "op": "upload", "target": "#upload", "files": [secret_file] }] })),
+        (15, "mimikyu_screenshot", json!({ "session": "conf", "out_path": outside_shot })),
+        (16, "mimikyu_screenshot", json!({ "session": "conf", "out_path": "../escaped.png" })),
+        (17, "browser_profile_export", json!({ "session": "conf", "out_path": outside_export })),
+        (18, "browser_profile_import", json!({ "session": "conf", "in_path": secret_file })),
+    ];
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        let link_secret = allowed.path().join("link_secret.txt");
+        symlink(&secret_file, &link_secret).unwrap();
+        let link_batch = allowed.path().join("link_batch.json");
+        symlink(&outside_batch, &link_batch).unwrap();
+        let link_out_dir = allowed.path().join("link_outside");
+        symlink(outside.path(), &link_out_dir).unwrap();
+        let dangling_shot = allowed.path().join("dangling.png");
+        symlink(outside.path().join("dangling-target.png"), &dangling_shot).unwrap();
+
+        cases.push((19, "browser_upload", json!({ "session": "conf", "target": "#upload", "path": link_secret })));
+        cases.push((20, "mimikyu_batch", json!({ "session": "conf", "file": link_batch })));
+        cases.push((21, "mimikyu_screenshot", json!({ "session": "conf", "out_path": link_out_dir.join("via-link.png") })));
+        cases.push((22, "mimikyu_screenshot", json!({ "session": "conf", "out_path": dangling_shot })));
+        cases.push((23, "browser_profile_export", json!({ "session": "conf", "out_path": link_out_dir.join("via-link.json") })));
+        cases.push((24, "browser_profile_import", json!({ "session": "conf", "in_path": link_secret })));
+    }
+
+    for (req_id, tool_name, arguments) in cases {
+        send_line(
+            &mut w,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "method": "tools/call",
+                "params": { "name": tool_name, "arguments": arguments }
+            }),
+        )
+        .await;
+        let resp = read_json_line(&mut r).await;
+        assert_eq!(
+            resp["error"]["code"], -32602,
+            "tool {tool_name} (id={req_id}) must reject escaped/symlink path: {resp}"
+        );
+    }
+
+    assert!(!outside_shot.exists());
+    assert!(!outside_export.exists());
 
     drop(w);
     server_task.await.unwrap().unwrap();
