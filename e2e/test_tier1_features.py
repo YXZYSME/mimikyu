@@ -203,7 +203,9 @@ def _collect_doctor_paths(obj: Any, out: list[str]) -> None:
         val = obj.get(key)
         if isinstance(val, str):
             out.append(val)
-    for val in obj.values():
+    for key, val in obj.items():
+        if isinstance(key, str) and key.lower() == "skipped_candidates":
+            continue
         if isinstance(val, (dict, list)):
             _collect_doctor_paths(val, out)
 
@@ -214,13 +216,19 @@ def _has_available_engine(obj: Any) -> bool:
         return any(_has_available_engine(item) for item in obj)
     if not isinstance(obj, dict):
         return False
+    if obj.get("available") is False or obj.get("found") is False:
+        return False
     if obj.get("available") is True or obj.get("found") is True:
         return True
     for key in ("path", "binary", "binary_path", "executable"):
         val = obj.get(key)
         if isinstance(val, str) and val.strip():
             return True
-    return any(_has_available_engine(v) for v in obj.values())
+    return any(
+        _has_available_engine(v)
+        for k, v in obj.items()
+        if not (isinstance(k, str) and k.lower() == "skipped_candidates")
+    )
 
 
 def _extract_engine_names(obj: Any) -> set[str]:
@@ -360,6 +368,25 @@ class TestF1BrowserDiscoveryAndDoctor(unittest.TestCase):
                 )
                 self.assertTrue(os.path.isfile(resolved), f"Not a regular file: {resolved}")
                 self.assertTrue(os.access(resolved, os.X_OK), f"Not executable: {resolved}")
+
+            # Verify recursive doctor walkers ignore skipped_candidates even when zero healthy browsers exist.
+            only_skipped = {
+                "chromium": [],
+                "firefox": [],
+                "skipped_candidates": [
+                    {
+                        "engine": "chromium",
+                        "source": "puppeteer_cache",
+                        "path": "/nonexistent/broken/chrome",
+                        "available": False,
+                        "reason": "probe failed",
+                    }
+                ],
+            }
+            skipped_paths: list[str] = []
+            _collect_doctor_paths(only_skipped, skipped_paths)
+            self.assertEqual(skipped_paths, [])
+            self.assertFalse(_has_available_engine(only_skipped))
 
     def test_f1_04_doctor_is_idempotent_and_creates_no_sessions(self) -> None:
         with MimikyuClient() as client:

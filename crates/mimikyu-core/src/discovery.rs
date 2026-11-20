@@ -73,6 +73,17 @@ pub struct EnvOverrides {
     pub mimikyu_firefox_path: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedCandidate {
+    pub engine: EngineKind,
+    pub source: DiscoverySource,
+    pub path: PathBuf,
+    /// Always `false` — ensures recursive doctor JSON consumers treating dicts
+    /// with `"path"` as available binaries never misclassify skipped candidates.
+    pub available: bool,
+    pub reason: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DoctorReport {
     pub platform: String,
@@ -82,6 +93,8 @@ pub struct DoctorReport {
     pub firefox: Vec<DiscoveredBrowser>,
     pub env_overrides: EnvOverrides,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub skipped_candidates: Vec<SkippedCandidate>,
 }
 
 /// Discover the best matching browser binary for `engine` and `headless` mode.
@@ -113,8 +126,8 @@ pub fn discover_browser(
         let trimmed = val.trim();
         if !trimmed.is_empty() {
             let path = PathBuf::from(trimmed);
-            let browser = validate_and_probe(engine, &path, DiscoverySource::EnvOverride)
-                .map_err(|e| {
+            let browser =
+                validate_and_probe(engine, &path, DiscoverySource::EnvOverride).map_err(|e| {
                     MimikyuError::BrowserNotFound(format!(
                         "{env_var}='{}' is invalid: {e}",
                         path.display()
@@ -133,7 +146,10 @@ pub fn discover_browser(
             continue;
         }
         let flavor_guess = classify_flavor(engine, &path, "");
-        if engine == EngineKind::Chromium && !headless && flavor_guess == ChromiumFlavor::HeadlessShell {
+        if engine == EngineKind::Chromium
+            && !headless
+            && flavor_guess == ChromiumFlavor::HeadlessShell
+        {
             if first_headed_error.is_none() {
                 first_headed_error = Some(MimikyuError::Unsupported {
                     engine: engine.to_string(),
@@ -170,7 +186,6 @@ pub fn discover_browser(
 
 /// Run full local browser discovery for `mimikyu doctor`.
 pub fn run_doctor() -> DoctorReport {
-    let platform = format!("{}-{}", env::consts::OS, env::consts::ARCH);
     let env_chromium = env::var(ENV_CHROMIUM_PATH)
         .ok()
         .map(|s| s.trim().to_string())
@@ -180,26 +195,59 @@ pub fn run_doctor() -> DoctorReport {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
+    let chromium_candidates = collect_candidates(EngineKind::Chromium);
+    let firefox_candidates = collect_candidates(EngineKind::Firefox);
+
+    run_doctor_with_candidates(
+        env_chromium,
+        env_firefox,
+        chromium_candidates,
+        firefox_candidates,
+    )
+}
+
+fn run_doctor_with_candidates(
+    env_chromium: Option<String>,
+    env_firefox: Option<String>,
+    chromium_candidates: Vec<(PathBuf, DiscoverySource)>,
+    firefox_candidates: Vec<(PathBuf, DiscoverySource)>,
+) -> DoctorReport {
+    let platform = format!("{}-{}", env::consts::OS, env::consts::ARCH);
+
     let mut warnings = Vec::new();
+    let mut skipped_candidates = Vec::new();
     let mut chromium = Vec::new();
     let mut firefox = Vec::new();
 
     if let Some(ref p) = env_chromium {
-        match validate_and_probe(EngineKind::Chromium, Path::new(p), DiscoverySource::EnvOverride)
-        {
+        match validate_and_probe(
+            EngineKind::Chromium,
+            Path::new(p),
+            DiscoverySource::EnvOverride,
+        ) {
             Ok(b) => chromium.push(b),
             Err(e) => warnings.push(format!("{ENV_CHROMIUM_PATH}='{p}' failed validation: {e}")),
         }
     }
     if let Some(ref p) = env_firefox {
-        match validate_and_probe(EngineKind::Firefox, Path::new(p), DiscoverySource::EnvOverride) {
+        match validate_and_probe(
+            EngineKind::Firefox,
+            Path::new(p),
+            DiscoverySource::EnvOverride,
+        ) {
             Ok(b) => firefox.push(b),
             Err(e) => warnings.push(format!("{ENV_FIREFOX_PATH}='{p}' failed validation: {e}")),
         }
     }
 
-    let mut seen_chromium: HashSet<PathBuf> = chromium.iter().map(|b| b.path.clone()).collect();
-    for (path, source) in collect_candidates(EngineKind::Chromium) {
+    let mut seen_chromium: HashSet<PathBuf> = HashSet::new();
+    for b in &chromium {
+        seen_chromium.insert(b.path.clone());
+        if let Ok(canon) = fs::canonicalize(&b.path) {
+            seen_chromium.insert(canon);
+        }
+    }
+    for (path, source) in chromium_candidates {
         let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         if seen_chromium.contains(&path) || seen_chromium.contains(&canonical) {
             continue;
@@ -214,13 +262,27 @@ pub fn run_doctor() -> DoctorReport {
                 chromium.push(b);
             }
             Err(e) => {
-                warnings.push(format!("failed probing {}: {e}", path.display()));
+                seen_chromium.insert(path.clone());
+                seen_chromium.insert(canonical);
+                skipped_candidates.push(SkippedCandidate {
+                    engine: EngineKind::Chromium,
+                    source,
+                    path,
+                    available: false,
+                    reason: e.to_string(),
+                });
             }
         }
     }
 
-    let mut seen_firefox: HashSet<PathBuf> = firefox.iter().map(|b| b.path.clone()).collect();
-    for (path, source) in collect_candidates(EngineKind::Firefox) {
+    let mut seen_firefox: HashSet<PathBuf> = HashSet::new();
+    for b in &firefox {
+        seen_firefox.insert(b.path.clone());
+        if let Ok(canon) = fs::canonicalize(&b.path) {
+            seen_firefox.insert(canon);
+        }
+    }
+    for (path, source) in firefox_candidates {
         let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
         if seen_firefox.contains(&path) || seen_firefox.contains(&canonical) {
             continue;
@@ -235,7 +297,15 @@ pub fn run_doctor() -> DoctorReport {
                 firefox.push(b);
             }
             Err(e) => {
-                warnings.push(format!("failed probing {}: {e}", path.display()));
+                seen_firefox.insert(path.clone());
+                seen_firefox.insert(canonical);
+                skipped_candidates.push(SkippedCandidate {
+                    engine: EngineKind::Firefox,
+                    source,
+                    path,
+                    available: false,
+                    reason: e.to_string(),
+                });
             }
         }
     }
@@ -276,6 +346,7 @@ pub fn run_doctor() -> DoctorReport {
             mimikyu_firefox_path: env_firefox,
         },
         warnings,
+        skipped_candidates,
     }
 }
 
@@ -349,7 +420,10 @@ pub fn classify_flavor(engine: EngineKind, path: &Path, version: &str) -> Chromi
         ChromiumFlavor::HeadlessShell
     } else if full.contains("google chrome for testing") || ver_lc.contains("chrome for testing") {
         ChromiumFlavor::ChromeForTesting
-    } else if full.contains("google chrome") || name == "google-chrome" || name == "google-chrome-stable" {
+    } else if full.contains("google chrome")
+        || name == "google-chrome"
+        || name == "google-chrome-stable"
+    {
         ChromiumFlavor::Chrome
     } else {
         ChromiumFlavor::Chromium
@@ -1140,7 +1214,9 @@ mod tests {
         assert_eq!(
             classify_flavor(
                 EngineKind::Chromium,
-                Path::new("/tmp/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"),
+                Path::new(
+                    "/tmp/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+                ),
                 "Google Chrome for Testing 143.0.7499.4",
             ),
             ChromiumFlavor::ChromeForTesting
@@ -1270,5 +1346,168 @@ Version=99.9.9
             ff[0]
         );
     }
-}
 
+    fn write_mock_executable(path: &Path, script: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, script).unwrap();
+        let mut perms = fs::metadata(path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(path, perms).unwrap();
+    }
+
+    #[test]
+    fn doctor_separates_broken_candidates_into_skipped_candidates_with_empty_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        let good_chrome = dir.path().join("good/chrome");
+        let bad_puppeteer_chrome = dir.path().join("puppeteer/chrome-headless-shell");
+        let good_firefox_dir = dir.path().join("good-firefox");
+        let good_firefox = good_firefox_dir.join("firefox");
+        let bad_firefox = dir.path().join("bad-firefox/firefox");
+
+        write_mock_executable(
+            &good_chrome,
+            "#!/bin/sh\necho 'Google Chrome for Testing 143.0.7499.4'\n",
+        );
+        write_mock_executable(
+            &bad_puppeteer_chrome,
+            "#!/bin/sh\necho 'dyld: missing library' >&2\nexit 1\n",
+        );
+        write_mock_executable(&good_firefox, "#!/bin/sh\nexit 99\n");
+        fs::write(
+            good_firefox_dir.join("application.ini"),
+            "[App]\nVendor=Mozilla\nName=Firefox\nVersion=144.0.2\n",
+        )
+        .unwrap();
+        write_mock_executable(
+            &bad_firefox,
+            "#!/bin/sh\necho 'corrupt binary' >&2\nexit 1\n",
+        );
+
+        let report = run_doctor_with_candidates(
+            None,
+            None,
+            vec![
+                (good_chrome.clone(), DiscoverySource::PlaywrightCache),
+                (
+                    bad_puppeteer_chrome.clone(),
+                    DiscoverySource::PuppeteerCache,
+                ),
+                // Duplicate broken path must be deduplicated cleanly
+                (
+                    bad_puppeteer_chrome.clone(),
+                    DiscoverySource::PuppeteerCache,
+                ),
+            ],
+            vec![
+                (good_firefox.clone(), DiscoverySource::PlaywrightCache),
+                (bad_firefox.clone(), DiscoverySource::SystemInstall),
+            ],
+        );
+
+        assert!(
+            report.warnings.is_empty(),
+            "expected empty warnings when healthy defaults exist, got {:?}",
+            report.warnings
+        );
+        assert_eq!(
+            report.default_chromium.as_deref(),
+            Some(good_chrome.as_path())
+        );
+        assert_eq!(
+            report.default_firefox.as_deref(),
+            Some(good_firefox.as_path())
+        );
+        assert_eq!(report.skipped_candidates.len(), 2);
+
+        let cr_skip = &report.skipped_candidates[0];
+        assert_eq!(cr_skip.engine, EngineKind::Chromium);
+        assert_eq!(cr_skip.source, DiscoverySource::PuppeteerCache);
+        assert_eq!(cr_skip.path, bad_puppeteer_chrome);
+        assert!(!cr_skip.available);
+        assert!(
+            cr_skip.reason.contains("missing library") || cr_skip.reason.contains("exited"),
+            "unexpected chromium skip reason: {}",
+            cr_skip.reason
+        );
+
+        let ff_skip = &report.skipped_candidates[1];
+        assert_eq!(ff_skip.engine, EngineKind::Firefox);
+        assert_eq!(ff_skip.source, DiscoverySource::SystemInstall);
+        assert_eq!(ff_skip.path, bad_firefox);
+        assert!(!ff_skip.available);
+        assert!(!ff_skip.reason.is_empty());
+
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["warnings"].as_array().unwrap().len(), 0);
+        let skipped = json["skipped_candidates"].as_array().unwrap();
+        assert_eq!(skipped.len(), 2);
+        assert_eq!(skipped[0]["available"], false);
+        assert_eq!(skipped[1]["available"], false);
+    }
+
+    #[test]
+    fn doctor_keeps_missing_default_and_invalid_env_override_in_warnings() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad_chrome = dir.path().join("broken/chrome");
+        write_mock_executable(&bad_chrome, "#!/bin/sh\necho 'broken' >&2\nexit 1\n");
+
+        // 1. All Chromium candidates fail -> skipped_candidates records the failure AND warnings reports missing default.
+        let no_healthy = run_doctor_with_candidates(
+            None,
+            None,
+            vec![(bad_chrome.clone(), DiscoverySource::PuppeteerCache)],
+            Vec::new(),
+        );
+        assert!(no_healthy.default_chromium.is_none());
+        assert_eq!(no_healthy.skipped_candidates.len(), 1);
+        assert!(!no_healthy.skipped_candidates[0].available);
+        assert!(
+            no_healthy
+                .warnings
+                .iter()
+                .any(|w| w.contains("no Chromium binary discovered"))
+        );
+        assert!(
+            no_healthy
+                .warnings
+                .iter()
+                .any(|w| w.contains("no Firefox binary discovered"))
+        );
+
+        // 2. Invalid MIMIKYU_CHROMIUM_PATH env override stays in warnings (not skipped_candidates).
+        let bad_env = run_doctor_with_candidates(
+            Some("/nonexistent/mimikyu/chromium".to_string()),
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(bad_env.default_chromium.is_none());
+        assert!(bad_env.skipped_candidates.is_empty());
+        assert!(
+            bad_env
+                .warnings
+                .iter()
+                .any(|w| w.contains(ENV_CHROMIUM_PATH) && w.contains("failed validation"))
+        );
+    }
+
+    #[test]
+    fn doctor_report_deserializes_legacy_json_without_skipped_candidates() {
+        let legacy = serde_json::json!({
+            "platform": "macos-aarch64",
+            "default_chromium": null,
+            "default_firefox": null,
+            "chromium": [],
+            "firefox": [],
+            "env_overrides": {
+                "mimikyu_chromium_path": null,
+                "mimikyu_firefox_path": null
+            },
+            "warnings": []
+        });
+        let parsed: DoctorReport = serde_json::from_value(legacy).unwrap();
+        assert!(parsed.skipped_candidates.is_empty());
+    }
+}

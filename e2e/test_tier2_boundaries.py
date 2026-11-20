@@ -268,6 +268,7 @@ def _is_engine_available_in_doctor(doc_data: Any, engine_name: str) -> bool:
                     "default_engine",
                     "primary",
                     "selected",
+                    "skipped_candidates",
                 ):
                     continue
                 found = _walk(val)
@@ -516,6 +517,33 @@ class TestF1DiscoveryDoctorBoundaries(_Tier2TestCase):
                 else listed.data
             )
             self.assertEqual(sessions or [], [])
+
+            # Verify _is_engine_available_in_doctor ignores skipped_candidates regardless of dict key order.
+            skipped_only = {
+                "skipped_candidates": [
+                    {
+                        "engine": "chromium",
+                        "source": "puppeteer_cache",
+                        "path": "/nonexistent/broken/chrome",
+                        "available": False,
+                        "reason": "probe failed",
+                    }
+                ],
+                "chromium": [],
+                "firefox": [],
+            }
+            self.assertFalse(_is_engine_available_in_doctor(skipped_only, "chromium"))
+
+            skipped_before_healthy = {
+                "skipped_candidates": skipped_only["skipped_candidates"],
+                "chromium": [
+                    {
+                        "engine": "chromium",
+                        "path": "/usr/bin/chromium",
+                    }
+                ],
+            }
+            self.assertTrue(_is_engine_available_in_doctor(skipped_before_healthy, "chromium"))
 
     def test_f1_doctor_non_json_human_readable_output(self) -> None:
         with self._client() as client:
