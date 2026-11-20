@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::driver::ScreencastOptions;
-use crate::error::{MimikyuError, Result};
+use crate::error::{
+    ErrorCategory, ErrorClassification, MimikyuError, Result, classify_navigation_message,
+    classify_protocol_error, classify_timeout_operation,
+};
 use crate::input::BatchAction;
 use crate::session::{ExtractMode, LogKind, SessionCreateOpts, SessionSummary, WaitRequest};
 use crate::snapshot::SnapshotOptions;
@@ -195,12 +198,7 @@ impl DaemonResponse {
             id,
             ok: false,
             data: None,
-            error: Some(DaemonError {
-                kind,
-                message: message.into(),
-                code: None,
-                timeout_ms: None,
-            }),
+            error: Some(DaemonError::from_kind_and_message(kind, message)),
         }
     }
 }
@@ -235,72 +233,64 @@ pub struct DaemonError {
     pub code: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<ErrorCategory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
 }
 
 impl DaemonError {
-    fn simple(kind: DaemonErrorKind, message: String) -> Self {
+    fn from_classification(
+        kind: DaemonErrorKind,
+        message: String,
+        class: ErrorClassification,
+    ) -> Self {
         Self {
             kind,
             message,
-            code: None,
-            timeout_ms: None,
+            code: class.protocol_code,
+            timeout_ms: class.timeout_ms,
+            error_code: Some(class.error_code.to_string()),
+            category: Some(class.category),
+            retryable: Some(class.retryable),
         }
     }
 
+    pub fn from_kind_and_message(kind: DaemonErrorKind, message: impl Into<String>) -> Self {
+        let message = message.into();
+        let class = classify_daemon_kind(kind, &message);
+        Self::from_classification(kind, message, class)
+    }
+
     pub fn from_mimikyu(err: &MimikyuError) -> Self {
-        match err {
-            MimikyuError::BrowserNotFound(msg) => {
-                Self::simple(DaemonErrorKind::BrowserNotFound, msg.clone())
-            }
-            MimikyuError::LaunchFailed(msg) => {
-                Self::simple(DaemonErrorKind::LaunchFailed, msg.clone())
-            }
-            MimikyuError::Transport(msg) => Self::simple(DaemonErrorKind::Transport, msg.clone()),
-            MimikyuError::Protocol { code, message } => Self {
-                kind: DaemonErrorKind::Protocol,
-                message: message.clone(),
-                code: Some(*code),
-                timeout_ms: None,
-            },
-            MimikyuError::Timeout {
-                timeout_ms,
-                operation: _,
-            } => Self {
-                kind: DaemonErrorKind::Timeout,
-                message: err.to_string(),
-                code: None,
-                timeout_ms: Some(*timeout_ms),
-            },
-            MimikyuError::InvalidConfig(msg) => {
-                Self::simple(DaemonErrorKind::InvalidConfig, msg.clone())
-            }
-            MimikyuError::ProfileLocked(msg) => {
-                Self::simple(DaemonErrorKind::ProfileLocked, msg.clone())
-            }
-            MimikyuError::NotFound(msg) => Self::simple(DaemonErrorKind::NotFound, msg.clone()),
-            MimikyuError::ElementNotFound(msg) => {
-                Self::simple(DaemonErrorKind::ElementNotFound, msg.clone())
-            }
-            MimikyuError::NavigationFailed(msg) => {
-                Self::simple(DaemonErrorKind::NavigationFailed, msg.clone())
-            }
-            MimikyuError::EvalFailed(msg) => {
-                Self::simple(DaemonErrorKind::EvalFailed, msg.clone())
-            }
+        let class = err.classify();
+        let (kind, message) = match err {
+            MimikyuError::BrowserNotFound(msg) => (DaemonErrorKind::BrowserNotFound, msg.clone()),
+            MimikyuError::LaunchFailed(msg) => (DaemonErrorKind::LaunchFailed, msg.clone()),
+            MimikyuError::Transport(msg) => (DaemonErrorKind::Transport, msg.clone()),
+            MimikyuError::Protocol { message, .. } => (DaemonErrorKind::Protocol, message.clone()),
+            MimikyuError::Timeout { .. } => (DaemonErrorKind::Timeout, err.to_string()),
+            MimikyuError::InvalidConfig(msg) => (DaemonErrorKind::InvalidConfig, msg.clone()),
+            MimikyuError::ProfileLocked(msg) => (DaemonErrorKind::ProfileLocked, msg.clone()),
+            MimikyuError::NotFound(msg) => (DaemonErrorKind::NotFound, msg.clone()),
+            MimikyuError::ElementNotFound(msg) => (DaemonErrorKind::ElementNotFound, msg.clone()),
+            MimikyuError::NavigationFailed(msg) => (DaemonErrorKind::NavigationFailed, msg.clone()),
+            MimikyuError::EvalFailed(msg) => (DaemonErrorKind::EvalFailed, msg.clone()),
             MimikyuError::MainWorldDisabled => {
-                Self::simple(DaemonErrorKind::MainWorldDisabled, err.to_string())
+                (DaemonErrorKind::MainWorldDisabled, err.to_string())
             }
-            MimikyuError::Unsupported { .. } => {
-                Self::simple(DaemonErrorKind::Unsupported, err.to_string())
-            }
+            MimikyuError::Unsupported { .. } => (DaemonErrorKind::Unsupported, err.to_string()),
             MimikyuError::PausedForHuman { .. } => {
-                Self::simple(DaemonErrorKind::PausedForHuman, err.to_string())
+                (DaemonErrorKind::PausedForHuman, err.to_string())
             }
-            MimikyuError::Disposed => Self::simple(DaemonErrorKind::Disposed, err.to_string()),
-            MimikyuError::Io(e) => Self::simple(DaemonErrorKind::Io, e.to_string()),
-            MimikyuError::Json(e) => Self::simple(DaemonErrorKind::InvalidConfig, e.to_string()),
-            MimikyuError::Url(e) => Self::simple(DaemonErrorKind::InvalidConfig, e.to_string()),
-        }
+            MimikyuError::Disposed => (DaemonErrorKind::Disposed, err.to_string()),
+            MimikyuError::Io(e) => (DaemonErrorKind::Io, e.to_string()),
+            MimikyuError::Json(e) => (DaemonErrorKind::InvalidConfig, e.to_string()),
+            MimikyuError::Url(e) => (DaemonErrorKind::InvalidConfig, e.to_string()),
+        };
+        Self::from_classification(kind, message, class)
     }
 
     pub fn into_mimikyu(self) -> MimikyuError {
@@ -352,7 +342,8 @@ impl DaemonError {
             },
             DaemonErrorKind::PausedForHuman => {
                 if let Some(rest) = self.message.strip_prefix("session '")
-                    && let Some((sid, after_sid)) = rest.split_once("' is paused for human takeover")
+                    && let Some((sid, after_sid)) =
+                        rest.split_once("' is paused for human takeover")
                 {
                     let reason = after_sid
                         .strip_prefix(" (")
@@ -373,6 +364,59 @@ impl DaemonError {
             DaemonErrorKind::Io => MimikyuError::Io(std::io::Error::other(self.message)),
             DaemonErrorKind::Internal => MimikyuError::Transport(self.message),
         }
+    }
+}
+
+fn classify_daemon_kind(kind: DaemonErrorKind, message: &str) -> ErrorClassification {
+    match kind {
+        DaemonErrorKind::BrowserNotFound => {
+            ErrorClassification::new("browser_not_found", ErrorCategory::Session, false)
+        }
+        DaemonErrorKind::LaunchFailed => {
+            ErrorClassification::new("launch_failed", ErrorCategory::Session, true)
+        }
+        DaemonErrorKind::Transport => {
+            ErrorClassification::new("transport_closed", ErrorCategory::Protocol, true)
+        }
+        DaemonErrorKind::Protocol => classify_protocol_error(None, message),
+        DaemonErrorKind::Timeout => {
+            let op = message
+                .strip_prefix("operation timed out after ")
+                .and_then(|rest| rest.split_once("ms: "))
+                .map(|(_, op)| op)
+                .unwrap_or(message);
+            classify_timeout_operation(None, op)
+        }
+        DaemonErrorKind::InvalidConfig => {
+            ErrorClassification::new("invalid_config", ErrorCategory::Config, false)
+        }
+        DaemonErrorKind::ProfileLocked => {
+            ErrorClassification::new("profile_locked", ErrorCategory::Session, true)
+        }
+        DaemonErrorKind::NotFound => {
+            ErrorClassification::new("session_not_found", ErrorCategory::Session, false)
+        }
+        DaemonErrorKind::ElementNotFound => {
+            ErrorClassification::new("element_not_found", ErrorCategory::Element, false)
+        }
+        DaemonErrorKind::NavigationFailed => classify_navigation_message(message),
+        DaemonErrorKind::EvalFailed => {
+            ErrorClassification::new("eval_failed", ErrorCategory::Eval, false)
+        }
+        DaemonErrorKind::MainWorldDisabled => {
+            ErrorClassification::new("main_world_disabled", ErrorCategory::Config, false)
+        }
+        DaemonErrorKind::Unsupported => {
+            ErrorClassification::new("unsupported_feature", ErrorCategory::Unsupported, false)
+        }
+        DaemonErrorKind::PausedForHuman => {
+            ErrorClassification::new("paused_for_human", ErrorCategory::Session, false)
+        }
+        DaemonErrorKind::Disposed => {
+            ErrorClassification::new("session_disposed", ErrorCategory::Session, false)
+        }
+        DaemonErrorKind::Io => ErrorClassification::new("io_error", ErrorCategory::Io, false),
+        DaemonErrorKind::Internal => ErrorClassification::internal(),
     }
 }
 
@@ -542,7 +586,10 @@ mod tests {
         let wire = DaemonError::from_mimikyu(&orig);
         assert_eq!(wire.kind, DaemonErrorKind::Timeout);
         assert_eq!(wire.timeout_ms, Some(250));
-        assert_eq!(wire.message, "operation timed out after 250ms: wait_text('NOPE')");
+        assert_eq!(
+            wire.message,
+            "operation timed out after 250ms: wait_text('NOPE')"
+        );
 
         let json_str = serde_json::to_string(&wire).unwrap();
         let decoded: DaemonError = serde_json::from_str(&json_str).unwrap();
@@ -584,7 +631,10 @@ mod tests {
             },
         };
         let encoded = serde_json::to_string(&pause_req).unwrap();
-        assert!(encoded.contains("\"method\":\"session.pause\""), "{encoded}");
+        assert!(
+            encoded.contains("\"method\":\"session.pause\""),
+            "{encoded}"
+        );
         let decoded: DaemonRequest = serde_json::from_str(&encoded).unwrap();
         assert!(matches!(decoded.op, DaemonOp::SessionPause { .. }));
 
