@@ -1,6 +1,6 @@
 # `mimikyu-mcp`
 
-Zero-dependency `npx` launcher for [`mimikyu`](https://github.com/YXZYSME/mimikyu) — the fast Rust browser automation, session/profile isolation, and 31-tool Model Context Protocol (`MCP`) server over **Chromium (CDP)** and **Firefox (WebDriver BiDi)**.
+Zero-dependency `npx` launcher for [`mimikyu`](https://github.com/YXZYSME/mimikyu) — the fast Rust browser automation, session/profile isolation, and 33-tool Model Context Protocol (`MCP`) server over **Chromium (CDP)** and **Firefox (WebDriver BiDi)**.
 
 ## MCP Client Configuration (Antigravity, Claude Desktop, Cursor, VS Code)
 

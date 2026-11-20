@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "mimikyu"
 version = "0.2.0"
-description = "Fast dual-engine (Chromium CDP & Firefox WebDriver BiDi) browser automation, session isolation, and 31-tool MCP server for AI agents."
+description = "Fast dual-engine (Chromium CDP & Firefox WebDriver BiDi) browser automation, session isolation, and 33-tool MCP server for AI agents."
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT OR Apache-2.0"

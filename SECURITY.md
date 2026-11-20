@@ -10,8 +10,8 @@ Only the latest minor release track receives security patches and advisories:
 
 | Version | Supported | Notes |
 | --- | :---: | --- |
-| `0.1.x` | Yes | Active release line (Rust 2024 edition, MSRV `1.88`) |
-| `< 0.1.0` | No | Pre-release / development snapshots |
+| `0.2.x` | Yes | Active release line (Rust 2024 edition, MSRV `1.88`) |
+| `< 0.2.0` | No | Prior release / development snapshots |
 
 ---
 

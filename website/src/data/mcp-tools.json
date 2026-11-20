@@ -107,6 +107,18 @@
           "description": "Block web font requests"
         },
         {
+          "name": "block_trackers",
+          "type": "boolean",
+          "required": false,
+          "description": "Block curated tracker, analytics, and ad-beacon domains"
+        },
+        {
+          "name": "privacy_mode",
+          "type": "boolean",
+          "required": false,
+          "description": "Enable hardened privacy mode (tracker blocking, WebRTC IP leak protection, human-safe window flags)"
+        },
+        {
           "name": "instant_animations",
           "type": "boolean",
           "required": false,
@@ -559,6 +571,18 @@
           "type": "boolean",
           "required": false,
           "description": "Block web font requests"
+        },
+        {
+          "name": "block_trackers",
+          "type": "boolean",
+          "required": false,
+          "description": "Block curated tracker, analytics, and ad-beacon domains"
+        },
+        {
+          "name": "privacy_mode",
+          "type": "boolean",
+          "required": false,
+          "description": "Enable hardened privacy mode (tracker blocking, WebRTC IP leak protection, human-safe window flags)"
         },
         {
           "name": "instant_animations",
@@ -1137,7 +1161,7 @@
     {
       "name": "mimikyu_request_human_takeover",
       "namespace": "mimikyu",
-      "description": "Pause automated input mutations on a session so a human can legitimately complete login, 2FA, payment, or verification in the browser window",
+      "description": "Pause automated input on a session and hand control to a human operator (for interactive login, 2FA, or manual review)",
       "required": [],
       "params": [
         {
@@ -1150,14 +1174,14 @@
           "name": "reason",
           "type": "string",
           "required": false,
-          "description": "Human-readable explanation shown for why takeover is needed"
+          "description": "Actionable reason explaining what the human operator should complete"
         }
       ]
     },
     {
       "name": "mimikyu_resume_from_human",
       "namespace": "mimikyu",
-      "description": "Resume automated session execution after human takeover completes and invalidate stale snapshot refs",
+      "description": "Resume automated input on a session after a human operator hands back control",
       "required": [],
       "params": [
         {

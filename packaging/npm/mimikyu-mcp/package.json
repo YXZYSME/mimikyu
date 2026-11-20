@@ -1,7 +1,7 @@
 {
   "name": "mimikyu-mcp",
   "version": "0.2.0",
-  "description": "Zero-dependency launcher for the mimikyu Rust browser automation & session isolation MCP server (31 tools over Chromium CDP & Firefox WebDriver BiDi).",
+  "description": "Zero-dependency launcher for the mimikyu Rust browser automation & session isolation MCP server (33 tools over Chromium CDP & Firefox WebDriver BiDi).",
   "mcpName": "io.github.YXZYSME/mimikyu",
   "license": "MIT OR Apache-2.0",
   "homepage": "https://github.com/YXZYSME/mimikyu",

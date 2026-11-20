@@ -79,6 +79,40 @@ const DOC_SLUG_BY_FILENAME = new Map(
   DOCS_MANIFEST.map((d) => [d.filename.toLowerCase(), d.slug])
 );
 
+function escapeHtml(input: string): string {
+  return input
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function isDangerousScheme(href: string): boolean {
+  const normalized = href.replace(/[\u0000-\u0020\u007f-\u009f]+/g, '');
+  return /^(?:javascript|vbscript|data):/i.test(normalized);
+}
+
+function sanitizeRenderedHtml(html: string): string {
+  // Defense-in-depth: strip any residual dangerous HTML elements, inline event handlers,
+  // or dangerous URI schemes from rendered HTML tags while leaving escaped code blocks intact.
+  return html
+    .replace(/<(script|iframe|object|embed|applet|style|link|meta|base)\b[\s\S]*?<\/\1>/gi, '')
+    .replace(/<\/?(script|iframe|object|embed|applet|style|link|meta|base)\b[^>]*\/?>/gi, '')
+    .replace(
+      /<([a-z][a-z0-9-]*)(\s[^>]*?)(\/?)>/gi,
+      (_, tag: string, rawAttrs: string, selfClose: string) => {
+        const cleanedAttrs = rawAttrs
+          .replace(/\s+on[a-z]+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+          .replace(
+            /\s+(href|src|action|formaction)\s*=\s*(?:"\s*(?:javascript|vbscript|data):[^"]*"|'\s*(?:javascript|vbscript|data):[^']*'|(?:\s*(?:javascript|vbscript|data):[^\s>]+))/gi,
+            ' $1="#"'
+          );
+        return `<${tag}${cleanedAttrs}${selfClose}>`;
+      }
+    );
+}
+
 function decodeHtmlEntities(input: string): string {
   return input
     .replace(/&amp;/g, '&')
@@ -130,6 +164,9 @@ export function loadDoc(slug: string, basePath = '/'): RenderedDoc {
 
   marked.use({
     renderer: {
+      html({ text }) {
+        return escapeHtml(text);
+      },
       heading({ tokens, depth }) {
         const innerHtml = this.parser.parseInline(tokens);
         const plainText = decodeHtmlEntities(innerHtml.replace(/<[^>]+>/g, '')).trim();
@@ -141,7 +178,7 @@ export function loadDoc(slug: string, basePath = '/'): RenderedDoc {
         if (depth === 2 || depth === 3) {
           headings.push({ depth, text: plainText, id });
         }
-        return `<h${depth} id="${id}">${innerHtml}</h${depth}>\n`;
+        return `<h${depth} id="${escapeHtml(id)}">${innerHtml}</h${depth}>\n`;
       },
       blockquote({ tokens }) {
         const body = this.parser.parse(tokens);
@@ -156,12 +193,24 @@ export function loadDoc(slug: string, basePath = '/'): RenderedDoc {
         }
         return `<blockquote>${body}</blockquote>\n`;
       },
+      image({ href, title, text }) {
+        const rawHref = (href || '').trim();
+        if (!rawHref || isDangerousScheme(rawHref)) {
+          return escapeHtml(text || '');
+        }
+        const safeSrc = escapeHtml(rawHref);
+        const safeAlt = escapeHtml(text || '');
+        const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
+        return `<img src="${safeSrc}" alt="${safeAlt}"${titleAttr} loading="lazy" />`;
+      },
       link({ href, title, tokens }) {
         const text = this.parser.parseInline(tokens);
-        let resolvedHref = href || '#';
+        let resolvedHref = (href || '#').trim();
         let external = false;
 
-        if (/^https?:\/\//i.test(resolvedHref)) {
+        if (isDangerousScheme(resolvedHref)) {
+          resolvedHref = '#';
+        } else if (/^https?:\/\//i.test(resolvedHref)) {
           external = true;
         } else if (!resolvedHref.startsWith('#') && !resolvedHref.startsWith('mailto:')) {
           const [pathPart, hashPart] = resolvedHref.split('#');
@@ -175,14 +224,15 @@ export function loadDoc(slug: string, basePath = '/'): RenderedDoc {
           }
         }
 
-        const titleAttr = title ? ` title="${title.replace(/"/g, '&quot;')}"` : '';
+        const safeHref = escapeHtml(resolvedHref);
+        const titleAttr = title ? ` title="${escapeHtml(title)}"` : '';
         const targetAttr = external ? ' target="_blank" rel="noopener noreferrer"' : '';
-        return `<a href="${resolvedHref}"${titleAttr}${targetAttr}>${text}</a>`;
+        return `<a href="${safeHref}"${titleAttr}${targetAttr}>${text}</a>`;
       },
     },
   });
 
-  const html = marked.parse(rawMarkdown) as string;
+  const html = sanitizeRenderedHtml(marked.parse(rawMarkdown) as string);
   const wordCount = rawMarkdown.trim().split(/\s+/).length;
   const readingMinutes = Math.max(1, Math.round(wordCount / 220));
 

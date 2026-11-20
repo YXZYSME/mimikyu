@@ -9,10 +9,10 @@
 //!
 //! ```toml
 //! [dependencies]
-//! mimikyu = "0.1"
+//! mimikyu = "0.2"
 //! ```
 //!
-//! ## CLI, Warm Daemon & 31-Tool MCP Server
+//! ## CLI, Warm Daemon & 33-Tool MCP Server
 //!
 //! Looking for the `mimikyu` command-line binary, background Unix-socket daemon,
 //! or stdio Model Context Protocol (`mcp`) server? Install `mimikyu-cli` (or use the

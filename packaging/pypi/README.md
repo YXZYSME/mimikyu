@@ -1,6 +1,6 @@
 # `mimikyu` (Python / `uvx` CLI & MCP Launcher)
 
-Zero-dependency Python / `uvx` binary launcher for [`mimikyu`](https://github.com/YXZYSME/mimikyu) — fast Rust browser automation, two-tier session/profile isolation, warm background daemon, and 31-tool Model Context Protocol (`MCP`) server over **Chromium (CDP)** and **Firefox (WebDriver BiDi)**.
+Zero-dependency Python / `uvx` binary launcher for [`mimikyu`](https://github.com/YXZYSME/mimikyu) — fast Rust browser automation, two-tier session/profile isolation, warm background daemon, and 33-tool Model Context Protocol (`MCP`) server over **Chromium (CDP)** and **Firefox (WebDriver BiDi)**.
 
 ## Quick Start (`pip` & `uvx`)
 

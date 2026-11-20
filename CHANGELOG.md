@@ -59,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Stateful stdio JSON-RPC 2.0 MCP server (`protocolVersion = "2024-11-05"`) exposing 11 `mimikyu_*` and 20 `browser_*` tools.
 - **Reproducible Offline Benchmark & Verification Suites (`harness`, `bench`, `e2e`)**:
   - Embedded `127.0.0.1:0` dual-origin HTTP benchmark server and `mimikyu bench` CLI measuring cold launch, warm virtual context creation, navigation, `@eN` snapshot latency (~5.0 ms median on Chromium), token compression ratio, live process-tree RSS, and 5 end-to-end agentic workflows across Chromium and Firefox.
-  - Standalone 244-test opaque-box Python 3 stdlib E2E verification suite (`e2e/run_e2e.py`) across Tiers 1–4 and `--self-test`.
+  - Standalone 237-test (244-run) opaque-box Python 3 stdlib E2E verification suite (`e2e/run_e2e.py`) across Tiers 1–4 and `--self-test`.
 
 ### Security & Host Reliability
 
@@ -67,5 +67,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **macOS Zero-Spawn Firefox Probe & Crash Suppression**: Reads `application.ini` and `Contents/Info.plist` directly from disk (avoiding `firefox --version` exit races on macOS) and launches Firefox with `MOZ_CRASHREPORTER_DISABLE=1`, `MOZ_CRASHREPORTER=0`, and `MOZ_CRASHREPORTER_NO_REPORT=1`.
 - **Deterministic Process-Group Reaping**: Isolates every spawned browser in its own POSIX process group (`setpgid(0, 0)`) with graceful protocol close followed by deterministic process-group cleanup on shutdown, signal, or `Drop`.
 
-[Unreleased]: https://github.com/YXZYSME/mimikyu/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/YXZYSME/mimikyu/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/YXZYSME/mimikyu/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/YXZYSME/mimikyu/releases/tag/v0.1.0
