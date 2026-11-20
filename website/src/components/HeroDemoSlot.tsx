@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'preact/hooks';
+import release from '../data/release.json';
 
 interface Props {
   baseUrl: string;
@@ -80,8 +81,7 @@ const DEMO_STEPS: DemoStep[] = [
   },
 ];
 
-const RELEASE_DEMO_BASE =
-  'https://github.com/YXZYSME/mimikyu/releases/download/v0.2.0';
+const RELEASE_DEMO_BASE = release.demoBaseUrl;
 
 const VIDEO_CLIPS = [
   {

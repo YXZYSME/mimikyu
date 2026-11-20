@@ -127,7 +127,7 @@ export default function McpExplorer() {
             value={query}
             onInput={(e) => setQuery((e.target as HTMLInputElement).value)}
             placeholder="Filter tool, param, or action..."
-            aria-label="Search 31 MCP tools"
+            aria-label={`Search ${mcpData.total} MCP tools`}
             class="w-full border-2 border-[#563A9E] bg-[#090414] px-3 py-1.5 font-mono text-xs text-[#F4EEFF] placeholder-[#C9B8F5]/55 focus:border-[#4CE0B3] focus:outline-none"
           />
         </div>

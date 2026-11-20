@@ -1,4 +1,6 @@
 ---
+import release from '../data/release.json';
+
 const base = import.meta.env.BASE_URL.endsWith('/')
   ? import.meta.env.BASE_URL
   : `${import.meta.env.BASE_URL}/`;
@@ -63,7 +65,7 @@ const base = import.meta.env.BASE_URL.endsWith('/')
       <rect x="34" y="176" width="142" height="74" fill="#120924" stroke="#9D80EB" stroke-width="1.5" />
       <text x="105" y="200" text-anchor="middle" fill="#F4EEFF" font-family="JetBrains Mono, monospace" font-size="12" font-weight="700">mimikyu mcp</text>
       <text x="105" y="219" text-anchor="middle" fill="#C9B8F5" font-family="JetBrains Mono, monospace" font-size="10">Stdio JSON-RPC 2.0</text>
-      <text x="105" y="236" text-anchor="middle" fill="#9D80EB" font-family="JetBrains Mono, monospace" font-size="10">31 MCP tools</text>
+      <text x="105" y="236" text-anchor="middle" fill="#9D80EB" font-family="JetBrains Mono, monospace" font-size="10">{release.mcp.total} MCP tools</text>
 
       <!-- Arrow 1 -> 2 -->
       <line x1="190" y1="155" x2="228" y2="155" stroke="#F5B841" stroke-width="2.5" marker-end="url(#arrow-gold)" />

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import re
@@ -12,7 +13,23 @@ from PIL import Image, ImageDraw, ImageFont
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 MASCOT_SVG = ROOT / "assets" / "mimikyu-mascot.svg"
+RELEASE_JSON = ROOT / "website" / "src" / "data" / "release.json"
+MCP_TOOLS_JSON = ROOT / "website" / "src" / "data" / "mcp-tools.json"
 OUT_PNG = ROOT / "website" / "public" / "og-card.png"
+
+
+def load_site_meta() -> tuple[str, int]:
+    """Load current release tag and MCP tool count from synced site data."""
+    tag = "v0.2.0"
+    mcp_total = 33
+    if RELEASE_JSON.exists():
+        data = json.loads(RELEASE_JSON.read_text(encoding="utf-8"))
+        tag = data.get("tag", tag)
+        mcp_total = int(data.get("mcp", {}).get("total", mcp_total))
+    elif MCP_TOOLS_JSON.exists():
+        data = json.loads(MCP_TOOLS_JSON.read_text(encoding="utf-8"))
+        mcp_total = int(data.get("total", mcp_total))
+    return tag, mcp_total
 
 # Exact 16-bit Dark HUD palette from assets/*.svg
 C_VOID = "#090414"
@@ -168,11 +185,13 @@ def main() -> None:
     f_kpi_lbl = mono_reg(16)
     f_footer = mono_bold(20)
 
+    release_tag, mcp_total = load_site_meta()
+
     # Status LEDs & Header Kicker
     draw.rectangle([58, 57, 72, 71], fill=C_GOLD)
     draw.rectangle([80, 57, 94, 71], fill=C_MINT)
     draw.rectangle([102, 57, 116, 71], fill=C_VIOLET)
-    draw.text((136, 53), "AGENTDEX // ENTRY NO. 031", font=f_kicker, fill=C_GOLD_BRIGHT)
+    draw.text((136, 53), f"AGENTDEX // ENTRY NO. {mcp_total:03d} · {release_tag}", font=f_kicker, fill=C_GOLD_BRIGHT)
     draw.text((W - 320, 53), "RUST 1.88+ · MIT/APACHE", font=f_kicker, fill=C_MINT_BRIGHT)
 
     # Left mascot sprite (256x256 crisp nearest-neighbor from SVG)
@@ -231,7 +250,7 @@ def main() -> None:
     pills = [
         ("5.0 ms snapshots", C_GOLD_BRIGHT, C_GOLD),
         ("CDP + BiDi", C_MINT_BRIGHT, C_MINT),
-        ("31 MCP tools", C_TEXT, C_VIOLET),
+        (f"{mcp_total} MCP tools", C_TEXT, C_VIOLET),
         ("Rust", C_CORAL, C_CORAL),
     ]
     for label, fg, border in pills:
@@ -244,7 +263,7 @@ def main() -> None:
     kpis = [
         ("5.0 ms", "SEMANTIC @eN SNAPSHOT", C_GOLD_BRIGHT),
         ("2.8x–3.6x", "TOKEN COMPRESSION", C_MINT_BRIGHT),
-        ("31 TOOLS", "MCP 2024-11-05 STDIO", C_VIOLET),
+        (f"{mcp_total} TOOLS", "MCP 2024-11-05 STDIO", C_VIOLET),
         ("581 TESTS", "337 RUST + 244 E2E", C_TEXT),
     ]
     col_w = (W - 96) // 4
