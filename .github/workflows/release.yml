@@ -7,9 +7,14 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Existing release tag to build and publish (e.g. v0.1.0)"
+        description: "Existing release tag to build and publish (e.g. v0.2.0)"
         required: true
         type: string
+      only_npm_mcp:
+        description: "Skip binary build/crates/PyPI and publish only npm + Official MCP Registry for an existing tag"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -28,6 +33,7 @@ env:
 jobs:
   verify:
     name: Verify Release Tag & Tests
+    if: ${{ !inputs.only_npm_mcp }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -306,9 +312,9 @@ jobs:
           cargo publish --locked -p mimikyu
 
   publish-mcp:
-    name: Publish npm (mimikyu-mcp) & Official MCP Registry (OIDC)
+    name: Publish npm (mimikyu-mcp, saengil-mimikyu, mimikyu-cli) & Official MCP Registry (OIDC)
     needs: publish
-    if: ${{ !contains(inputs.tag || github.ref_name, '-') }}
+    if: ${{ always() && (needs.publish.result == 'success' || inputs.only_npm_mcp) && !contains(inputs.tag || github.ref_name, '-') }}
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -321,16 +327,28 @@ jobs:
         with:
           ref: ${{ (inputs.tag && format('refs/tags/{0}', inputs.tag)) || github.ref }}
 
-      - name: Set up Node.js 24 (npm Trusted Publishing OIDC)
+      - name: Set up Node.js 24 (pure OIDC, no dummy NODE_AUTH_TOKEN)
         uses: actions/setup-node@v4
         with:
           node-version: "24"
-          registry-url: "https://registry.npmjs.org"
 
-      - name: Publish npm packages (mimikyu-mcp, saengil-mimikyu, mimikyu-cli) with provenance
+      - name: Ensure npm >= 11.5.1 for Trusted Publishing OIDC
         run: |
+          npm install -g npm@latest
+          npm --version
+
+      - name: Publish npm packages (mimikyu-mcp, saengil-mimikyu, mimikyu-cli) with OIDC provenance
+        env:
+          TAG_NAME: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -eu
+          REL_VER="${TAG_NAME#v}"
           for pkg_dir in mimikyu-mcp saengil-mimikyu mimikyu-cli; do
-            (cd "packaging/npm/$pkg_dir" && npm publish --provenance --access public)
+            if curl -fsSL "https://registry.npmjs.org/${pkg_dir}/${REL_VER}" >/dev/null 2>&1; then
+              echo "${pkg_dir}@${REL_VER} already published on npm; skipping."
+            else
+              (cd "packaging/npm/$pkg_dir" && npm publish --provenance --access public)
+            fi
           done
 
       - name: Install Cosign & verify mcp-publisher CLI
