@@ -63,7 +63,12 @@ CARGO_LOCK="$REPO_ROOT/Cargo.lock"
 CHANGELOG="$REPO_ROOT/CHANGELOG.md"
 BREW_FORMULA="$REPO_ROOT/packaging/homebrew/mimikyu.rb"
 MCP_SERVER_JSON="$REPO_ROOT/server.json"
-NPM_PKG_JSON="$REPO_ROOT/packaging/npm/mimikyu-mcp/package.json"
+NPM_MCP_JSON="$REPO_ROOT/packaging/npm/mimikyu-mcp/package.json"
+NPM_SAENGIL_JSON="$REPO_ROOT/packaging/npm/saengil-mimikyu/package.json"
+NPM_CLI_JSON="$REPO_ROOT/packaging/npm/mimikyu-cli/package.json"
+PYPI_TOML="$REPO_ROOT/packaging/pypi/pyproject.toml"
+PYPI_INIT="$REPO_ROOT/packaging/pypi/src/mimikyu_pypi/__init__.py"
+CITATION_CFF="$REPO_ROOT/CITATION.cff"
 
 [ -f "$ROOT_CARGO" ] || die "missing $ROOT_CARGO"
 [ -f "$CORE_CARGO" ] || die "missing $CORE_CARGO"
@@ -201,18 +206,70 @@ if [ -f "$BREW_FORMULA" ]; then
   printf '[ok] packaging/homebrew/mimikyu.rb version = %s\n' "$brew_ver"
 fi
 
-if [ -f "$NPM_PKG_JSON" ]; then
-  npm_ver=$(awk '
-    $0 ~ /^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"/ {
+check_npm_manifest() {
+  pkg_file="$1"
+  pkg_label="$2"
+  if [ -f "$pkg_file" ]; then
+    npm_ver=$(awk '
+      $0 ~ /^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"/ {
+        line = $0
+        sub(/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"/, "", line)
+        sub(/".*$/, "", line)
+        print line
+        exit 0
+      }
+    ' "$pkg_file")
+    [ "$npm_ver" = "$WORKSPACE_VERSION" ] || die "$pkg_label version '$npm_ver' does not match workspace version '$WORKSPACE_VERSION'"
+    printf '[ok] %s version = %s\n' "$pkg_label" "$npm_ver"
+  fi
+}
+
+check_npm_manifest "$NPM_MCP_JSON" "packaging/npm/mimikyu-mcp/package.json"
+check_npm_manifest "$NPM_SAENGIL_JSON" "packaging/npm/saengil-mimikyu/package.json"
+check_npm_manifest "$NPM_CLI_JSON" "packaging/npm/mimikyu-cli/package.json"
+
+if [ -f "$PYPI_TOML" ]; then
+  pypi_ver=$(awk '
+    /^\[project\][[:space:]]*$/ { in_proj = 1; next }
+    /^\[/ { in_proj = 0 }
+    in_proj && $0 ~ /^[[:space:]]*version[[:space:]]*=[[:space:]]*"/ {
       line = $0
-      sub(/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"/, "", line)
+      sub(/^[[:space:]]*version[[:space:]]*=[[:space:]]*"/, "", line)
       sub(/".*$/, "", line)
       print line
       exit 0
     }
-  ' "$NPM_PKG_JSON")
-  [ "$npm_ver" = "$WORKSPACE_VERSION" ] || die "packaging/npm/mimikyu-mcp/package.json version '$npm_ver' does not match workspace version '$WORKSPACE_VERSION'"
-  printf '[ok] packaging/npm/mimikyu-mcp/package.json version = %s\n' "$npm_ver"
+  ' "$PYPI_TOML")
+  [ "$pypi_ver" = "$WORKSPACE_VERSION" ] || die "packaging/pypi/pyproject.toml version '$pypi_ver' does not match workspace version '$WORKSPACE_VERSION'"
+  printf '[ok] packaging/pypi/pyproject.toml version = %s\n' "$pypi_ver"
+fi
+
+if [ -f "$PYPI_INIT" ]; then
+  pypi_init_ver=$(awk '
+    $0 ~ /^__version__[[:space:]]*=[[:space:]]*"/ {
+      line = $0
+      sub(/^__version__[[:space:]]*=[[:space:]]*"/, "", line)
+      sub(/".*$/, "", line)
+      print line
+      exit 0
+    }
+  ' "$PYPI_INIT")
+  [ "$pypi_init_ver" = "$WORKSPACE_VERSION" ] || die "packaging/pypi/src/mimikyu_pypi/__init__.py version '$pypi_init_ver' does not match workspace version '$WORKSPACE_VERSION'"
+  printf '[ok] packaging/pypi/src/mimikyu_pypi/__init__.py version = %s\n' "$pypi_init_ver"
+fi
+
+if [ -f "$CITATION_CFF" ]; then
+  cff_ver=$(awk '
+    $0 ~ /^version:[[:space:]]*"/ {
+      line = $0
+      sub(/^version:[[:space:]]*"/, "", line)
+      sub(/".*$/, "", line)
+      print line
+      exit 0
+    }
+  ' "$CITATION_CFF")
+  [ "$cff_ver" = "$WORKSPACE_VERSION" ] || die "CITATION.cff version '$cff_ver' does not match workspace version '$WORKSPACE_VERSION'"
+  printf '[ok] CITATION.cff version = %s\n' "$cff_ver"
 fi
 
 if [ -f "$MCP_SERVER_JSON" ]; then

@@ -1,0 +1,22 @@
+cff-version: 1.2.0
+title: "mimikyu: Fast Dual-Engine Agentic Browser Runtime, Session Isolation & MCP Server"
+message: "If you use mimikyu in research, benchmarks, or agentic workflows, please cite it using the metadata below."
+type: software
+authors:
+  - alias: "YXZYSME"
+    name: "Saengil (YXZYS)"
+repository-code: "https://github.com/YXZYSME/mimikyu"
+url: "https://github.com/YXZYSME/mimikyu"
+license:
+  - MIT
+  - Apache-2.0
+version: "0.1.0"
+date-released: "2026-11-19"
+keywords:
+  - browser-automation
+  - ai-agents
+  - model-context-protocol
+  - mcp
+  - chrome-devtools-protocol
+  - webdriver-bidi
+  - rust

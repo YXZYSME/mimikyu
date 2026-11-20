@@ -1,0 +1,47 @@
+{
+  "name": "saengil-mimikyu",
+  "version": "0.1.0",
+  "description": "Official Saengil CLI & MCP binary installer/launcher for mimikyu — fast Rust browser automation & session isolation over Chromium CDP and Firefox WebDriver BiDi.",
+  "license": "MIT OR Apache-2.0",
+  "homepage": "https://github.com/YXZYSME/mimikyu",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/YXZYSME/mimikyu.git",
+    "directory": "packaging/npm/saengil-mimikyu"
+  },
+  "bugs": {
+    "url": "https://github.com/YXZYSME/mimikyu/issues"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "arm64",
+    "x64"
+  ],
+  "bin": {
+    "mimikyu": "bin/mimikyu.js",
+    "saengil-mimikyu": "bin/mimikyu.js"
+  },
+  "files": [
+    "bin/mimikyu.js",
+    "README.md"
+  ],
+  "keywords": [
+    "saengil",
+    "mimikyu",
+    "browser-automation",
+    "mcp",
+    "model-context-protocol",
+    "cdp",
+    "webdriver-bidi",
+    "chromium",
+    "firefox",
+    "ai-agents",
+    "cli"
+  ]
+}

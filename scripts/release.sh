@@ -230,6 +230,53 @@ rewrite_json_versions() {
   ' "$in_file" > "$out_file"
 }
 
+rewrite_pyproject_toml() {
+  in_file="$1"
+  out_file="$2"
+  new_ver="$3"
+  awk -v ver="$new_ver" '
+    /^\[project\][[:space:]]*$/ { in_proj = 1; print; next }
+    /^\[/ { in_proj = 0 }
+    in_proj && !replaced && $0 ~ /^[[:space:]]*version[[:space:]]*=[[:space:]]*"/ {
+      print "version = \"" ver "\""
+      replaced = 1
+      next
+    }
+    { print }
+  ' "$in_file" > "$out_file"
+}
+
+rewrite_pypi_init() {
+  in_file="$1"
+  out_file="$2"
+  new_ver="$3"
+  awk -v ver="$new_ver" '
+    $0 ~ /^__version__[[:space:]]*=[[:space:]]*"/ {
+      print "__version__ = \"" ver "\""
+      next
+    }
+    { print }
+  ' "$in_file" > "$out_file"
+}
+
+rewrite_citation_cff() {
+  in_file="$1"
+  out_file="$2"
+  new_ver="$3"
+  rel_date="$4"
+  awk -v ver="$new_ver" -v rdate="$rel_date" '
+    $0 ~ /^version:[[:space:]]*"/ {
+      print "version: \"" ver "\""
+      next
+    }
+    $0 ~ /^date-released:[[:space:]]*"/ {
+      print "date-released: \"" rdate "\""
+      next
+    }
+    { print }
+  ' "$in_file" > "$out_file"
+}
+
 rewrite_changelog() {
   in_file="$1"
   out_file="$2"
@@ -304,7 +351,7 @@ fi
 # 2. Dry-run simulation (never touches the working tree!)
 if [ "$DRY_RUN" -eq 1 ]; then
   TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mimikyu-release-dryrun.XXXXXX")
-  mkdir -p "$TMP_DIR/crates/mimikyu-core" "$TMP_DIR/crates/mimikyu-cli" "$TMP_DIR/crates/mimikyu" "$TMP_DIR/packaging/homebrew" "$TMP_DIR/packaging/npm/mimikyu-mcp"
+  mkdir -p "$TMP_DIR/crates/mimikyu-core" "$TMP_DIR/crates/mimikyu-cli" "$TMP_DIR/crates/mimikyu" "$TMP_DIR/packaging/homebrew" "$TMP_DIR/packaging/npm/mimikyu-mcp" "$TMP_DIR/packaging/npm/saengil-mimikyu" "$TMP_DIR/packaging/npm/mimikyu-cli" "$TMP_DIR/packaging/pypi/src/mimikyu_pypi"
 
   rewrite_cargo_toml "$REPO_ROOT/Cargo.toml" "$TMP_DIR/Cargo.toml" "$NEW_VERSION"
   cp "$REPO_ROOT/crates/mimikyu-core/Cargo.toml" "$TMP_DIR/crates/mimikyu-core/Cargo.toml"
@@ -317,8 +364,19 @@ if [ "$DRY_RUN" -eq 1 ]; then
   if [ -f "$REPO_ROOT/packaging/homebrew/mimikyu.rb" ]; then
     rewrite_homebrew_formula "$REPO_ROOT/packaging/homebrew/mimikyu.rb" "$TMP_DIR/packaging/homebrew/mimikyu.rb" "$NEW_VERSION"
   fi
-  if [ -f "$REPO_ROOT/packaging/npm/mimikyu-mcp/package.json" ]; then
-    rewrite_json_versions "$REPO_ROOT/packaging/npm/mimikyu-mcp/package.json" "$TMP_DIR/packaging/npm/mimikyu-mcp/package.json" "$NEW_VERSION"
+  for npm_dir in mimikyu-mcp saengil-mimikyu mimikyu-cli; do
+    if [ -f "$REPO_ROOT/packaging/npm/$npm_dir/package.json" ]; then
+      rewrite_json_versions "$REPO_ROOT/packaging/npm/$npm_dir/package.json" "$TMP_DIR/packaging/npm/$npm_dir/package.json" "$NEW_VERSION"
+    fi
+  done
+  if [ -f "$REPO_ROOT/packaging/pypi/pyproject.toml" ]; then
+    rewrite_pyproject_toml "$REPO_ROOT/packaging/pypi/pyproject.toml" "$TMP_DIR/packaging/pypi/pyproject.toml" "$NEW_VERSION"
+  fi
+  if [ -f "$REPO_ROOT/packaging/pypi/src/mimikyu_pypi/__init__.py" ]; then
+    rewrite_pypi_init "$REPO_ROOT/packaging/pypi/src/mimikyu_pypi/__init__.py" "$TMP_DIR/packaging/pypi/src/mimikyu_pypi/__init__.py" "$NEW_VERSION"
+  fi
+  if [ -f "$REPO_ROOT/CITATION.cff" ]; then
+    rewrite_citation_cff "$REPO_ROOT/CITATION.cff" "$TMP_DIR/CITATION.cff" "$NEW_VERSION" "$RELEASE_DATE"
   fi
   if [ -f "$REPO_ROOT/server.json" ]; then
     rewrite_json_versions "$REPO_ROOT/server.json" "$TMP_DIR/server.json" "$NEW_VERSION"
@@ -358,10 +416,30 @@ if [ -f "$REPO_ROOT/packaging/homebrew/mimikyu.rb" ]; then
   mv "$TMP_DIR/mimikyu.rb" "$REPO_ROOT/packaging/homebrew/mimikyu.rb"
 fi
 
-if [ -f "$REPO_ROOT/packaging/npm/mimikyu-mcp/package.json" ]; then
-  log_info "Updating packaging/npm/mimikyu-mcp/package.json version -> $NEW_VERSION"
-  rewrite_json_versions "$REPO_ROOT/packaging/npm/mimikyu-mcp/package.json" "$TMP_DIR/package.json" "$NEW_VERSION"
-  mv "$TMP_DIR/package.json" "$REPO_ROOT/packaging/npm/mimikyu-mcp/package.json"
+for npm_dir in mimikyu-mcp saengil-mimikyu mimikyu-cli; do
+  if [ -f "$REPO_ROOT/packaging/npm/$npm_dir/package.json" ]; then
+    log_info "Updating packaging/npm/$npm_dir/package.json version -> $NEW_VERSION"
+    rewrite_json_versions "$REPO_ROOT/packaging/npm/$npm_dir/package.json" "$TMP_DIR/package.json" "$NEW_VERSION"
+    mv "$TMP_DIR/package.json" "$REPO_ROOT/packaging/npm/$npm_dir/package.json"
+  fi
+done
+
+if [ -f "$REPO_ROOT/packaging/pypi/pyproject.toml" ]; then
+  log_info "Updating packaging/pypi/pyproject.toml version -> $NEW_VERSION"
+  rewrite_pyproject_toml "$REPO_ROOT/packaging/pypi/pyproject.toml" "$TMP_DIR/pyproject.toml" "$NEW_VERSION"
+  mv "$TMP_DIR/pyproject.toml" "$REPO_ROOT/packaging/pypi/pyproject.toml"
+fi
+
+if [ -f "$REPO_ROOT/packaging/pypi/src/mimikyu_pypi/__init__.py" ]; then
+  log_info "Updating packaging/pypi/src/mimikyu_pypi/__init__.py version -> $NEW_VERSION"
+  rewrite_pypi_init "$REPO_ROOT/packaging/pypi/src/mimikyu_pypi/__init__.py" "$TMP_DIR/__init__.py" "$NEW_VERSION"
+  mv "$TMP_DIR/__init__.py" "$REPO_ROOT/packaging/pypi/src/mimikyu_pypi/__init__.py"
+fi
+
+if [ -f "$REPO_ROOT/CITATION.cff" ]; then
+  log_info "Updating CITATION.cff version -> $NEW_VERSION"
+  rewrite_citation_cff "$REPO_ROOT/CITATION.cff" "$TMP_DIR/CITATION.cff" "$NEW_VERSION" "$RELEASE_DATE"
+  mv "$TMP_DIR/CITATION.cff" "$REPO_ROOT/CITATION.cff"
 fi
 
 if [ -f "$REPO_ROOT/server.json" ]; then
@@ -385,8 +463,19 @@ git add Cargo.toml Cargo.lock CHANGELOG.md
 if [ -f "$REPO_ROOT/packaging/homebrew/mimikyu.rb" ]; then
   git add packaging/homebrew/mimikyu.rb
 fi
-if [ -f "$REPO_ROOT/packaging/npm/mimikyu-mcp/package.json" ]; then
-  git add packaging/npm/mimikyu-mcp/package.json
+for npm_dir in mimikyu-mcp saengil-mimikyu mimikyu-cli; do
+  if [ -f "$REPO_ROOT/packaging/npm/$npm_dir/package.json" ]; then
+    git add "packaging/npm/$npm_dir/package.json"
+  fi
+done
+if [ -f "$REPO_ROOT/packaging/pypi/pyproject.toml" ]; then
+  git add packaging/pypi/pyproject.toml
+fi
+if [ -f "$REPO_ROOT/packaging/pypi/src/mimikyu_pypi/__init__.py" ]; then
+  git add packaging/pypi/src/mimikyu_pypi/__init__.py
+fi
+if [ -f "$REPO_ROOT/CITATION.cff" ]; then
+  git add CITATION.cff
 fi
 if [ -f "$REPO_ROOT/server.json" ]; then
   git add server.json
