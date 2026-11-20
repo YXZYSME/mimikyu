@@ -1,0 +1,1138 @@
+{
+  "protocolVersion": "2024-11-05",
+  "registryId": "io.github.YXZYSME/mimikyu",
+  "total": 31,
+  "namespaces": {
+    "mimikyu": 11,
+    "browser": 20
+  },
+  "tools": [
+    {
+      "name": "mimikyu_session_new",
+      "namespace": "mimikyu",
+      "description": "Create a new isolated browser session",
+      "required": [],
+      "params": [
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        },
+        {
+          "name": "profile",
+          "type": "string",
+          "required": false,
+          "description": "Named profile or directory path for persistent storage"
+        },
+        {
+          "name": "ephemeral",
+          "type": "boolean",
+          "required": false,
+          "description": "Use a temporary isolated profile directory"
+        },
+        {
+          "name": "virtual",
+          "type": "boolean",
+          "required": false,
+          "description": "Use a lightweight virtual browser context"
+        },
+        {
+          "name": "engine",
+          "type": "string",
+          "required": false,
+          "description": "Browser engine",
+          "enum": [
+            "chromium",
+            "firefox"
+          ]
+        },
+        {
+          "name": "preset",
+          "type": "string",
+          "required": false,
+          "description": "Environment profile preset",
+          "enum": [
+            "win11",
+            "macos",
+            "linux"
+          ]
+        },
+        {
+          "name": "locale",
+          "type": "string",
+          "required": false,
+          "description": "BCP 47 locale identifier (e.g. en-US, de-DE)"
+        },
+        {
+          "name": "timezone",
+          "type": "string",
+          "required": false,
+          "description": "IANA timezone identifier (e.g. America/Chicago)"
+        },
+        {
+          "name": "proxy",
+          "type": "string",
+          "required": false,
+          "description": "HTTP or SOCKS5 proxy URL"
+        },
+        {
+          "name": "geoip",
+          "type": "string",
+          "required": false,
+          "description": "IPv4/IPv6 address for local GeoIP region alignment"
+        },
+        {
+          "name": "viewport",
+          "type": "string",
+          "required": false,
+          "description": "Viewport size in WxH format (e.g. 1280x720)"
+        },
+        {
+          "name": "block_images",
+          "type": "boolean",
+          "required": false,
+          "description": "Block image requests"
+        },
+        {
+          "name": "block_media",
+          "type": "boolean",
+          "required": false,
+          "description": "Block audio and video media requests"
+        },
+        {
+          "name": "block_fonts",
+          "type": "boolean",
+          "required": false,
+          "description": "Block web font requests"
+        },
+        {
+          "name": "instant_animations",
+          "type": "boolean",
+          "required": false,
+          "description": "Accelerate CSS animations and transitions"
+        },
+        {
+          "name": "humanize",
+          "type": "boolean",
+          "required": false,
+          "description": "Enable kinematic pointer and typing motion"
+        },
+        {
+          "name": "headless",
+          "type": "boolean",
+          "required": false,
+          "description": "Run browser in headless mode (defaults to true)"
+        },
+        {
+          "name": "main_world_eval",
+          "type": "boolean",
+          "required": false,
+          "description": "Allow opt-in main-world evaluation (defaults to true)"
+        }
+      ]
+    },
+    {
+      "name": "mimikyu_session_close",
+      "namespace": "mimikyu",
+      "description": "Close an active browser session and clean up its resources",
+      "required": [],
+      "params": [
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "mimikyu_open",
+      "namespace": "mimikyu",
+      "description": "Navigate an existing session to a URL",
+      "required": [
+        "url"
+      ],
+      "params": [
+        {
+          "name": "url",
+          "type": "string",
+          "required": true,
+          "description": "Target HTTP/HTTPS/data/about URL"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "mimikyu_snapshot",
+      "namespace": "mimikyu",
+      "description": "Capture a compact @eN semantic accessibility tree snapshot",
+      "required": [],
+      "params": [
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        },
+        {
+          "name": "diff",
+          "type": "boolean",
+          "required": false,
+          "description": "Include structural diff from the previous snapshot"
+        },
+        {
+          "name": "max_depth",
+          "type": "integer",
+          "required": false,
+          "description": "Maximum tree traversal depth",
+          "minimum": 0
+        },
+        {
+          "name": "interactive_only",
+          "type": "boolean",
+          "required": false,
+          "description": "Keep only interactive elements and ancestors"
+        },
+        {
+          "name": "include_bounds",
+          "type": "boolean",
+          "required": false,
+          "description": "Resolve bounding boxes for interactive refs"
+        }
+      ]
+    },
+    {
+      "name": "mimikyu_click",
+      "namespace": "mimikyu",
+      "description": "Click an element by @eN ref or CSS selector",
+      "required": [
+        "target"
+      ],
+      "params": [
+        {
+          "name": "target",
+          "type": "string",
+          "required": true,
+          "description": "Target @eN ref or CSS selector"
+        },
+        {
+          "name": "humanize",
+          "type": "boolean",
+          "required": false,
+          "description": "Override humanize setting for this click"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "mimikyu_fill",
+      "namespace": "mimikyu",
+      "description": "Clear and fill a form field by @eN ref or CSS selector",
+      "required": [
+        "target",
+        "value"
+      ],
+      "params": [
+        {
+          "name": "target",
+          "type": "string",
+          "required": true,
+          "description": "Target @eN ref or CSS selector"
+        },
+        {
+          "name": "value",
+          "type": "string",
+          "required": true,
+          "description": "Text value to fill"
+        },
+        {
+          "name": "humanize",
+          "type": "boolean",
+          "required": false,
+          "description": "Override humanize setting for this fill"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "mimikyu_extract",
+      "namespace": "mimikyu",
+      "description": "Extract structured content (markdown, text, links, or tables) from the current page",
+      "required": [
+        "mode"
+      ],
+      "params": [
+        {
+          "name": "mode",
+          "type": "string",
+          "required": true,
+          "description": "Extraction mode",
+          "enum": [
+            "markdown",
+            "text",
+            "links",
+            "tables"
+          ]
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "mimikyu_wait",
+      "namespace": "mimikyu",
+      "description": "Wait for page idle, text, URL substring, or selector state",
+      "required": [],
+      "params": [
+        {
+          "name": "idle",
+          "type": "boolean",
+          "required": false,
+          "description": "Wait for page lifecycle, network quiet, and layout stability"
+        },
+        {
+          "name": "text",
+          "type": "string",
+          "required": false,
+          "description": "Wait until page text contains this substring"
+        },
+        {
+          "name": "url",
+          "type": "string",
+          "required": false,
+          "description": "Wait until current URL contains this substring"
+        },
+        {
+          "name": "selector",
+          "type": "string",
+          "required": false,
+          "description": "Wait for CSS selector state"
+        },
+        {
+          "name": "state",
+          "type": "string",
+          "required": false,
+          "description": "Desired selector state",
+          "enum": [
+            "attached",
+            "visible",
+            "hidden",
+            "detached"
+          ]
+        },
+        {
+          "name": "timeout_ms",
+          "type": "integer",
+          "required": false,
+          "description": "Maximum wait duration in milliseconds",
+          "minimum": 1
+        },
+        {
+          "name": "poll_interval_ms",
+          "type": "integer",
+          "required": false,
+          "description": "Polling interval in milliseconds",
+          "minimum": 1
+        },
+        {
+          "name": "network_quiet_ms",
+          "type": "integer",
+          "required": false,
+          "description": "Quiet window for idle wait",
+          "minimum": 0
+        },
+        {
+          "name": "stable_target",
+          "type": "string",
+          "required": false,
+          "description": "Optional @eN or CSS target for bounding-box stability"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "mimikyu_batch",
+      "namespace": "mimikyu",
+      "description": "Execute an ordered sequence of browser actions in a single call",
+      "required": [],
+      "params": [
+        {
+          "name": "ops",
+          "type": "array",
+          "required": false,
+          "description": "Ordered array of action objects"
+        },
+        {
+          "name": "file",
+          "type": "string",
+          "required": false,
+          "description": "Path to JSON file containing batch actions"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "mimikyu_eval",
+      "namespace": "mimikyu",
+      "description": "Evaluate JavaScript in isolated world or opt-in main world",
+      "required": [
+        "js"
+      ],
+      "params": [
+        {
+          "name": "js",
+          "type": "string",
+          "required": true,
+          "description": "JavaScript expression or function body to evaluate"
+        },
+        {
+          "name": "main_world",
+          "type": "boolean",
+          "required": false,
+          "description": "Evaluate in page main world instead of isolated world"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "mimikyu_screenshot",
+      "namespace": "mimikyu",
+      "description": "Capture a PNG screenshot of the viewport, full page, or target element",
+      "required": [],
+      "params": [
+        {
+          "name": "out_path",
+          "type": "string",
+          "required": false,
+          "description": "Output PNG file path (returns base64 image block if omitted)"
+        },
+        {
+          "name": "target",
+          "type": "string",
+          "required": false,
+          "description": "Optional @eN ref or CSS selector to clip"
+        },
+        {
+          "name": "full_page",
+          "type": "boolean",
+          "required": false,
+          "description": "Capture full scrollable page when target is omitted"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "browser_open",
+      "namespace": "browser",
+      "description": "Open a browser session if needed and navigate to a URL",
+      "required": [],
+      "params": [
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        },
+        {
+          "name": "profile",
+          "type": "string",
+          "required": false,
+          "description": "Named profile or directory path for persistent storage"
+        },
+        {
+          "name": "ephemeral",
+          "type": "boolean",
+          "required": false,
+          "description": "Use a temporary isolated profile directory"
+        },
+        {
+          "name": "virtual",
+          "type": "boolean",
+          "required": false,
+          "description": "Use a lightweight virtual browser context"
+        },
+        {
+          "name": "engine",
+          "type": "string",
+          "required": false,
+          "description": "Browser engine",
+          "enum": [
+            "chromium",
+            "firefox"
+          ]
+        },
+        {
+          "name": "preset",
+          "type": "string",
+          "required": false,
+          "description": "Environment profile preset",
+          "enum": [
+            "win11",
+            "macos",
+            "linux"
+          ]
+        },
+        {
+          "name": "locale",
+          "type": "string",
+          "required": false,
+          "description": "BCP 47 locale identifier (e.g. en-US, de-DE)"
+        },
+        {
+          "name": "timezone",
+          "type": "string",
+          "required": false,
+          "description": "IANA timezone identifier (e.g. America/Chicago)"
+        },
+        {
+          "name": "proxy",
+          "type": "string",
+          "required": false,
+          "description": "HTTP or SOCKS5 proxy URL"
+        },
+        {
+          "name": "geoip",
+          "type": "string",
+          "required": false,
+          "description": "IPv4/IPv6 address for local GeoIP region alignment"
+        },
+        {
+          "name": "viewport",
+          "type": "string",
+          "required": false,
+          "description": "Viewport size in WxH format (e.g. 1280x720)"
+        },
+        {
+          "name": "block_images",
+          "type": "boolean",
+          "required": false,
+          "description": "Block image requests"
+        },
+        {
+          "name": "block_media",
+          "type": "boolean",
+          "required": false,
+          "description": "Block audio and video media requests"
+        },
+        {
+          "name": "block_fonts",
+          "type": "boolean",
+          "required": false,
+          "description": "Block web font requests"
+        },
+        {
+          "name": "instant_animations",
+          "type": "boolean",
+          "required": false,
+          "description": "Accelerate CSS animations and transitions"
+        },
+        {
+          "name": "humanize",
+          "type": "boolean",
+          "required": false,
+          "description": "Enable kinematic pointer and typing motion"
+        },
+        {
+          "name": "headless",
+          "type": "boolean",
+          "required": false,
+          "description": "Run browser in headless mode (defaults to true)"
+        },
+        {
+          "name": "main_world_eval",
+          "type": "boolean",
+          "required": false,
+          "description": "Allow opt-in main-world evaluation (defaults to true)"
+        },
+        {
+          "name": "url",
+          "type": "string",
+          "required": false,
+          "description": "Optional URL to navigate to after opening or reusing session"
+        }
+      ]
+    },
+    {
+      "name": "browser_close",
+      "namespace": "browser",
+      "description": "Close an active browser session",
+      "required": [],
+      "params": [
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "browser_snapshot",
+      "namespace": "browser",
+      "description": "Capture a compact @eN semantic accessibility tree snapshot",
+      "required": [],
+      "params": [
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        },
+        {
+          "name": "diff",
+          "type": "boolean",
+          "required": false,
+          "description": "Include structural diff from the previous snapshot"
+        },
+        {
+          "name": "max_depth",
+          "type": "integer",
+          "required": false,
+          "description": "Maximum tree traversal depth",
+          "minimum": 0
+        },
+        {
+          "name": "interactive_only",
+          "type": "boolean",
+          "required": false,
+          "description": "Keep only interactive elements and ancestors"
+        },
+        {
+          "name": "include_bounds",
+          "type": "boolean",
+          "required": false,
+          "description": "Resolve bounding boxes for interactive refs"
+        }
+      ]
+    },
+    {
+      "name": "browser_click",
+      "namespace": "browser",
+      "description": "Click an element by @eN ref or CSS selector",
+      "required": [
+        "target"
+      ],
+      "params": [
+        {
+          "name": "target",
+          "type": "string",
+          "required": true,
+          "description": "Target @eN ref or CSS selector"
+        },
+        {
+          "name": "humanize",
+          "type": "boolean",
+          "required": false,
+          "description": "Override humanize setting for this click"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "browser_fill",
+      "namespace": "browser",
+      "description": "Clear and fill a form field by @eN ref or CSS selector",
+      "required": [
+        "target",
+        "value"
+      ],
+      "params": [
+        {
+          "name": "target",
+          "type": "string",
+          "required": true,
+          "description": "Target @eN ref or CSS selector"
+        },
+        {
+          "name": "value",
+          "type": "string",
+          "required": true,
+          "description": "Text value to fill"
+        },
+        {
+          "name": "humanize",
+          "type": "boolean",
+          "required": false,
+          "description": "Override humanize setting for this fill"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "browser_type",
+      "namespace": "browser",
+      "description": "Type text sequentially into an element by @eN ref or CSS selector",
+      "required": [
+        "target",
+        "text"
+      ],
+      "params": [
+        {
+          "name": "target",
+          "type": "string",
+          "required": true,
+          "description": "Target @eN ref or CSS selector"
+        },
+        {
+          "name": "text",
+          "type": "string",
+          "required": true,
+          "description": "Text to type"
+        },
+        {
+          "name": "humanize",
+          "type": "boolean",
+          "required": false,
+          "description": "Override humanize setting for typing"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "browser_press",
+      "namespace": "browser",
+      "description": "Press a keyboard key or key combination",
+      "required": [
+        "key"
+      ],
+      "params": [
+        {
+          "name": "key",
+          "type": "string",
+          "required": true,
+          "description": "Key name (e.g. Enter, Tab, Escape)"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "browser_select",
+      "namespace": "browser",
+      "description": "Select an option in a <select> element by value or label",
+      "required": [
+        "target",
+        "value"
+      ],
+      "params": [
+        {
+          "name": "target",
+          "type": "string",
+          "required": true,
+          "description": "Target @eN ref or CSS selector"
+        },
+        {
+          "name": "value",
+          "type": "string",
+          "required": true,
+          "description": "Option value or label"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "browser_upload",
+      "namespace": "browser",
+      "description": "Attach a local file to a file input element",
+      "required": [
+        "target",
+        "path"
+      ],
+      "params": [
+        {
+          "name": "target",
+          "type": "string",
+          "required": true,
+          "description": "Target @eN ref or CSS selector"
+        },
+        {
+          "name": "path",
+          "type": "string",
+          "required": true,
+          "description": "Path to local file to upload"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "browser_scroll",
+      "namespace": "browser",
+      "description": "Scroll the viewport by horizontal and vertical deltas",
+      "required": [
+        "dx",
+        "dy"
+      ],
+      "params": [
+        {
+          "name": "dx",
+          "type": "number",
+          "required": true,
+          "description": "Horizontal scroll delta in pixels"
+        },
+        {
+          "name": "dy",
+          "type": "number",
+          "required": true,
+          "description": "Vertical scroll delta in pixels"
+        },
+        {
+          "name": "humanize",
+          "type": "boolean",
+          "required": false,
+          "description": "Override humanize setting for scrolling"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "browser_eval",
+      "namespace": "browser",
+      "description": "Evaluate JavaScript in isolated world or opt-in main world",
+      "required": [
+        "js"
+      ],
+      "params": [
+        {
+          "name": "js",
+          "type": "string",
+          "required": true,
+          "description": "JavaScript expression or function body to evaluate"
+        },
+        {
+          "name": "main_world",
+          "type": "boolean",
+          "required": false,
+          "description": "Evaluate in page main world instead of isolated world"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "browser_extract",
+      "namespace": "browser",
+      "description": "Extract structured content (markdown, text, links, or tables) from the current page",
+      "required": [
+        "mode"
+      ],
+      "params": [
+        {
+          "name": "mode",
+          "type": "string",
+          "required": true,
+          "description": "Extraction mode",
+          "enum": [
+            "markdown",
+            "text",
+            "links",
+            "tables"
+          ]
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "browser_screenshot",
+      "namespace": "browser",
+      "description": "Capture a PNG screenshot of the viewport, full page, or target element",
+      "required": [],
+      "params": [
+        {
+          "name": "out_path",
+          "type": "string",
+          "required": false,
+          "description": "Output PNG file path (returns base64 image block if omitted)"
+        },
+        {
+          "name": "target",
+          "type": "string",
+          "required": false,
+          "description": "Optional @eN ref or CSS selector to clip"
+        },
+        {
+          "name": "full_page",
+          "type": "boolean",
+          "required": false,
+          "description": "Capture full scrollable page when target is omitted"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "browser_wait",
+      "namespace": "browser",
+      "description": "Wait for page idle, text, URL substring, or selector state",
+      "required": [],
+      "params": [
+        {
+          "name": "idle",
+          "type": "boolean",
+          "required": false,
+          "description": "Wait for page lifecycle, network quiet, and layout stability"
+        },
+        {
+          "name": "text",
+          "type": "string",
+          "required": false,
+          "description": "Wait until page text contains this substring"
+        },
+        {
+          "name": "url",
+          "type": "string",
+          "required": false,
+          "description": "Wait until current URL contains this substring"
+        },
+        {
+          "name": "selector",
+          "type": "string",
+          "required": false,
+          "description": "Wait for CSS selector state"
+        },
+        {
+          "name": "state",
+          "type": "string",
+          "required": false,
+          "description": "Desired selector state",
+          "enum": [
+            "attached",
+            "visible",
+            "hidden",
+            "detached"
+          ]
+        },
+        {
+          "name": "timeout_ms",
+          "type": "integer",
+          "required": false,
+          "description": "Maximum wait duration in milliseconds",
+          "minimum": 1
+        },
+        {
+          "name": "poll_interval_ms",
+          "type": "integer",
+          "required": false,
+          "description": "Polling interval in milliseconds",
+          "minimum": 1
+        },
+        {
+          "name": "network_quiet_ms",
+          "type": "integer",
+          "required": false,
+          "description": "Quiet window for idle wait",
+          "minimum": 0
+        },
+        {
+          "name": "stable_target",
+          "type": "string",
+          "required": false,
+          "description": "Optional @eN or CSS target for bounding-box stability"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "browser_batch",
+      "namespace": "browser",
+      "description": "Execute an ordered sequence of browser actions in a single call",
+      "required": [],
+      "params": [
+        {
+          "name": "ops",
+          "type": "array",
+          "required": false,
+          "description": "Ordered array of action objects"
+        },
+        {
+          "name": "file",
+          "type": "string",
+          "required": false,
+          "description": "Path to JSON file containing batch actions"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "browser_context_list",
+      "namespace": "browser",
+      "description": "List all active browser sessions and virtual contexts",
+      "required": [],
+      "params": []
+    },
+    {
+      "name": "browser_context_close",
+      "namespace": "browser",
+      "description": "Close an active browser session or virtual context",
+      "required": [],
+      "params": [
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        },
+        {
+          "name": "context",
+          "type": "string",
+          "required": false,
+          "description": "Alias for session identifier"
+        }
+      ]
+    },
+    {
+      "name": "browser_profile_export",
+      "namespace": "browser",
+      "description": "Export session cookies and storage state to a JSON file",
+      "required": [
+        "out_path"
+      ],
+      "params": [
+        {
+          "name": "out_path",
+          "type": "string",
+          "required": true,
+          "description": "Destination storage state JSON path"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "browser_profile_import",
+      "namespace": "browser",
+      "description": "Import session cookies and storage state from a JSON file",
+      "required": [
+        "in_path"
+      ],
+      "params": [
+        {
+          "name": "in_path",
+          "type": "string",
+          "required": true,
+          "description": "Source storage state JSON path"
+        },
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    },
+    {
+      "name": "browser_env_report",
+      "namespace": "browser",
+      "description": "Inspect environment profile, coherence, proxy, and resource policy for a session",
+      "required": [],
+      "params": [
+        {
+          "name": "session",
+          "type": "string",
+          "required": false,
+          "description": "Session identifier (defaults to 'default')"
+        }
+      ]
+    }
+  ]
+}

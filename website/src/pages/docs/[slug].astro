@@ -1,0 +1,107 @@
+---
+import BaseLayout from '../../layouts/BaseLayout.astro';
+import { DOCS_MANIFEST, loadDoc } from '../../lib/docs';
+
+export function getStaticPaths() {
+  return DOCS_MANIFEST.map((doc) => ({
+    params: { slug: doc.slug },
+  }));
+}
+
+const base = import.meta.env.BASE_URL.endsWith('/')
+  ? import.meta.env.BASE_URL
+  : `${import.meta.env.BASE_URL}/`;
+
+const { slug } = Astro.params;
+const doc = loadDoc(slug!, base);
+---
+
+<BaseLayout
+  title={`${doc.title} — mimikyu Docs`}
+  description={doc.summary}
+  canonicalPath={`/docs/${doc.slug}`}
+  activeNav="docs"
+>
+  <div class="mx-auto max-w-6xl px-4 py-10 sm:px-6">
+    <!-- Breadcrumb -->
+    <div class="mb-6 flex flex-wrap items-center justify-between gap-3 font-mono text-xs">
+      <div class="flex items-center gap-2 text-[#C9B8F5]">
+        <a href={base} class="hover:text-[#FFE47A]">mimikyu</a>
+        <span class="text-[#563A9E]">/</span>
+        <a href={`${base}docs`} class="hover:text-[#FFE47A]">docs</a>
+        <span class="text-[#563A9E]">/</span>
+        <span class="text-[#FFE47A]">{doc.filename}</span>
+      </div>
+      <a
+        href={doc.githubUrl}
+        target="_blank"
+        rel="noopener noreferrer"
+        class="hud-btn-ghost px-3 py-1 font-semibold text-[#4CE0B3]"
+      >
+        View Source on GitHub ↗
+      </a>
+    </div>
+
+    <div class="grid gap-8 lg:grid-cols-12">
+      <!-- Left Sidebar: Docs Navigation -->
+      <aside class="lg:col-span-3">
+        <div class="hud-frame p-4 lg:sticky lg:top-20">
+          <div class="font-mono text-[11px] font-bold uppercase tracking-widest text-[#9D80EB]">
+            Root Specifications
+          </div>
+          <nav aria-label="Documentation sections" class="mt-3 space-y-1.5 font-mono text-xs">
+            {DOCS_MANIFEST.map((item) => {
+              const active = item.slug === doc.slug;
+              return (
+                <a
+                  href={`${base}docs/${item.slug}`}
+                  class:list={[
+                    'block border px-3 py-2 transition-colors',
+                    active
+                      ? 'border-[#F5B841] bg-[#22133F] font-bold text-[#FFE47A]'
+                      : 'border-transparent bg-[#120924] text-[#C9B8F5] hover:border-[#563A9E] hover:text-[#F4EEFF]',
+                  ]}
+                >
+                  <div>{item.filename}</div>
+                  <div class="mt-0.5 text-[10px] font-normal text-[#9D80EB]">{item.badge}</div>
+                </a>
+              );
+            })}
+          </nav>
+
+          {doc.headings.length > 0 && (
+            <div class="mt-6 border-t border-[#563A9E]/70 pt-4">
+              <div class="font-mono text-[11px] font-bold uppercase tracking-widest text-[#4CE0B3]">
+                On This Page
+              </div>
+              <ul class="mt-2.5 max-h-80 space-y-1.5 overflow-y-auto pr-1 font-mono text-[11px]">
+                {doc.headings.map((h) => (
+                  <li class={h.depth === 3 ? 'pl-3' : ''}>
+                    <a
+                      href={`#${h.id}`}
+                      class="block text-[#C9B8F5] transition-colors hover:text-[#FFE47A]"
+                    >
+                      {h.text}
+                    </a>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      </aside>
+
+      <!-- Main Markdown Content -->
+      <article class="hud-frame min-w-0 p-6 sm:p-8 lg:col-span-9">
+        <div class="mb-6 flex flex-wrap items-center justify-between gap-2 border-b border-[#563A9E]/70 pb-4 font-mono text-xs text-[#C9B8F5]">
+          <span>
+            Canonical source: <code class="text-[#FFE47A]">{doc.filename}</code>
+          </span>
+          <span>~{doc.readingMinutes} min read</span>
+        </div>
+
+        <div class="docs-prose" set:html={doc.html} />
+      </article>
+    </div>
+  </div>
+</BaseLayout>

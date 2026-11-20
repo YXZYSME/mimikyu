@@ -1,0 +1,99 @@
+# mimikyu (by Saengil)
+
+> High-speed native Rust agentic browser runtime, two-tier session/profile isolation layer, warm Unix-socket daemon, and 31-tool MCP control plane driving local Chromium (CDP) and Firefox (W3C WebDriver BiDi).
+
+- Website: https://mimikyu.saengil.ai
+- Repository: https://github.com/YXZYSME/mimikyu
+- License: MIT OR Apache-2.0
+- Author / Brand: Saengil / YXZYSME
+- MCP Registry ID: io.github.YXZYSME/mimikyu (MCP Protocol 2024-11-05)
+- MSRV: Rust 1.88+ (Edition 2024)
+
+## Key Capabilities & Measured Performance
+
+- **~5.0 ms semantic `@eN` snapshots** (Chromium CDP; `19.0 ms` on Firefox BiDi) across open Shadow DOM and nested/cross-origin iframes.
+- **2.79x–3.57x token compression** (967 -> 347 est. tokens on Chromium CDP; 967 -> 271 est. tokens on Firefox BiDi).
+- **~5.4 ms Markdown extraction** (`5.5 ms` on Firefox BiDi) and **~67.1 ms warm virtual contexts** (Tier 2 `VirtualContextPool`).
+- **Dual-Engine Native Drivers**: Native WebSocket Chromium DevTools Protocol (`driver::cdp`) and W3C WebDriver BiDi (`driver::bidi`) behind a strict `DriverSession` trait boundary.
+- **Two-Tier Isolation**: Tier 1 `fs2`-locked persistent profiles (`--profile`) or self-cleaning ephemeral directories (`--ephemeral`), plus Tier 2 warm pooled virtual browser contexts (`--virtual`).
+- **Coherent Environment Profiles & ProxyRelay**: Built-in `win11`, `macos`, `linux` presets, offline GeoIP alignment (`--geoip`), and an embedded local `127.0.0.1:0` `ProxyRelay` (`--proxy`) supporting authenticated HTTP/SOCKS5 upstreams without exposing credentials in browser flags.
+- **31 Turnkey MCP Tools**: 11 `mimikyu_*` tools + 20 `browser_*` tools over stdio JSON-RPC 2.0.
+- **Verified Suite**: 337 Rust tests (0 Clippy warnings) + 244 opaque-box Python E2E tests (5/5 agentic workflows passing on both Chromium and Firefox).
+
+## Official Package Registries
+
+- Shell (`curl`, SHA-256 + SLSA v1): `curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh`
+- Homebrew (`YXZYSME/homebrew-tap`): `brew tap YXZYSME/tap && brew trust yxzysme/tap && brew install mimikyu`
+- Rust (`crates.io` / `binstall`): `cargo install mimikyu-cli` or `cargo binstall mimikyu-cli` or `cargo add mimikyu`
+- Node (`npm` / `npx`): `npm install -g saengil-mimikyu` or `npx -y saengil-mimikyu doctor` or `npx -y mimikyu-mcp`
+- Python (`PyPI` / `uvx`): `pip install mimikyu` or `uvx mimikyu doctor` or `uvx --from mimikyu mimikyu-mcp`
+
+## MCP Client Configuration
+
+### npx (zero global install)
+```json
+{
+  "mcpServers": {
+    "mimikyu": {
+      "command": "npx",
+      "args": ["-y", "mimikyu-mcp"]
+    }
+  }
+}
+```
+
+### uvx (zero global install)
+```json
+{
+  "mcpServers": {
+    "mimikyu": {
+      "command": "uvx",
+      "args": ["--from", "mimikyu", "mimikyu-mcp"]
+    }
+  }
+}
+```
+
+### Local binary
+```json
+{
+  "mcpServers": {
+    "mimikyu": {
+      "command": "mimikyu",
+      "args": ["mcp", "--engine", "chromium"]
+    }
+  }
+}
+```
+
+## 31 MCP Tools
+
+### `mimikyu_*` Namespace (11 tools)
+- `mimikyu_session_new`: Create a new isolated browser session
+- `mimikyu_session_close`: Close an active browser session and clean up its resources
+- `mimikyu_open`: Navigate an existing session to a URL
+- `mimikyu_snapshot`: Capture a compact `@eN` semantic accessibility tree snapshot
+- `mimikyu_click`: Click an element by `@eN` ref or CSS selector
+- `mimikyu_fill`: Clear and fill a form field by `@eN` ref or CSS selector
+- `mimikyu_extract`: Extract structured content (`markdown`, `text`, `links`, or `tables`)
+- `mimikyu_wait`: Wait for page idle, text, URL substring, or selector state
+- `mimikyu_batch`: Execute an ordered sequence of browser actions in a single call
+- `mimikyu_eval`: Evaluate JavaScript in isolated world or opt-in main world
+- `mimikyu_screenshot`: Capture a PNG screenshot of the viewport, full page, or target element
+
+### `browser_*` Namespace (20 tools)
+- `browser_open`, `browser_close`, `browser_snapshot`, `browser_click`, `browser_fill`, `browser_type`, `browser_press`, `browser_select`, `browser_upload`, `browser_scroll`, `browser_eval`, `browser_extract`, `browser_screenshot`, `browser_wait`, `browser_batch`, `browser_context_list`, `browser_context_close`, `browser_profile_export`, `browser_profile_import`, `browser_env_report`
+
+## Scope & R3 Compliance Boundary
+
+`mimikyu` is strictly a general-purpose AI-agent browser automation, session/profile isolation, and environment consistency runtime. It intentionally excludes any CAPTCHA solver, human-verification challenge bypass, proof-of-work circumvention, or anti-bot gate bypass functionality.
+
+## Documentation URLs
+
+- Home: https://mimikyu.saengil.ai/
+- Docs Hub: https://mimikyu.saengil.ai/docs
+- Architecture & Scaling Invariants: https://mimikyu.saengil.ai/docs/architecture
+- Security Policy & R3 Boundary: https://mimikyu.saengil.ai/docs/security
+- Release & Version Control Process: https://mimikyu.saengil.ai/docs/release
+- Changelog: https://mimikyu.saengil.ai/docs/changelog
+- Contributing Guide: https://mimikyu.saengil.ai/docs/contributing

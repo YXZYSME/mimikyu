@@ -1,0 +1,293 @@
+---
+import '../styles/global.css';
+
+interface Props {
+  title?: string;
+  description?: string;
+  canonicalPath?: string;
+  activeNav?: 'home' | 'docs';
+}
+
+const {
+  title = 'mimikyu by Saengil — High-Speed Rust Agentic Browser Runtime',
+  description = 'Native Rust agentic browser runtime, two-tier session/profile isolation layer, warm Unix-socket daemon, and 31-tool MCP control plane driving local Chromium (CDP) and Firefox (W3C WebDriver BiDi).',
+  canonicalPath = '/',
+  activeNav = 'home',
+} = Astro.props;
+
+const base = import.meta.env.BASE_URL.endsWith('/')
+  ? import.meta.env.BASE_URL
+  : `${import.meta.env.BASE_URL}/`;
+const siteOrigin = Astro.site?.toString().replace(/\/$/, '') || 'https://mimikyu.saengil.ai';
+const canonicalUrl = new URL(canonicalPath.replace(/^\//, ''), `${siteOrigin}${base}`).toString();
+const ogImageUrl = new URL('og-card.png', `${siteOrigin}${base}`).toString();
+
+const softwareAppJsonLd = {
+  '@context': 'https://schema.org',
+  '@type': 'SoftwareApplication',
+  name: 'mimikyu',
+  alternateName: 'mimikyu by Saengil',
+  applicationCategory: 'DeveloperApplication',
+  operatingSystem: 'macOS, Linux',
+  softwareVersion: '0.1.0',
+  license: 'https://opensource.org/licenses/MIT',
+  url: `${siteOrigin}${base}`,
+  downloadUrl: 'https://github.com/YXZYSME/mimikyu/releases',
+  codeRepository: 'https://github.com/YXZYSME/mimikyu',
+  programmingLanguage: 'Rust',
+  author: {
+    '@type': 'Organization',
+    name: 'Saengil',
+    url: 'https://saengil.ai',
+  },
+  description,
+  offers: {
+    '@type': 'Offer',
+    price: '0',
+    priceCurrency: 'USD',
+  },
+};
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#120924" />
+    <link rel="canonical" href={canonicalUrl} />
+    <link rel="icon" type="image/svg+xml" href={`${base}favicon.svg`} />
+
+    <!-- OpenGraph -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="mimikyu by Saengil" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonicalUrl} />
+    <meta property="og:image" content={ogImageUrl} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content="mimikyu by Saengil — 5.0 ms snapshots, CDP + BiDi, 31 MCP tools, Rust" />
+
+    <!-- Twitter Card -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImageUrl} />
+
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700;800&family=Silkscreen:wght@400;700&family=Space+Grotesk:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+
+    <!-- Structured Data -->
+    <script type="application/ld+json" set:html={JSON.stringify(softwareAppJsonLd)} />
+  </head>
+  <body class="antialiased selection:bg-[#9D80EB] selection:text-[#090414]">
+    <!-- Sticky Pixel-HUD Header -->
+    <header class="sticky top-0 z-50 border-b-2 border-[#563A9E] bg-[#120924]/95 backdrop-blur-md">
+      <div class="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-3 sm:px-6">
+        <a href={base} class="group flex items-center gap-3 focus:outline-none">
+          <img
+            src={`${base}assets/mimikyu-mascot.svg`}
+            alt="mimikyu pixel mascot"
+            width="36"
+            height="36"
+            class="pixel-art h-9 w-9 shrink-0 transition-transform group-hover:scale-105"
+          />
+          <div class="flex flex-wrap items-center gap-2">
+            <span class="font-mono text-lg font-extrabold tracking-tight text-[#FFE47A]">
+              mimikyu
+            </span>
+            <span class="border border-[#9D80EB] bg-[#22133F] px-2 py-0.5 font-mono text-[11px] font-semibold tracking-wide text-[#F4EEFF]">
+              by Saengil
+            </span>
+          </div>
+        </a>
+
+        <nav aria-label="Primary navigation" class="hidden items-center gap-1 md:flex">
+          <a
+            href={`${base}#install`}
+            class="px-3 py-1.5 font-mono text-xs font-semibold text-[#C9B8F5] transition-colors hover:bg-[#22133F] hover:text-[#FFE47A]"
+          >
+            Install
+          </a>
+          <a
+            href={`${base}#benchmarks`}
+            class="px-3 py-1.5 font-mono text-xs font-semibold text-[#C9B8F5] transition-colors hover:bg-[#22133F] hover:text-[#4CE0B3]"
+          >
+            Benchmarks
+          </a>
+          <a
+            href={`${base}#mcp`}
+            class="px-3 py-1.5 font-mono text-xs font-semibold text-[#C9B8F5] transition-colors hover:bg-[#22133F] hover:text-[#9D80EB]"
+          >
+            MCP (31)
+          </a>
+          <a
+            href={`${base}#architecture`}
+            class="px-3 py-1.5 font-mono text-xs font-semibold text-[#C9B8F5] transition-colors hover:bg-[#22133F] hover:text-[#FF6B8B]"
+          >
+            Architecture
+          </a>
+          <a
+            href={`${base}docs`}
+            class:list={[
+              'px-3 py-1.5 font-mono text-xs font-semibold transition-colors',
+              activeNav === 'docs'
+                ? 'border border-[#9D80EB] bg-[#22133F] text-[#FFE47A]'
+                : 'text-[#C9B8F5] hover:bg-[#22133F] hover:text-[#F4EEFF]',
+            ]}
+          >
+            Docs
+          </a>
+        </nav>
+
+        <div class="flex items-center gap-2">
+          <a
+            href={`${base}docs`}
+            class="hud-btn-ghost px-2.5 py-1.5 font-mono text-xs font-semibold md:hidden"
+          >
+            Docs
+          </a>
+          <a
+            href="https://github.com/YXZYSME/mimikyu"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="hud-btn-gold inline-flex items-center gap-2 px-3.5 py-1.5 font-mono text-xs font-bold"
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+              <path d="M8 .25a.75.75 0 0 1 .673.418l1.882 3.815 4.21.612a.75.75 0 0 1 .416 1.279l-3.046 2.97.719 4.192a.751.751 0 0 1-1.088.791L8 12.347l-3.766 1.98a.75.75 0 0 1-1.088-.79l.72-4.194L.818 6.374a.75.75 0 0 1 .416-1.28l4.21-.611L7.327.668A.75.75 0 0 1 8 .25Z" />
+            </svg>
+            <span>Star on GitHub</span>
+          </a>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <slot />
+    </main>
+
+    <!-- Footer -->
+    <footer class="mt-20 border-t-2 border-[#563A9E] bg-[#120924]">
+      <div class="mx-auto max-w-6xl px-4 py-12 sm:px-6">
+        <div class="grid gap-10 md:grid-cols-12">
+          <div class="md:col-span-5">
+            <div class="flex items-center gap-3">
+              <img
+                src={`${base}assets/mimikyu-mascot.svg`}
+                alt="mimikyu mascot"
+                width="44"
+                height="44"
+                class="pixel-art h-11 w-11"
+              />
+              <div>
+                <div class="flex items-center gap-2">
+                  <span class="font-mono text-lg font-extrabold text-[#FFE47A]">mimikyu</span>
+                  <span class="border border-[#563A9E] bg-[#180D2E] px-2 py-0.5 font-mono text-[11px] text-[#C9B8F5]">
+                    Saengil → mimikyu
+                  </span>
+                </div>
+                <p class="font-mono text-xs text-[#4CE0B3]">mimikyu.saengil.ai</p>
+              </div>
+            </div>
+            <p class="mt-4 max-w-md text-sm leading-relaxed text-[#C9B8F5]">
+              High-speed native Rust agentic browser runtime, two-tier session &amp; profile isolation layer,
+              warm Unix-socket daemon, and 31-tool MCP control plane for local Chromium (CDP) and Firefox (W3C WebDriver BiDi).
+            </p>
+          </div>
+
+          <div class="md:col-span-3">
+            <h3 class="font-mono text-xs font-bold uppercase tracking-widest text-[#FFE47A]">
+              Documentation
+            </h3>
+            <ul class="mt-3 space-y-2 font-mono text-xs text-[#C9B8F5]">
+              <li><a href={`${base}docs`} class="hover:text-[#4CE0B3]">Docs Hub</a></li>
+              <li><a href={`${base}docs/architecture`} class="hover:text-[#4CE0B3]">ARCHITECTURE.md</a></li>
+              <li><a href={`${base}docs/security`} class="hover:text-[#FF6B8B]">SECURITY.md (R3 Policy)</a></li>
+              <li><a href={`${base}docs/release`} class="hover:text-[#4CE0B3]">RELEASE.md</a></li>
+              <li><a href={`${base}docs/changelog`} class="hover:text-[#4CE0B3]">CHANGELOG.md</a></li>
+              <li><a href={`${base}docs/contributing`} class="hover:text-[#4CE0B3]">CONTRIBUTING.md</a></li>
+              <li><a href={`${base}llms.txt`} class="hover:text-[#FFE47A]">llms.txt (AI Index)</a></li>
+            </ul>
+          </div>
+
+          <div class="md:col-span-4">
+            <h3 class="font-mono text-xs font-bold uppercase tracking-widest text-[#FFE47A]">
+              Official Registries &amp; Legal
+            </h3>
+            <ul class="mt-3 grid grid-cols-2 gap-2 font-mono text-xs text-[#C9B8F5]">
+              <li>
+                <a href="https://github.com/YXZYSME/mimikyu" target="_blank" rel="noopener noreferrer" class="hover:text-[#4CE0B3]">
+                  GitHub Repo ↗
+                </a>
+              </li>
+              <li>
+                <a href="https://crates.io/crates/mimikyu" target="_blank" rel="noopener noreferrer" class="hover:text-[#F5B841]">
+                  crates.io ↗
+                </a>
+              </li>
+              <li>
+                <a href="https://www.npmjs.com/package/saengil-mimikyu" target="_blank" rel="noopener noreferrer" class="hover:text-[#4CE0B3]">
+                  npm (saengil-mimikyu) ↗
+                </a>
+              </li>
+              <li>
+                <a href="https://pypi.org/project/mimikyu/" target="_blank" rel="noopener noreferrer" class="hover:text-[#9D80EB]">
+                  PyPI (mimikyu) ↗
+                </a>
+              </li>
+              <li>
+                <a href="https://github.com/YXZYSME/homebrew-tap" target="_blank" rel="noopener noreferrer" class="hover:text-[#F5B841]">
+                  Homebrew Tap ↗
+                </a>
+              </li>
+              <li>
+                <a href="https://registry.modelcontextprotocol.io/v0/servers?search=io.github.YXZYSME/mimikyu" target="_blank" rel="noopener noreferrer" class="hover:text-[#9D80EB]">
+                  MCP Registry ↗
+                </a>
+              </li>
+              <li>
+                <a href="https://github.com/YXZYSME/mimikyu/blob/main/NOTICE" target="_blank" rel="noopener noreferrer" class="hover:text-[#FFE47A]">
+                  NOTICE ↗
+                </a>
+              </li>
+              <li>
+                <a href="https://github.com/YXZYSME/mimikyu/blob/main/LICENSE-MIT" target="_blank" rel="noopener noreferrer" class="hover:text-[#FFE47A]">
+                  MIT ↗
+                </a>
+                <span class="text-[#563A9E]"> / </span>
+                <a href="https://github.com/YXZYSME/mimikyu/blob/main/LICENSE-APACHE" target="_blank" rel="noopener noreferrer" class="hover:text-[#FFE47A]">
+                  Apache-2.0 ↗
+                </a>
+              </li>
+            </ul>
+          </div>
+        </div>
+
+        <div class="mt-10 border-t border-[#563A9E]/70 pt-6 text-xs leading-relaxed text-[#C9B8F5]">
+          <p class="font-mono text-[11px] text-[#9D80EB]">
+            Copyright © 2026 Saengil / YXZYS (YXZYSME) · Dual-licensed under{' '}
+            <a href="https://github.com/YXZYSME/mimikyu/blob/main/LICENSE-MIT" target="_blank" rel="noopener noreferrer" class="underline hover:text-[#FFE47A]">MIT</a>
+            {' '}OR{' '}
+            <a href="https://github.com/YXZYSME/mimikyu/blob/main/LICENSE-APACHE" target="_blank" rel="noopener noreferrer" class="underline hover:text-[#FFE47A]">Apache-2.0</a>
+            {' '}· See{' '}
+            <a href="https://github.com/YXZYSME/mimikyu/blob/main/NOTICE" target="_blank" rel="noopener noreferrer" class="underline hover:text-[#FFE47A]">NOTICE</a>.
+          </p>
+          <p class="mt-2 text-[#C9B8F5]/85">
+            <strong class="text-[#F4EEFF]">Independent Non-Affiliation Notice:</strong>{' '}
+            <code class="font-mono text-[#FFE47A]">mimikyu</code> is an independent open-source software project;
+            it is not affiliated with, endorsed by, or sponsored by Nintendo, Creatures Inc., or GAME FREAK.
+            All pixel-art illustrations in <code class="font-mono text-[#C9B8F5]">assets/</code> are original works created for this project.
+          </p>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>
