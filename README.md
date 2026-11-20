@@ -36,7 +36,7 @@
 > *"A tiny deterministic Rust agent peeking out from beneath a hand-stitched browser-window & rag-fox cloak. Waving its `@e1` cursor wand, it speaks fluent Chromium CDP and Firefox BiDi in single-digit milliseconds without burning your context window."*
 
 **Why `mimikyu` exists:**
-- **Camoufox-Inspired Foundations:** Inspired by the documented base architecture of [Camoufox](https://camoufox.com/development/) — coherent OS environment presets (`win11`, `macos`, `linux`), offline GeoIP alignment, authenticated loopback proxy relaying, two-tier browser/context isolation, kinematic input modeling, and granular resource blocking.
+- **Coherent Environment & Isolation Foundations:** Built-in OS environment presets (`win11`, `macos`, `linux`), offline GeoIP alignment, authenticated loopback proxy relaying, two-tier browser/context isolation, kinematic input modeling, and granular resource blocking.
 - **Blazing Native Rust Speed:** Compiled into a single native `mimikyu` binary with a warm auto-spawning Unix-socket daemon — delivering **`~5.0 ms` semantic snapshots**, **`~5.4 ms` Markdown extraction**, and **`~67 ms` warm virtual contexts** with zero Node.js or Python runtime overhead.
 - **Token-Efficient `@eN` Agentic Control:** Compresses sprawling DOMs (including open Shadow DOM and nested/cross-origin iframes) by **`2.79x–3.57x`** into deterministic `@e1`, `@e2` interactive element refs, structural diffs, atomic action batches, and **31 turnkey MCP tools**.
 
@@ -184,7 +184,7 @@ e2e/                      # Opaque-box Python 3 stdlib E2E test suite (Tiers 1�
 
 ## Features
 
-### Camoufox-Inspired Environment & Runtime Controls
+### Environment Consistency & Runtime Controls
 - **Consistent Environment Profiles**: Built-in `win11`, `macos`, and `linux` presets with cross-checked UA/platform/screen/locale/timezone coherence validation and synchronized window + worker init scripts (including SharedWorker alignment).
 - **Offline GeoIP & Proxy Alignment**: Local GeoIP lookup (`--geoip`) for timezone/locale derivation and an embedded local `ProxyRelay` (`--proxy`) supporting authenticated HTTP and SOCKS5 upstreams without leaking credentials in browser flags.
 - **Two-Tier Session & Profile Isolation**: Persistent locked profiles, ephemeral temp profiles, storage state export/import (`session export/import`, `profile export/import`), and warm pooled virtual contexts.
@@ -374,4 +374,4 @@ Verified E2E results against `./target/release/mimikyu` (**244/244 passed**, 0 f
 
 Dual-licensed under [`MIT`](LICENSE-MIT) OR [`Apache-2.0`](LICENSE-APACHE) at your option.
 
-`mimikyu` is an independent open-source project and parody homage inspired by [Camoufox](https://camoufox.com/development/); not affiliated with Nintendo, Creatures Inc., GAME FREAK, or the Camoufox authors. All pixel-art illustrations in [`assets/`](assets/) are original works created for this project.
+`mimikyu` is an independent open-source software project; it is not affiliated with, endorsed by, or sponsored by Nintendo, Creatures Inc., or GAME FREAK. All pixel-art illustrations in [`assets/`](assets/) are original works created for this project.

@@ -343,11 +343,11 @@ Once `vX.Y.Z` is live on GitHub Releases, users upgrade seamlessly across all su
 
 ## 6. Parody, Branding & Trademark Best Practices
 
-`mimikyu` embraces playful 16-bit pixel-art aesthetics and takes its project nickname as a developer homage to [Camoufox](https://camoufox.com/development/) ("disguising a clean native Rust browser engine beneath a cozy environment-profile cloak"). To keep the project legally clean, respectful, and unambiguous at scale:
+`mimikyu` embraces playful 16-bit pixel-art aesthetics around its core metaphor of disguising a clean native Rust browser engine beneath a cozy environment-profile cloak. To keep the project legally clean, respectful, and unambiguous at scale:
 
 1. **Explicit Non-Affiliation Notice**:
    - Always retain the prominent disclaimer in `README.md`:
-     > *"`mimikyu` is an independent open-source software project and parody homage inspired by Camoufox; it is not affiliated with, endorsed by, or sponsored by Nintendo, Creatures Inc., GAME FREAK, The Pokémon Company, or the Camoufox authors."*
+     > *"`mimikyu` is an independent open-source software project; it is not affiliated with, endorsed by, or sponsored by Nintendo, Creatures Inc., GAME FREAK, or The Pokémon Company."*
 2. **100% Original Artwork & Assets (`assets/`)**:
    - Every SVG banner, mascot icon, and pixel divider in `assets/` must remain **100% original pixel art** authored from scratch for this repository (an original stitched pixel browser-window / rag-fox sprite).
    - **Never** commit, trace, embed, or link official Pokémon sprites, ripped GBA/DS/3DS/Switch assets, official logos, Pokéball icons, or copyrighted game fonts/audio in code, docs, or PR comments.
