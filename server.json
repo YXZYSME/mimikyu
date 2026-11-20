@@ -1,0 +1,24 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.YXZYSME/mimikyu",
+  "title": "mimikyu",
+  "description": "Fast Chromium CDP & Firefox BiDi browser automation and session isolation MCP server (31 tools).",
+  "repository": {
+    "url": "https://github.com/YXZYSME/mimikyu",
+    "source": "github"
+  },
+  "websiteUrl": "https://github.com/YXZYSME/mimikyu",
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "registryBaseUrl": "https://registry.npmjs.org",
+      "identifier": "mimikyu-mcp",
+      "version": "0.1.0",
+      "runtimeHint": "npx",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

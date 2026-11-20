@@ -72,14 +72,24 @@ curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | s
 curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- --uninstall
 ```
 
-### Rust / Cargo & `cargo-binstall`
+### Rust (`crates.io`) & `cargo-binstall`
 
 ```bash
-# Install directly from Git with Cargo (Rust 1.88+)
-cargo install --git https://github.com/YXZYSME/mimikyu mimikyu-cli
+# Install the unified `mimikyu` CLI, daemon & MCP binary from crates.io
+cargo install mimikyu-cli
 
-# Fast prebuilt binary install via cargo-binstall
+# Or download the prebuilt release binary via cargo-binstall
 cargo binstall mimikyu-cli
+
+# Embed the Rust library runtime in your own project
+cargo add mimikyu
+```
+
+### Homebrew (macOS & Linux)
+
+```bash
+brew tap YXZYSME/tap
+brew install mimikyu
 ```
 
 ### Build & Install from Local Source
@@ -223,7 +233,20 @@ mimikyu daemon stop
 - **11 `mimikyu_*` tools**: `mimikyu_session_new`, `mimikyu_session_close`, `mimikyu_open`, `mimikyu_snapshot`, `mimikyu_click`, `mimikyu_fill`, `mimikyu_extract`, `mimikyu_wait`, `mimikyu_batch`, `mimikyu_eval`, `mimikyu_screenshot`
 - **20 `browser_*` tools**: `browser_open`, `browser_close`, `browser_snapshot`, `browser_click`, `browser_fill`, `browser_type`, `browser_press`, `browser_select`, `browser_upload`, `browser_scroll`, `browser_eval`, `browser_extract`, `browser_screenshot`, `browser_wait`, `browser_batch`, `browser_context_list`, `browser_context_close`, `browser_profile_export`, `browser_profile_import`, `browser_env_report`
 
-Example MCP client entry (or set `"command": "/path/to/mimikyu/target/release/mimikyu"` when running from source):
+Example MCP client entry (zero-install via `npx -y mimikyu-mcp`, or direct `mimikyu` binary):
+
+```json
+{
+  "mcpServers": {
+    "mimikyu": {
+      "command": "npx",
+      "args": ["-y", "mimikyu-mcp"]
+    }
+  }
+}
+```
+
+Or if `mimikyu` is already installed on your `PATH`:
 
 ```json
 {

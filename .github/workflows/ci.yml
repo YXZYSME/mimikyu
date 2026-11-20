@@ -147,7 +147,11 @@ jobs:
         if: matrix.mode == 'browser'
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-          npx --yes playwright install --with-deps "${{ matrix.engine }}"
+          if [ "${{ matrix.tier }}" = "all" ]; then
+            npx --yes playwright install --with-deps chromium firefox
+          else
+            npx --yes playwright install --with-deps "${{ matrix.engine }}"
+          fi
 
       - name: Build release mimikyu binary
         if: matrix.mode == 'browser'
