@@ -887,6 +887,70 @@ async fn cdp_eval_edge_cases_throwing_getter_deep_nesting_dataview_csp_and_synta
         }
         .expect("trailing comment expression");
         assert_eq!(comment_val, serde_json::json!(3));
+
+        // 5b. Comma operator, invalid top-level spread, and custom ES thenable parity
+        let comma_val = if main_world {
+            session.eval_main_world("1, 2").await
+        } else {
+            session.eval_isolated("1, 2").await
+        }
+        .expect("comma expression eval");
+        assert_eq!(comma_val, serde_json::json!(2));
+
+        let comma_assign = if main_world {
+            session
+                .eval_main_world("globalThis.__m_comma = 10, globalThis.__m_comma + 5")
+                .await
+        } else {
+            session
+                .eval_isolated("globalThis.__m_comma = 10, globalThis.__m_comma + 5")
+                .await
+        }
+        .expect("comma assignment eval");
+        assert_eq!(comma_assign, serde_json::json!(15));
+
+        let spread_err = if main_world {
+            session.eval_main_world("...[1, 2]").await
+        } else {
+            session.eval_isolated("...[1, 2]").await
+        }
+        .expect_err("top-level spread must fail with SyntaxError");
+        assert!(
+            matches!(spread_err, MimikyuError::EvalFailed(_)),
+            "main_world={main_world}: expected EvalFailed for top-level spread, got {spread_err:?}"
+        );
+
+        let thenable_val = if main_world {
+            session
+                .eval_main_world("({ then(res) { res(123); } })")
+                .await
+        } else {
+            session.eval_isolated("({ then(res) { res(123); } })").await
+        }
+        .expect("custom object thenable must assimilate");
+        assert_eq!(thenable_val, serde_json::json!(123));
+
+        let fn_thenable = if main_world {
+            session
+                .eval_main_world(
+                    "(() => { const f = () => {}; f.then = (r) => r(77); return f; })()",
+                )
+                .await
+        } else {
+            session
+                .eval_isolated("(() => { const f = () => {}; f.then = (r) => r(77); return f; })()")
+                .await
+        }
+        .expect("function thenable must assimilate");
+        assert_eq!(fn_thenable, serde_json::json!(77));
+
+        let non_callable_then = if main_world {
+            session.eval_main_world("({ a: 1, then: 42 })").await
+        } else {
+            session.eval_isolated("({ a: 1, then: 42 })").await
+        }
+        .expect("non-callable then property must serialize as plain object");
+        assert_eq!(non_callable_then, serde_json::json!({ "a": 1, "then": 42 }));
     }
 
     // 6. Runtime SyntaxError MUST NOT trigger compile-time fallback / double execution!

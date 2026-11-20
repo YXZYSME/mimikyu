@@ -8465,21 +8465,24 @@ fn can_wrap_cdp_eval_expr(expr: &str) -> bool {
 /// and zero `eval()` / CSP dependency).
 fn build_wrapped_cdp_eval_expr(expr: &str) -> String {
     format!(
-        "((__mimikyu_eval_val) => {{\n\
+        "((__v) => {{\n\
             const __validate = (function() {{\n\
                 {CDP_EVAL_JSON_VALIDATOR_CORE}\n\
                 return (root) => (root === undefined ? null : walk(root));\n\
             }})();\n\
-            if (__mimikyu_eval_val !== null && typeof __mimikyu_eval_val === 'object' && (\n\
-                (typeof Promise === 'function' && __mimikyu_eval_val instanceof Promise) ||\n\
-                (Object.prototype.toString.call(__mimikyu_eval_val) === '[object Promise]' &&\n\
-                    typeof __mimikyu_eval_val.then === 'function' &&\n\
-                    Function.prototype.toString.call(__mimikyu_eval_val.then).includes('[native code]'))\n\
-            )) {{\n\
-                return __mimikyu_eval_val.then(__validate);\n\
+            if (__v !== null && (typeof __v === 'object' || typeof __v === 'function')) {{\n\
+                if (typeof Promise === 'function' && __v instanceof Promise) {{\n\
+                    return __v.then(__validate);\n\
+                }}\n\
+                const __then = __v.then;\n\
+                if (typeof __then === 'function') {{\n\
+                    return new Promise((resolve, reject) => {{\n\
+                        __then.call(__v, resolve, reject);\n\
+                    }}).then(__validate);\n\
+                }}\n\
             }}\n\
-            return __validate(__mimikyu_eval_val);\n\
-        }})(\n{expr}\n)"
+            return __validate(__v);\n\
+        }})((\n{expr}\n))"
     )
 }
 
@@ -9996,11 +9999,13 @@ mod tests {
         // Expressions that safely fold into 1-RPC validation
         for expr in [
             "1 + 1",
+            "1, 2",
             "({ a: 1, b: [2, 3] })",
             "(() => ({ ok: true }))()",
             "(function foo() {})",
             "(class Foo {})",
             "Promise.resolve({ answer: 42 })",
+            "({ then(res) { res(123); } })",
             "async () => 42",
             "document.title",
             "new DataView(new ArrayBuffer(4))",
@@ -10012,6 +10017,14 @@ mod tests {
             let wrapped = build_wrapped_cdp_eval_expr(expr);
             assert!(wrapped.contains("ArrayBuffer.isView"));
             assert!(wrapped.contains(expr));
+            assert!(
+                wrapped.ends_with(&format!("((\n{expr}\n))")),
+                "wrapper must group expr in double parens to preserve comma operator"
+            );
+            assert!(
+                !wrapped.to_ascii_lowercase().contains("mimikyu"),
+                "wrapper must not leak tool identifier into main-world stack frames"
+            );
         }
 
         // Statements / declarations / comments / empty / trailing semicolon skip wrapper
