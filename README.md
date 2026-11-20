@@ -5,6 +5,10 @@
 <br />
 
 [![CI](https://github.com/YXZYSME/mimikyu/actions/workflows/ci.yml/badge.svg)](https://github.com/YXZYSME/mimikyu/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/mimikyu?style=flat-square&label=crates.io&labelColor=180d2e&color=f5b841)](https://crates.io/crates/mimikyu)
+[![npm](https://img.shields.io/npm/v/saengil-mimikyu?style=flat-square&label=npm&labelColor=180d2e&color=4ce0b3)](https://www.npmjs.com/package/saengil-mimikyu)
+[![PyPI](https://img.shields.io/pypi/v/mimikyu?style=flat-square&label=PyPI&labelColor=180d2e&color=9d80eb)](https://pypi.org/project/mimikyu/)
+[![MCP Registry](https://img.shields.io/badge/MCP%20Registry-io.github.YXZYSME%2Fmimikyu-9d80eb?style=flat-square&labelColor=180d2e)](https://registry.modelcontextprotocol.io/v0/servers?search=io.github.YXZYSME/mimikyu)
 [![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B%20(2024)-f5b841?style=flat-square&labelColor=180d2e)](Cargo.toml)
 [![Engines: CDP + BiDi](https://img.shields.io/badge/engines-Chromium%20CDP%20%2B%20Firefox%20BiDi-4ce0b3?style=flat-square&labelColor=180d2e)](ARCHITECTURE.md)
 [![MCP Server: 31 Tools](https://img.shields.io/badge/MCP%202024--11--05-31%20tools-9d80eb?style=flat-square&labelColor=180d2e)](#mcp-server-configuration)
@@ -50,6 +54,17 @@
 
 ## Installation & Updating
 
+### Official Package Registries
+
+| Ecosystem | Official Package(s) | Install / Quick Run |
+| :--- | :--- | :--- |
+| **Shell (`curl`)** | [GitHub Releases](https://github.com/YXZYSME/mimikyu/releases) (`SHA256SUMS` + SLSA v1) | `curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh \| sh` |
+| **Homebrew** | [`YXZYSME/homebrew-tap`](https://github.com/YXZYSME/homebrew-tap) (`yxzysme/tap/mimikyu`) | `brew tap YXZYSME/tap && brew install mimikyu` |
+| **Rust (`crates.io`)** | [`mimikyu`](https://crates.io/crates/mimikyu) · [`mimikyu-cli`](https://crates.io/crates/mimikyu-cli) · [`mimikyu-core`](https://crates.io/crates/mimikyu-core) | `cargo install mimikyu-cli` / `cargo binstall mimikyu-cli` |
+| **Node (`npm`)** | [`saengil-mimikyu`](https://www.npmjs.com/package/saengil-mimikyu) · [`mimikyu-cli`](https://www.npmjs.com/package/mimikyu-cli) · [`mimikyu-mcp`](https://www.npmjs.com/package/mimikyu-mcp) | `npm install -g saengil-mimikyu` / `npx -y saengil-mimikyu doctor` |
+| **Python (`PyPI`)** | [`mimikyu`](https://pypi.org/project/mimikyu/) | `pip install mimikyu` / `uvx mimikyu doctor` |
+| **MCP Registry** | [`io.github.YXZYSME/mimikyu`](https://registry.modelcontextprotocol.io/v0/servers?search=io.github.YXZYSME/mimikyu) | `npx -y mimikyu-mcp` or `uvx --from mimikyu mimikyu-mcp` |
+
 ### One-Line POSIX Installer (macOS & Linux)
 
 Downloads the prebuilt [GitHub Release](https://github.com/YXZYSME/mimikyu/releases) archive (`aarch64-apple-darwin`, `x86_64-apple-darwin`, `x86_64-unknown-linux-gnu`, or `aarch64-unknown-linux-gnu`), **verifies its SHA-256 checksum against `SHA256SUMS`** before extraction, and installs atomically to `~/.local/bin` (or `$MIMIKYU_INSTALL_DIR`):
@@ -72,44 +87,63 @@ curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | s
 curl -fsSL https://raw.githubusercontent.com/YXZYSME/mimikyu/main/install.sh | sh -s -- --uninstall
 ```
 
+### Homebrew (macOS & Linux)
+
+Published via the official custom tap [`YXZYSME/homebrew-tap`](https://github.com/YXZYSME/homebrew-tap):
+
+```bash
+brew tap YXZYSME/tap
+brew trust yxzysme/tap   # required once on Homebrew 5+
+brew install mimikyu
+
+# Upgrade later
+brew update && brew upgrade mimikyu
+```
+
 ### Rust (`crates.io`) & `cargo-binstall`
+
+Published on crates.io as [`mimikyu`](https://crates.io/crates/mimikyu) (library facade), [`mimikyu-cli`](https://crates.io/crates/mimikyu-cli) (CLI/daemon/MCP binary), and [`mimikyu-core`](https://crates.io/crates/mimikyu-core) (core runtime):
 
 ```bash
 # Install the unified `mimikyu` CLI, daemon & MCP binary from crates.io
 cargo install mimikyu-cli
 
-# Or download the prebuilt release binary via cargo-binstall
+# Or download the prebuilt GitHub Release binary directly via cargo-binstall
 cargo binstall mimikyu-cli
 
 # Embed the Rust library runtime in your own project
 cargo add mimikyu
 ```
 
-### Homebrew (macOS & Linux)
-
-```bash
-brew tap YXZYSME/tap
-brew install mimikyu
-```
-
 ### Node / `npm` & `npx`
+
+Zero-dependency launchers that download and SHA-256-verify the official native Rust release binary on first run:
 
 ```bash
 # Install the `mimikyu` CLI binary globally via Saengil's official npm package
 npm install -g saengil-mimikyu
+mimikyu doctor
+
+# Or run ephemerally with npx (zero global install)
 npx -y saengil-mimikyu doctor
 
-# (Also published as `mimikyu-cli` and MCP launcher `mimikyu-mcp`)
+# Alternative unscoped CLI alias & dedicated MCP stdio launcher:
+npm install -g mimikyu-cli
+npx -y mimikyu-mcp
 ```
 
 ### Python / `pip` & `uvx`
 
+Published on PyPI as [`mimikyu`](https://pypi.org/project/mimikyu/) (exposing both `mimikyu` and `mimikyu-mcp` console scripts with zero third-party Python dependencies):
+
 ```bash
-# Install `mimikyu` and `mimikyu-mcp` via PyPI
+# Install `mimikyu` and `mimikyu-mcp` onto your PATH
 pip install mimikyu
+mimikyu doctor
 
 # Or run ephemerally with uvx
 uvx mimikyu doctor
+uvx --from mimikyu mimikyu-mcp
 ```
 
 ### Build & Install from Local Source
@@ -127,8 +161,6 @@ cargo build --release
 ./target/release/mimikyu doctor --json
 ```
 
-A Homebrew tap formula template is also maintained at [`packaging/homebrew/mimikyu.rb`](packaging/homebrew/mimikyu.rb) and rendered automatically on tagged releases (see [`RELEASE.md`](RELEASE.md)).
-
 ### Runtime Prerequisites
 
 - **Local Browser:** Chromium/Chrome and/or Firefox installation (auto-discovered via explicit override → `MIMIKYU_CHROMIUM_PATH` / `MIMIKYU_FIREFOX_PATH` → Playwright & Puppeteer local caches → system installs & `PATH`)
@@ -141,7 +173,7 @@ A Homebrew tap formula template is also maintained at [`packaging/homebrew/mimik
 
 ## Architecture
 
-`mimikyu` is organized as a two-crate Rust workspace (Edition 2024, MSRV `1.88`) plus an opaque-box Python 3 stdlib end-to-end test suite (see [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full module graph and non-negotiable invariants):
+`mimikyu` is organized as a three-crate Rust workspace (`mimikyu`, `mimikyu-core`, `mimikyu-cli` — Edition 2024, MSRV `1.88`) plus an opaque-box Python 3 stdlib end-to-end test suite (see [`ARCHITECTURE.md`](ARCHITECTURE.md) for the full module graph and non-negotiable invariants):
 
 ```text
 crates/
@@ -249,11 +281,11 @@ mimikyu daemon stop
 
 ### MCP Server Configuration
 
-`mimikyu mcp` speaks JSON-RPC 2.0 over stdio (MCP protocol `2024-11-05`) and exposes **31 tools**:
+Registered on the **Official MCP Registry** as [`io.github.YXZYSME/mimikyu`](https://registry.modelcontextprotocol.io/v0/servers?search=io.github.YXZYSME/mimikyu). `mimikyu mcp` speaks JSON-RPC 2.0 over stdio (MCP protocol `2024-11-05`) and exposes **31 tools**:
 - **11 `mimikyu_*` tools**: `mimikyu_session_new`, `mimikyu_session_close`, `mimikyu_open`, `mimikyu_snapshot`, `mimikyu_click`, `mimikyu_fill`, `mimikyu_extract`, `mimikyu_wait`, `mimikyu_batch`, `mimikyu_eval`, `mimikyu_screenshot`
 - **20 `browser_*` tools**: `browser_open`, `browser_close`, `browser_snapshot`, `browser_click`, `browser_fill`, `browser_type`, `browser_press`, `browser_select`, `browser_upload`, `browser_scroll`, `browser_eval`, `browser_extract`, `browser_screenshot`, `browser_wait`, `browser_batch`, `browser_context_list`, `browser_context_close`, `browser_profile_export`, `browser_profile_import`, `browser_env_report`
 
-Example MCP client entry (zero-install via `npx -y mimikyu-mcp`, or direct `mimikyu` binary):
+Zero-install MCP client config via **`npx` (`npm`)**:
 
 ```json
 {
@@ -266,7 +298,20 @@ Example MCP client entry (zero-install via `npx -y mimikyu-mcp`, or direct `mimi
 }
 ```
 
-Or if `mimikyu` is already installed on your `PATH`:
+Or zero-install via **`uvx` (`PyPI`)**:
+
+```json
+{
+  "mcpServers": {
+    "mimikyu": {
+      "command": "uvx",
+      "args": ["--from", "mimikyu", "mimikyu-mcp"]
+    }
+  }
+}
+```
+
+Or using a locally installed `mimikyu` binary on your `PATH`:
 
 ```json
 {
