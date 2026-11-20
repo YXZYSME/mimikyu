@@ -3989,21 +3989,47 @@ impl CdpSession {
         self.conn.send_raw(Some(sid), method, params).await
     }
 
+    async fn release_cdp_eval_objects(&self, target_frame_id: Option<&str>, res: &Value) {
+        let exc_oid = res["exceptionDetails"]["exception"]["objectId"].as_str();
+        let res_oid = res["result"]["objectId"].as_str();
+        if let Some(oid) = exc_oid {
+            let _ = self
+                .call_for_frame(
+                    target_frame_id,
+                    "Runtime.releaseObject",
+                    json!({ "objectId": oid }),
+                )
+                .await;
+        }
+        if let Some(oid) = res_oid
+            && Some(oid) != exc_oid
+        {
+            let _ = self
+                .call_for_frame(
+                    target_frame_id,
+                    "Runtime.releaseObject",
+                    json!({ "objectId": oid }),
+                )
+                .await;
+        }
+    }
+
+    async fn resolve_cdp_wrapped_eval_result(
+        &self,
+        target_frame_id: Option<&str>,
+        res: Value,
+    ) -> Result<Value> {
+        self.release_cdp_eval_objects(target_frame_id, &res).await;
+        parse_eval_result(res)
+    }
+
     async fn resolve_cdp_eval_result(
         &self,
         target_frame_id: Option<&str>,
         res: Value,
     ) -> Result<Value> {
         if let Some(exc) = res.get("exceptionDetails") {
-            if let Some(oid) = exc["exception"]["objectId"].as_str() {
-                let _ = self
-                    .call_for_frame(
-                        target_frame_id,
-                        "Runtime.releaseObject",
-                        json!({ "objectId": oid }),
-                    )
-                    .await;
-            }
+            self.release_cdp_eval_objects(target_frame_id, &res).await;
             let text = exc["exception"]["description"]
                 .as_str()
                 .or_else(|| exc["text"].as_str())
@@ -4045,15 +4071,7 @@ impl CdpSession {
                     )
                     .await;
                 let val = fn_res?;
-                if let Some(oid) = val["exceptionDetails"]["exception"]["objectId"].as_str() {
-                    let _ = self
-                        .call_for_frame(
-                            target_frame_id,
-                            "Runtime.releaseObject",
-                            json!({ "objectId": oid }),
-                        )
-                        .await;
-                }
+                self.release_cdp_eval_objects(target_frame_id, &val).await;
                 parse_eval_result(val)
             }
         }
@@ -4821,7 +4839,10 @@ impl CdpSession {
         allow_mid_execution_retry: bool,
     ) -> Result<Value> {
         self.ensure_alive()?;
+        let wrapped_expr = can_wrap_cdp_eval_expr(expr).then(|| build_wrapped_cdp_eval_expr(expr));
+        let mut use_wrapper = wrapped_expr.is_some();
         let mut last_transient_err: Option<MimikyuError> = None;
+
         for attempt in 0..CONTEXT_MAX_ATTEMPTS {
             self.ensure_alive()?;
             let (fid, ctx_id) = match self.get_or_create_isolated_context_for(frame_id).await {
@@ -4841,6 +4862,72 @@ impl CdpSession {
                 Err(err) => return Err(err),
             };
 
+            if use_wrapper && let Some(ref wrapped) = wrapped_expr {
+                let eval_res = self
+                    .call_for_frame(
+                        Some(&fid),
+                        "Runtime.evaluate",
+                        json!({
+                            "expression": wrapped,
+                            "contextId": ctx_id,
+                            "returnByValue": true,
+                            "awaitPromise": true,
+                        }),
+                    )
+                    .await;
+
+                match eval_res {
+                    Ok(v) if is_compile_time_syntax_error(&v) => {
+                        // V8 failed to parse the wrapped expression (0 bytes executed);
+                        // release exception handles and fall back to bare 2-RPC evaluation.
+                        self.release_cdp_eval_objects(Some(&fid), &v).await;
+                        use_wrapper = false;
+                    }
+                    Ok(v) => return self.resolve_cdp_wrapped_eval_result(Some(&fid), v).await,
+                    Err(err) => match classify_transient_context_error(&err) {
+                        Some(TransientContextErrorKind::PreExecution) => {
+                            self.invalidate_frame_contexts(
+                                frame_id,
+                                Some(&fid),
+                                Some(ctx_id),
+                                None,
+                            );
+                            last_transient_err = Some(err);
+                            if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                                && !self.conn.closed.load(Ordering::SeqCst)
+                            {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                continue;
+                            }
+                            break;
+                        }
+                        Some(TransientContextErrorKind::MidOrPostExecution) => {
+                            self.invalidate_frame_contexts(
+                                frame_id,
+                                Some(&fid),
+                                Some(ctx_id),
+                                None,
+                            );
+                            if allow_mid_execution_retry {
+                                last_transient_err = Some(err);
+                                if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                                    && !self.conn.closed.load(Ordering::SeqCst)
+                                {
+                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                    continue;
+                                }
+                                break;
+                            }
+                            return Err(format_mid_eval_context_destroyed_error(
+                                "isolated-world evaluation",
+                                err,
+                            ));
+                        }
+                        None => return Err(err),
+                    },
+                }
+            }
+
             let eval_res = self
                 .call_for_frame(
                     Some(&fid),
@@ -4850,7 +4937,6 @@ impl CdpSession {
                         "contextId": ctx_id,
                         "returnByValue": false,
                         "awaitPromise": true,
-                        "serializationOptions": { "serialization": "deep" },
                     }),
                 )
                 .await;
@@ -5669,41 +5755,24 @@ impl DriverSession for CdpSession {
             return Err(MimikyuError::MainWorldDisabled);
         }
 
+        let wrapped_expr = can_wrap_cdp_eval_expr(expr).then(|| build_wrapped_cdp_eval_expr(expr));
+        let mut use_wrapper = wrapped_expr.is_some();
         let mut last_transient_err: Option<MimikyuError> = None;
+
         for attempt in 0..CONTEXT_MAX_ATTEMPTS {
             self.ensure_alive()?;
-            let mut params = json!({
-                "expression": expr,
-                "returnByValue": false,
-                "awaitPromise": true,
-                "serializationOptions": { "serialization": "deep" },
-            });
-
-            let (target_fid, used_default_ctx, eval_res) = match frame_id {
-                None => (None, None, self.call("Runtime.evaluate", params).await),
+            let (target_fid, used_default_ctx) = match frame_id {
+                None => (None, None),
                 Some(fid) => {
                     let main_fid = self.main_frame_id().await.ok();
                     let is_oopif = self.state.iframe_sessions.lock().contains_key(fid);
                     let cached_ctx = self.state.default_contexts.lock().get(fid).copied();
                     if main_fid.as_deref() == Some(fid) {
-                        (None, None, self.call("Runtime.evaluate", params).await)
+                        (None, None)
                     } else if is_oopif {
-                        if let Some(cid) = cached_ctx {
-                            params["contextId"] = json!(cid);
-                        }
-                        (
-                            Some(fid),
-                            cached_ctx,
-                            self.call_for_frame(Some(fid), "Runtime.evaluate", params)
-                                .await,
-                        )
+                        (Some(fid), cached_ctx)
                     } else if let Some(ctx_id) = cached_ctx {
-                        params["contextId"] = json!(ctx_id);
-                        (
-                            None,
-                            Some(ctx_id),
-                            self.call("Runtime.evaluate", params).await,
-                        )
+                        (None, Some(ctx_id))
                     } else {
                         // The frame's default execution context may have just been cleared
                         // by Page.frameNavigated / Runtime.executionContextsCleared while
@@ -5728,6 +5797,78 @@ impl DriverSession for CdpSession {
                         )));
                     }
                 }
+            };
+
+            if use_wrapper && let Some(ref wrapped) = wrapped_expr {
+                let mut params = json!({
+                    "expression": wrapped,
+                    "returnByValue": true,
+                    "awaitPromise": true,
+                });
+                if let Some(cid) = used_default_ctx {
+                    params["contextId"] = json!(cid);
+                }
+                let eval_res = match target_fid {
+                    Some(fid) => {
+                        self.call_for_frame(Some(fid), "Runtime.evaluate", params)
+                            .await
+                    }
+                    None => self.call("Runtime.evaluate", params).await,
+                };
+                match eval_res {
+                    Ok(v) if is_compile_time_syntax_error(&v) => {
+                        self.release_cdp_eval_objects(target_fid, &v).await;
+                        use_wrapper = false;
+                    }
+                    Ok(v) => return self.resolve_cdp_wrapped_eval_result(target_fid, v).await,
+                    Err(err) => match classify_transient_context_error(&err) {
+                        Some(TransientContextErrorKind::PreExecution) => {
+                            self.invalidate_frame_contexts(
+                                frame_id,
+                                target_fid,
+                                None,
+                                used_default_ctx,
+                            );
+                            last_transient_err = Some(err);
+                            if let Some(&delay_ms) = CONTEXT_RETRY_BACKOFF_MS.get(attempt)
+                                && !self.conn.closed.load(Ordering::SeqCst)
+                            {
+                                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                                continue;
+                            }
+                            break;
+                        }
+                        Some(TransientContextErrorKind::MidOrPostExecution) => {
+                            self.invalidate_frame_contexts(
+                                frame_id,
+                                target_fid,
+                                None,
+                                used_default_ctx,
+                            );
+                            return Err(format_mid_eval_context_destroyed_error(
+                                "main-world evaluation",
+                                err,
+                            ));
+                        }
+                        None => return Err(err),
+                    },
+                }
+            }
+
+            let mut params = json!({
+                "expression": expr,
+                "returnByValue": false,
+                "awaitPromise": true,
+            });
+            if let Some(cid) = used_default_ctx {
+                params["contextId"] = json!(cid);
+            }
+            let eval_res = match target_fid {
+                Some(fid) => {
+                    self.call_for_frame(Some(fid), "Runtime.evaluate", params)
+                        .await
+                }
+                None => self.call("Runtime.evaluate", params).await,
             };
 
             let raw_val = match eval_res {
@@ -8055,7 +8196,9 @@ fn normalize_cdp_same_site(raw: &str) -> Option<&'static str> {
     }
 }
 
-const CDP_EVAL_JSON_VALIDATOR: &str = r#"function() {
+macro_rules! cdp_eval_json_validator_core {
+    () => {
+        r#"
     const ancestors = new Set();
     const toString = Object.prototype.toString;
     const nonJsonTags = new Set([
@@ -8169,8 +8312,17 @@ const CDP_EVAL_JSON_VALIDATOR: &str = r#"function() {
             ancestors.delete(v);
         }
     };
-    return walk(this);
-}"#;
+"#
+    };
+}
+
+const CDP_EVAL_JSON_VALIDATOR_CORE: &str = cdp_eval_json_validator_core!();
+
+const CDP_EVAL_JSON_VALIDATOR: &str = concat!(
+    "function() {",
+    cdp_eval_json_validator_core!(),
+    "    return walk(this);\n}",
+);
 
 /// Backoff schedule between bounded CDP transient context recovery attempts.
 /// 4 attempts total (initial + 3 retries: 25ms -> 75ms -> 150ms; 250ms cap).
@@ -8260,172 +8412,95 @@ fn format_mid_eval_context_destroyed_error(operation: &str, err: MimikyuError) -
     }
 }
 
-#[derive(Debug)]
-enum DeepParseOutcome {
-    Resolved(Result<Value>),
-    NeedsFallback,
+fn starts_with_js_keyword(s: &str, kw: &str) -> bool {
+    let Some(rest) = s.strip_prefix(kw) else {
+        return false;
+    };
+    rest.chars()
+        .next()
+        .is_none_or(|c| !(c.is_ascii_alphanumeric() || c == '_' || c == '$'))
 }
 
-fn parse_cdp_deep_serialized_value(val: &Value) -> DeepParseOutcome {
-    let mut ancestors = HashSet::new();
-    let mut seen = HashMap::new();
-    cdp_deep_serialized_to_json(val, &mut ancestors, &mut seen)
-}
-
-fn cdp_deep_serialized_to_json(
-    val: &Value,
-    ancestors: &mut HashSet<i64>,
-    seen: &mut HashMap<i64, Value>,
-) -> DeepParseOutcome {
-    let t = val.get("type").and_then(|v| v.as_str()).unwrap_or("");
-    match t {
-        "undefined" | "null" => DeepParseOutcome::Resolved(Ok(Value::Null)),
-        "boolean" => match val.get("value").and_then(|v| v.as_bool()) {
-            Some(b) => DeepParseOutcome::Resolved(Ok(Value::Bool(b))),
-            None => DeepParseOutcome::NeedsFallback,
-        },
-        "string" => match val.get("value").and_then(|v| v.as_str()) {
-            Some(s) => DeepParseOutcome::Resolved(Ok(Value::String(s.to_string()))),
-            None => DeepParseOutcome::NeedsFallback,
-        },
-        "number" => {
-            if let Some(n) = val.get("value") {
-                if n.as_f64().is_some_and(f64::is_finite) {
-                    return DeepParseOutcome::Resolved(Ok(n.clone()));
-                }
-                if let Some(s) = n.as_str() {
-                    if s == "-0" {
-                        return DeepParseOutcome::Resolved(Ok(json!(0)));
-                    }
-                    return DeepParseOutcome::Resolved(Err(MimikyuError::EvalFailed(format!(
-                        "JavaScript evaluation returned non-JSON-serializable value (number: {s})"
-                    ))));
-                }
-            }
-            DeepParseOutcome::NeedsFallback
-        }
-        "bigint" | "symbol" | "function" | "regexp" | "date" | "map" | "set" | "weakmap"
-        | "weakset" | "error" | "promise" | "typedarray" | "arraybuffer" | "node" | "window"
-        | "generator" => DeepParseOutcome::Resolved(Err(MimikyuError::EvalFailed(format!(
-            "JavaScript evaluation returned non-JSON-serializable value ({t})"
-        )))),
-        "array" => {
-            let weak_ref = val.get("weakLocalObjectReference").and_then(|v| v.as_i64());
-            if let Some(id) = weak_ref {
-                if ancestors.contains(&id) {
-                    return DeepParseOutcome::Resolved(Err(MimikyuError::EvalFailed(
-                        "Converting circular structure to JSON".to_string(),
-                    )));
-                }
-                if val.get("value").is_none() {
-                    if let Some(cached) = seen.get(&id) {
-                        return DeepParseOutcome::Resolved(Ok(cached.clone()));
-                    }
-                    return DeepParseOutcome::NeedsFallback;
-                }
-            }
-            let Some(arr) = val.get("value").and_then(|v| v.as_array()) else {
-                return DeepParseOutcome::NeedsFallback;
-            };
-            if let Some(id) = weak_ref {
-                ancestors.insert(id);
-            }
-            let mut items = Vec::with_capacity(arr.len());
-            let mut early: Option<DeepParseOutcome> = None;
-            for item in arr {
-                match cdp_deep_serialized_to_json(item, ancestors, seen) {
-                    DeepParseOutcome::Resolved(Ok(v)) => items.push(v),
-                    other => {
-                        early = Some(other);
-                        break;
-                    }
-                }
-            }
-            if let Some(id) = weak_ref {
-                ancestors.remove(&id);
-            }
-            if let Some(other) = early {
-                return other;
-            }
-            let out = Value::Array(items);
-            if let Some(id) = weak_ref {
-                seen.insert(id, out.clone());
-            }
-            DeepParseOutcome::Resolved(Ok(out))
-        }
-        "object" => {
-            let weak_ref = val.get("weakLocalObjectReference").and_then(|v| v.as_i64());
-            if let Some(id) = weak_ref {
-                if ancestors.contains(&id) {
-                    return DeepParseOutcome::Resolved(Err(MimikyuError::EvalFailed(
-                        "Converting circular structure to JSON".to_string(),
-                    )));
-                }
-                if val.get("value").is_none() {
-                    if let Some(cached) = seen.get(&id) {
-                        return DeepParseOutcome::Resolved(Ok(cached.clone()));
-                    }
-                    return DeepParseOutcome::NeedsFallback;
-                }
-            }
-            let Some(pairs) = val.get("value").and_then(|v| v.as_array()) else {
-                return DeepParseOutcome::NeedsFallback;
-            };
-            if let Some(id) = weak_ref {
-                ancestors.insert(id);
-            }
-            let mut obj = serde_json::Map::new();
-            let mut early: Option<DeepParseOutcome> = None;
-            for pair in pairs {
-                let Some(pair_arr) = pair.as_array() else {
-                    early = Some(DeepParseOutcome::NeedsFallback);
-                    break;
-                };
-                if pair_arr.len() != 2 {
-                    early = Some(DeepParseOutcome::NeedsFallback);
-                    break;
-                }
-                if pair_arr[0].get("type").and_then(|v| v.as_str()) == Some("symbol") {
-                    // Match Object.keys(): skip symbol-keyed properties.
-                    continue;
-                }
-                let key = if let Some(s) = pair_arr[0].as_str() {
-                    s.to_string()
-                } else if pair_arr[0].get("type").and_then(|v| v.as_str()) == Some("string")
-                    && let Some(s) = pair_arr[0].get("value").and_then(|v| v.as_str())
-                {
-                    s.to_string()
-                } else {
-                    early = Some(DeepParseOutcome::NeedsFallback);
-                    break;
-                };
-                if pair_arr[1].get("type").and_then(|v| v.as_str()) == Some("undefined") {
-                    continue;
-                }
-                match cdp_deep_serialized_to_json(&pair_arr[1], ancestors, seen) {
-                    DeepParseOutcome::Resolved(Ok(v)) => {
-                        obj.insert(key, v);
-                    }
-                    other => {
-                        early = Some(other);
-                        break;
-                    }
-                }
-            }
-            if let Some(id) = weak_ref {
-                ancestors.remove(&id);
-            }
-            if let Some(other) = early {
-                return other;
-            }
-            let out = Value::Object(obj);
-            if let Some(id) = weak_ref {
-                seen.insert(id, out.clone());
-            }
-            DeepParseOutcome::Resolved(Ok(out))
-        }
-        _ => DeepParseOutcome::NeedsFallback,
+/// Returns true when `expr` can be safely wrapped inside a single-RPC
+/// `Runtime.evaluate(returnByValue: true)` validator call without changing
+/// top-level JS semantics (such as bare `{ ... }` block statements or
+/// `function`/`class` declarations). Any remaining multi-statement scripts
+/// that fail to parse inside `(...)` are detected via `is_compile_time_syntax_error`
+/// before any JS executes and fall back cleanly to the 2-RPC path.
+fn can_wrap_cdp_eval_expr(expr: &str) -> bool {
+    let trimmed = expr.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('{')
+        || trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.ends_with(';')
+    {
+        return false;
     }
+    const STATEMENT_PREFIXES: &[&str] = &[
+        "function", "class", "var", "let", "const", "if", "for", "while", "do", "switch", "try",
+        "throw", "with", "debugger", "return", "import", "export",
+    ];
+    if STATEMENT_PREFIXES
+        .iter()
+        .any(|kw| starts_with_js_keyword(trimmed, kw))
+    {
+        return false;
+    }
+    if starts_with_js_keyword(trimmed, "async") {
+        let after_async = trimmed["async".len()..].trim_start();
+        if starts_with_js_keyword(after_async, "function") {
+            return false;
+        }
+    }
+    true
+}
+
+/// Wraps a JS expression so `CDP_EVAL_JSON_VALIDATOR_CORE` validates and
+/// normalizes the return value (or resolved Promise value) in a single atomic
+/// `Runtime.evaluate(..., returnByValue: true, awaitPromise: true)` RPC.
+///
+/// Because `expr` is passed as the call argument, it evaluates in the outer
+/// global scope (preserving `this === globalThis`, zero identifier shadowing,
+/// and zero `eval()` / CSP dependency).
+fn build_wrapped_cdp_eval_expr(expr: &str) -> String {
+    format!(
+        "((__mimikyu_eval_val) => {{\n\
+            const __validate = (function() {{\n\
+                {CDP_EVAL_JSON_VALIDATOR_CORE}\n\
+                return (root) => (root === undefined ? null : walk(root));\n\
+            }})();\n\
+            if (__mimikyu_eval_val !== null && typeof __mimikyu_eval_val === 'object' && (\n\
+                (typeof Promise === 'function' && __mimikyu_eval_val instanceof Promise) ||\n\
+                (Object.prototype.toString.call(__mimikyu_eval_val) === '[object Promise]' &&\n\
+                    typeof __mimikyu_eval_val.then === 'function' &&\n\
+                    Function.prototype.toString.call(__mimikyu_eval_val.then).includes('[native code]'))\n\
+            )) {{\n\
+                return __mimikyu_eval_val.then(__validate);\n\
+            }}\n\
+            return __validate(__mimikyu_eval_val);\n\
+        }})(\n{expr}\n)"
+    )
+}
+
+/// Detects a V8 compile-time `SyntaxError` (zero instructions executed).
+/// Runtime `SyntaxError`s (e.g. `JSON.parse('{')`, `throw new SyntaxError(...)`)
+/// always carry non-empty `stackTrace.callFrames` and return `false` so
+/// side-effecting scripts are NEVER re-executed.
+fn is_compile_time_syntax_error(res: &Value) -> bool {
+    let Some(exc) = res.get("exceptionDetails") else {
+        return false;
+    };
+    let class_name = exc
+        .get("exception")
+        .and_then(|e| e.get("className"))
+        .and_then(|v| v.as_str());
+    let has_stack_frames = exc
+        .get("stackTrace")
+        .and_then(|st| st.get("callFrames"))
+        .and_then(|cf| cf.as_array())
+        .is_some_and(|frames| !frames.is_empty());
+    class_name == Some("SyntaxError") && !has_stack_frames
 }
 
 #[derive(Debug)]
@@ -8465,17 +8540,6 @@ fn classify_cdp_eval_remote_object(result: &Value) -> CdpEvalAction {
         }
         "object" if subtype == Some("null") => CdpEvalAction::Resolved(Ok(Value::Null)),
         "object" if subtype.is_none() || subtype == Some("array") => {
-            let is_plain_top_object = subtype == Some("array")
-                || matches!(
-                    result.get("className").and_then(|v| v.as_str()),
-                    None | Some("Object")
-                );
-            if is_plain_top_object
-                && let Some(deep) = result.get("deepSerializedValue")
-                && let DeepParseOutcome::Resolved(outcome) = parse_cdp_deep_serialized_value(deep)
-            {
-                return CdpEvalAction::Resolved(outcome);
-            }
             if let Some(oid) = result.get("objectId").and_then(|v| v.as_str()) {
                 CdpEvalAction::ValidateObject {
                     object_id: oid.to_string(),
@@ -9927,104 +9991,98 @@ mod tests {
     }
 
     #[test]
-    fn parse_cdp_deep_serialized_value_resolves_json_dags_rejects_cycles_and_falls_back_on_opaque()
+    fn cdp_single_rpc_wrapper_guards_statements_and_distinguishes_compile_vs_runtime_syntax_errors()
     {
-        // Plain object + array + -0 + undefined omission + array undefined -> null
-        let deep_obj = json!({
-            "type": "object",
-            "value": [
-                ["a", { "type": "array", "value": [
-                    { "type": "number", "value": 1 },
-                    { "type": "undefined" },
-                    { "type": "number", "value": "-0" }
-                ] }],
-                ["skip", { "type": "undefined" }],
-                ["ok", { "type": "boolean", "value": true }]
-            ]
-        });
-        match parse_cdp_deep_serialized_value(&deep_obj) {
-            DeepParseOutcome::Resolved(Ok(v)) => {
-                assert_eq!(v, json!({ "a": [1, null, 0], "ok": true }));
-            }
-            other => panic!("expected resolved JSON object, got {other:?}"),
+        // Expressions that safely fold into 1-RPC validation
+        for expr in [
+            "1 + 1",
+            "({ a: 1, b: [2, 3] })",
+            "(() => ({ ok: true }))()",
+            "(function foo() {})",
+            "(class Foo {})",
+            "Promise.resolve({ answer: 42 })",
+            "async () => 42",
+            "document.title",
+            "new DataView(new ArrayBuffer(4))",
+        ] {
+            assert!(
+                can_wrap_cdp_eval_expr(expr),
+                "expected expression to be wrappable: {expr}"
+            );
+            let wrapped = build_wrapped_cdp_eval_expr(expr);
+            assert!(wrapped.contains("ArrayBuffer.isView"));
+            assert!(wrapped.contains(expr));
         }
 
-        // Shared DAG reference resolves cleanly
-        let dag = json!({
-            "type": "object",
-            "value": [
-                ["a", {
+        // Statements / declarations / comments / empty / trailing semicolon skip wrapper
+        for stmt in [
+            "",
+            "   ",
+            "{ a: 1 }",
+            "function foo() {}",
+            "function* gen() {}",
+            "async function foo() {}",
+            "async function* gen() {}",
+            "class Foo {}",
+            "const x = 1; x + 2",
+            "let x = 1; x + 2",
+            "var x = 1; x + 2",
+            "if (true) 1",
+            "for (let i = 0; i < 1; i++) {}",
+            "throw new Error('boom')",
+            "document.getElementById('x').focus();",
+            "// comment\n1 + 1",
+            "/* comment */ { a: 1 }",
+        ] {
+            assert!(
+                !can_wrap_cdp_eval_expr(stmt),
+                "expected statement/declaration NOT to be wrapped: {stmt}"
+            );
+        }
+
+        // Compile-time SyntaxError (no stack frames) vs runtime SyntaxError (has callFrames)
+        let compile_err = json!({
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {
                     "type": "object",
-                    "weakLocalObjectReference": 1,
-                    "value": [["k", { "type": "number", "value": 7 }]]
-                }],
-                ["b", {
+                    "subtype": "error",
+                    "className": "SyntaxError",
+                    "description": "SyntaxError: Unexpected token ';'",
+                    "objectId": "err-1"
+                }
+            }
+        });
+        assert!(is_compile_time_syntax_error(&compile_err));
+
+        let runtime_syntax_err = json!({
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "stackTrace": {
+                    "callFrames": [{ "functionName": "parse", "lineNumber": 0, "columnNumber": 0 }]
+                },
+                "exception": {
                     "type": "object",
-                    "weakLocalObjectReference": 1
-                }]
-            ]
-        });
-        match parse_cdp_deep_serialized_value(&dag) {
-            DeepParseOutcome::Resolved(Ok(v)) => {
-                assert_eq!(v, json!({ "a": { "k": 7 }, "b": { "k": 7 } }));
-            }
-            other => panic!("expected resolved DAG, got {other:?}"),
-        }
-
-        // Cyclic reference rejects with EvalFailed
-        let cycle = json!({
-            "type": "object",
-            "weakLocalObjectReference": 1,
-            "value": [
-                ["self", { "type": "object", "weakLocalObjectReference": 1 }]
-            ]
-        });
-        match parse_cdp_deep_serialized_value(&cycle) {
-            DeepParseOutcome::Resolved(Err(MimikyuError::EvalFailed(msg))) => {
-                assert!(msg.contains("circular"), "unexpected msg: {msg}");
-            }
-            other => panic!("expected circular EvalFailed, got {other:?}"),
-        }
-
-        // Opaque platform object without "value" triggers fallback validator
-        let opaque = json!({
-            "type": "object",
-            "value": [
-                ["resp", { "type": "object" }]
-            ]
-        });
-        assert!(matches!(
-            parse_cdp_deep_serialized_value(&opaque),
-            DeepParseOutcome::NeedsFallback
-        ));
-
-        // classify_cdp_eval_remote_object resolves plain Object in 1 RPC when deepSerializedValue is present
-        let remote_plain = json!({
-            "type": "object",
-            "className": "Object",
-            "objectId": "obj-plain",
-            "deepSerializedValue": {
-                "type": "object",
-                "value": [["href", { "type": "string", "value": "http://127.0.0.1/" }]]
+                    "subtype": "error",
+                    "className": "SyntaxError",
+                    "description": "SyntaxError: Expected property name",
+                    "objectId": "err-2"
+                }
             }
         });
-        match classify_cdp_eval_remote_object(&remote_plain) {
-            CdpEvalAction::Resolved(Ok(v)) => {
-                assert_eq!(v, json!({ "href": "http://127.0.0.1/" }));
-            }
-            other => panic!("expected 1-RPC Resolved, got {other:?}"),
-        }
+        assert!(!is_compile_time_syntax_error(&runtime_syntax_err));
 
-        // Non-plain className (e.g. Blob) still validates through CDP_EVAL_JSON_VALIDATOR
-        let remote_blob = json!({
-            "type": "object",
-            "className": "Blob",
-            "objectId": "obj-blob",
-            "deepSerializedValue": { "type": "object", "value": [] }
+        let runtime_type_err = json!({
+            "exceptionDetails": {
+                "text": "Uncaught",
+                "exception": {
+                    "type": "object",
+                    "subtype": "error",
+                    "className": "TypeError",
+                    "description": "TypeError: boom"
+                }
+            }
         });
-        assert!(matches!(
-            classify_cdp_eval_remote_object(&remote_blob),
-            CdpEvalAction::ValidateObject { object_id } if object_id == "obj-blob"
-        ));
+        assert!(!is_compile_time_syntax_error(&runtime_type_err));
     }
 }

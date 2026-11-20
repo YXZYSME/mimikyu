@@ -206,6 +206,14 @@ impl RaceTestServer {
   </script>
 </body></html>"#,
                         ),
+                        ("GET", "/strict-csp") => (
+                            "200 OK",
+                            "text/html; charset=utf-8\r\nContent-Security-Policy: script-src 'none'",
+                            r#"<!doctype html>
+<html><head><title>Strict CSP</title></head><body>
+  <div id="csp-ok">locked</div>
+</body></html>"#,
+                        ),
                         ("GET", "/favicon.ico") => ("204 No Content", "text/plain", ""),
                         _ => ("404 Not Found", "text/plain", "not found"),
                     };
@@ -732,6 +740,185 @@ async fn cdp_active_location_replace_churn_recovers_without_raw_32000() {
     }
     assert!(reached_final, "expected churn page to settle at /churn?n=5");
     assert_eq!(session.title().await.expect("final title"), "Churn 5");
+
+    session.dispose().await.expect("dispose");
+    assert_pgid_gone(pid as libc::pid_t);
+}
+
+#[tokio::test]
+async fn cdp_eval_edge_cases_throwing_getter_deep_nesting_dataview_csp_and_syntax_safety() {
+    let server = RaceTestServer::start().await;
+    let session = driver_for(EngineKind::Chromium)
+        .launch(LaunchOptions {
+            engine: EngineKind::Chromium,
+            headless: true,
+            profile_mode: ProfileMode::EphemeralDir,
+            main_world_eval: true,
+            ..Default::default()
+        })
+        .await
+        .expect("launch chromium");
+    let pid = session.info().pid.expect("chromium pid");
+
+    session
+        .navigate(&server.url("/strict-csp"))
+        .await
+        .expect("navigate /strict-csp");
+
+    for main_world in [false, true] {
+        // 1. Strict CSP (`script-src 'none'`): single-RPC wrapper uses zero eval()/new Function()
+        let csp_val = if main_world {
+            session
+                .eval_main_world("({ csp: 'ok', arr: [1, 2] })")
+                .await
+        } else {
+            session.eval_isolated("({ csp: 'ok', arr: [1, 2] })").await
+        }
+        .expect("strict CSP eval must succeed");
+        assert_eq!(csp_val, serde_json::json!({ "csp": "ok", "arr": [1, 2] }));
+
+        // 2. Throwing getter MUST fail cleanly with EvalFailed (never crash/wedge renderer)
+        let getter_expr = "({ get a() { throw new Error('getter-boom'); }, b: 4 })";
+        let getter_err = if main_world {
+            session.eval_main_world(getter_expr).await
+        } else {
+            session.eval_isolated(getter_expr).await
+        }
+        .expect_err("throwing getter must fail");
+        match &getter_err {
+            MimikyuError::EvalFailed(msg) => {
+                assert!(
+                    msg.contains("getter-boom"),
+                    "main_world={main_world}: expected getter-boom in {msg}"
+                );
+            }
+            other => panic!("main_world={main_world}: expected EvalFailed, got {other:?}"),
+        }
+        // Session remains immediately healthy after throwing getter
+        let probe = if main_world {
+            session.eval_main_world("2 + 3").await
+        } else {
+            session.eval_isolated("2 + 3").await
+        }
+        .expect("session must remain healthy after throwing getter");
+        assert_eq!(probe, serde_json::json!(5));
+
+        // 3. Deeply nested plain object (depth 50) MUST succeed without JSON recursion overflow
+        let deep_expr = "(() => { let o = { leaf: 1 }; for (let i = 0; i < 50; i++) o = { d: i, n: o }; return o; })()";
+        let deep_val = if main_world {
+            session.eval_main_world(deep_expr).await
+        } else {
+            session.eval_isolated(deep_expr).await
+        }
+        .expect("depth-50 plain object must succeed");
+        let mut cursor = &deep_val;
+        for expected_d in (0..50).rev() {
+            assert_eq!(cursor["d"], serde_json::json!(expected_d));
+            cursor = &cursor["n"];
+        }
+        assert_eq!(cursor["leaf"], serde_json::json!(1));
+
+        // 4. Nested DataView MUST be rejected with EvalFailed (matching ArrayBuffer.isView)
+        let dv_expr = "({ d: new DataView(new ArrayBuffer(4)) })";
+        let dv_err = if main_world {
+            session.eval_main_world(dv_expr).await
+        } else {
+            session.eval_isolated(dv_expr).await
+        }
+        .expect_err("nested DataView must fail");
+        match &dv_err {
+            MimikyuError::EvalFailed(msg) => {
+                assert!(
+                    msg.contains("DataView"),
+                    "main_world={main_world}: expected DataView in {msg}"
+                );
+            }
+            other => panic!("main_world={main_world}: expected EvalFailed, got {other:?}"),
+        }
+
+        // 5. Statements, bare blocks, declarations, and trailing line comments preserve exact JS semantics
+        let block_val = if main_world {
+            session.eval_main_world("{ a: 1 }").await
+        } else {
+            session.eval_isolated("{ a: 1 }").await
+        }
+        .expect("block statement eval");
+        assert_eq!(block_val, serde_json::json!(1));
+
+        let const_val = if main_world {
+            session.eval_main_world("const __m_c = 10; __m_c + 5").await
+        } else {
+            session.eval_isolated("const __m_c = 10; __m_c + 5").await
+        }
+        .expect("const statement eval");
+        assert_eq!(const_val, serde_json::json!(15));
+
+        let multi_stmt = if main_world {
+            session.eval_main_world("__m_a = 7; __m_a + 3").await
+        } else {
+            session.eval_isolated("__m_a = 7; __m_a + 3").await
+        }
+        .expect("multi-statement fallback eval");
+        assert_eq!(multi_stmt, serde_json::json!(10));
+
+        let fn_decl = if main_world {
+            session
+                .eval_main_world("function __m_decl() { return 9; }")
+                .await
+        } else {
+            session
+                .eval_isolated("function __m_decl() { return 9; }")
+                .await
+        }
+        .expect("function declaration eval");
+        assert_eq!(fn_decl, serde_json::Value::Null);
+        let fn_call = if main_world {
+            session.eval_main_world("__m_decl()").await
+        } else {
+            session.eval_isolated("__m_decl()").await
+        }
+        .expect("declared function must exist in global scope");
+        assert_eq!(fn_call, serde_json::json!(9));
+
+        let comment_val = if main_world {
+            session.eval_main_world("1 + 2 // trailing comment").await
+        } else {
+            session.eval_isolated("1 + 2 // trailing comment").await
+        }
+        .expect("trailing comment expression");
+        assert_eq!(comment_val, serde_json::json!(3));
+    }
+
+    // 6. Runtime SyntaxError MUST NOT trigger compile-time fallback / double execution!
+    session
+        .navigate(&server.url("/side-effect-host"))
+        .await
+        .expect("navigate /side-effect-host");
+    let before = server.side_effect_hits();
+    let rt_err = session
+        .eval_isolated(
+            r#"(() => {
+                fetch('/side-effect', { method: 'POST', keepalive: true });
+                throw new SyntaxError('runtime-syntax-boom');
+            })()"#,
+        )
+        .await
+        .expect_err("runtime SyntaxError must fail");
+    match &rt_err {
+        MimikyuError::EvalFailed(msg) => {
+            assert!(
+                msg.contains("runtime-syntax-boom"),
+                "unexpected runtime SyntaxError msg: {msg}"
+            );
+        }
+        other => panic!("expected EvalFailed, got {other:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        server.side_effect_hits(),
+        before + 1,
+        "runtime SyntaxError must execute at most once (never fall back and double-execute)"
+    );
 
     session.dispose().await.expect("dispose");
     assert_pgid_gone(pid as libc::pid_t);
