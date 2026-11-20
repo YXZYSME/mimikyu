@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Two-Tier Session & Profile Isolation (`isolation`)**:
   - **Tier 1 (Process & Disk Profile)**: Exclusive `fs2`-locked persistent profiles (`--profile`), self-cleaning ephemeral directories (`--ephemeral`), and portable JSON cookie/storage export and import (`session export/import`, `profile export/import`).
   - **Tier 2 (Virtual Browser Contexts)**: Warm pooled lightweight contexts (`--virtual` / `VirtualContextPool`) for low-latency concurrent agent sessions.
-- **Camoufox-Inspired Environment Consistency (`env_profile`)**:
+- **Environment Consistency (`env_profile`)**:
   - Built-in `win11`, `macos`, and `linux` OS environment presets with cross-checked User-Agent, platform, screen/viewport, locale, and timezone coherence validation.
   - Synchronized window, Worker, and SharedWorker initialization script injection.
   - Offline GeoIP timezone/locale derivation (`--geoip`) and loopback `ProxyRelay` (`127.0.0.1:0`) supporting upstream HTTP and SOCKS5 authentication without exposing credentials on browser command lines.
