@@ -263,7 +263,7 @@ rewrite_cargo_lock_preview() {
       print
       next
     }
-    (pkg == "mimikyu-core" || pkg == "mimikyu-cli") && $0 ~ /^version = "/ {
+    (pkg == "mimikyu" || pkg == "mimikyu-core" || pkg == "mimikyu-cli") && $0 ~ /^version = "/ {
       print "version = \"" ver "\""
       pkg = ""
       next
@@ -292,11 +292,14 @@ fi
 # 2. Dry-run simulation (never touches the working tree!)
 if [ "$DRY_RUN" -eq 1 ]; then
   TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/mimikyu-release-dryrun.XXXXXX")
-  mkdir -p "$TMP_DIR/crates/mimikyu-core" "$TMP_DIR/crates/mimikyu-cli" "$TMP_DIR/packaging/homebrew"
+  mkdir -p "$TMP_DIR/crates/mimikyu-core" "$TMP_DIR/crates/mimikyu-cli" "$TMP_DIR/crates/mimikyu" "$TMP_DIR/packaging/homebrew"
 
   rewrite_cargo_toml "$REPO_ROOT/Cargo.toml" "$TMP_DIR/Cargo.toml" "$NEW_VERSION"
   cp "$REPO_ROOT/crates/mimikyu-core/Cargo.toml" "$TMP_DIR/crates/mimikyu-core/Cargo.toml"
   cp "$REPO_ROOT/crates/mimikyu-cli/Cargo.toml" "$TMP_DIR/crates/mimikyu-cli/Cargo.toml"
+  if [ -f "$REPO_ROOT/crates/mimikyu/Cargo.toml" ]; then
+    cp "$REPO_ROOT/crates/mimikyu/Cargo.toml" "$TMP_DIR/crates/mimikyu/Cargo.toml"
+  fi
   rewrite_cargo_lock_preview "$REPO_ROOT/Cargo.lock" "$TMP_DIR/Cargo.lock" "$NEW_VERSION"
   rewrite_changelog "$REPO_ROOT/CHANGELOG.md" "$TMP_DIR/CHANGELOG.md" "$NEW_VERSION" "$RELEASE_DATE"
   if [ -f "$REPO_ROOT/packaging/homebrew/mimikyu.rb" ]; then

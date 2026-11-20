@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/mimikyu-core", "crates/mimikyu-cli"]
+members = ["crates/mimikyu-core", "crates/mimikyu-cli", "crates/mimikyu"]
 
 [workspace.package]
 version = "0.1.0"

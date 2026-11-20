@@ -58,6 +58,7 @@ done
 ROOT_CARGO="$REPO_ROOT/Cargo.toml"
 CORE_CARGO="$REPO_ROOT/crates/mimikyu-core/Cargo.toml"
 CLI_CARGO="$REPO_ROOT/crates/mimikyu-cli/Cargo.toml"
+UMBRELLA_CARGO="$REPO_ROOT/crates/mimikyu/Cargo.toml"
 CARGO_LOCK="$REPO_ROOT/Cargo.lock"
 CHANGELOG="$REPO_ROOT/CHANGELOG.md"
 BREW_FORMULA="$REPO_ROOT/packaging/homebrew/mimikyu.rb"
@@ -141,6 +142,9 @@ check_member_manifest() {
 
 check_member_manifest "$CORE_CARGO" "crates/mimikyu-core/Cargo.toml"
 check_member_manifest "$CLI_CARGO" "crates/mimikyu-cli/Cargo.toml"
+if [ -f "$UMBRELLA_CARGO" ]; then
+  check_member_manifest "$UMBRELLA_CARGO" "crates/mimikyu/Cargo.toml"
+fi
 
 # 3. Verify Cargo.lock is synchronized for workspace crates
 check_lockfile_pkg() {
@@ -174,6 +178,9 @@ check_lockfile_pkg() {
 
 check_lockfile_pkg "mimikyu-core"
 check_lockfile_pkg "mimikyu-cli"
+if [ -f "$UMBRELLA_CARGO" ]; then
+  check_lockfile_pkg "mimikyu"
+fi
 
 # 4. Verify Homebrew formula version sync if present
 if [ -f "$BREW_FORMULA" ]; then

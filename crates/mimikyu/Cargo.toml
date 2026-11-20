@@ -1,0 +1,16 @@
+[package]
+name = "mimikyu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Fast dual-engine (CDP & WebDriver BiDi) browser automation, session/profile isolation, and MCP runtime for AI agents"
+homepage = "https://github.com/YXZYSME/mimikyu"
+repository = "https://github.com/YXZYSME/mimikyu"
+documentation = "https://docs.rs/mimikyu"
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+mimikyu-core.workspace = true
