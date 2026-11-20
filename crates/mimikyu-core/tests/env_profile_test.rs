@@ -2112,6 +2112,7 @@ async fn assert_target_blank_links_preserve_env_and_network_virtual(engine: Engi
         .await
         .expect("set_route_mock");
 
+    let host_tid = vc.session().info().target_id.clone();
     vc.session()
         .navigate(&server.url("/target-blank-host"))
         .await
@@ -2132,6 +2133,18 @@ async fn assert_target_blank_links_preserve_env_and_network_virtual(engine: Engi
         !blank_out.is_null(),
         "{engine}: timed out waiting for <a target=_blank>"
     );
+
+    // Bring the opener tab back to the foreground and settle a layout frame before clicking `#lnk-noopener`.
+    vc.session()
+        .activate_tab(&host_tid)
+        .await
+        .unwrap_or_else(|e| panic!("{engine}: activate_tab(host_tid) before noopener failed: {e}"));
+    let _ = vc
+        .session()
+        .eval_isolated(
+            "new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))",
+        )
+        .await;
 
     click_element_real_mouse(vc.session().as_ref(), "#lnk-noopener").await;
 

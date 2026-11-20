@@ -277,9 +277,19 @@ pub fn sample_key_delay_ms(
     safe_ms.round().clamp(12.0, 220.0) as u64
 }
 
+pub const MAX_WHEEL_DELTA_PX: f64 = 32_000.0;
+
+pub fn sanitize_wheel_delta(delta: f64) -> f64 {
+    if delta.is_finite() {
+        delta.clamp(-MAX_WHEEL_DELTA_PX, MAX_WHEEL_DELTA_PX)
+    } else {
+        0.0
+    }
+}
+
 pub fn split_wheel_notches(dx: f64, dy: f64, rng: &mut impl Rng) -> Vec<(f64, f64, u64)> {
-    let dx = if dx.is_finite() { dx } else { 0.0 };
-    let dy = if dy.is_finite() { dy } else { 0.0 };
+    let dx = sanitize_wheel_delta(dx);
+    let dy = sanitize_wheel_delta(dy);
     let total_mag = dx.abs().max(dy.abs());
     if total_mag < 1e-3 {
         return vec![(dx, dy, 0)];
@@ -328,7 +338,10 @@ mod tests {
 
     #[test]
     fn clamp_point_to_viewport_prevents_negative_or_overflow() {
-        assert_eq!(clamp_point_to_viewport(-5.0, -1.0, 1280.0, 800.0), (0.0, 0.0));
+        assert_eq!(
+            clamp_point_to_viewport(-5.0, -1.0, 1280.0, 800.0),
+            (0.0, 0.0)
+        );
         assert_eq!(
             clamp_point_to_viewport(1280.0, 800.0, 1280.0, 800.0),
             (1279.0, 799.0)
@@ -351,7 +364,10 @@ mod tests {
             &cfg,
         );
         assert!(pts.len() > 2);
-        assert_eq!((pts.last().unwrap().x, pts.last().unwrap().y), (600.0, 420.0));
+        assert_eq!(
+            (pts.last().unwrap().x, pts.last().unwrap().y),
+            (600.0, 420.0)
+        );
 
         // Check viewport clamping & non-collinearity against start->end line
         let (x0, y0) = (100.0_f64, 100.0_f64);
@@ -369,10 +385,16 @@ mod tests {
             speeds.push(seg / (p.delay_ms as f64));
             prev = (p.x, p.y);
         }
-        assert!(max_perp > 2.0, "trajectory must be curved, max_perp={max_perp}");
+        assert!(
+            max_perp > 2.0,
+            "trajectory must be curved, max_perp={max_perp}"
+        );
         let min_v = speeds.iter().copied().fold(f64::INFINITY, f64::min);
         let max_v = speeds.iter().copied().fold(0.0_f64, f64::max);
-        assert!(max_v > min_v * 1.5, "expected non-constant velocity: min={min_v}, max={max_v}");
+        assert!(
+            max_v > min_v * 1.5,
+            "expected non-constant velocity: min={min_v}, max={max_v}"
+        );
     }
 
     #[test]
@@ -409,7 +431,10 @@ mod tests {
                 assert!(p.y.is_finite() && p.y >= 0.0 && p.y <= 799.0);
                 assert!(p.delay_ms >= 3);
             }
-            assert_eq!((pts.last().unwrap().x, pts.last().unwrap().y), (300.0, 300.0));
+            assert_eq!(
+                (pts.last().unwrap().x, pts.last().unwrap().y),
+                (300.0, 300.0)
+            );
         }
 
         let nan_vp_pts = generate_trajectory(
@@ -464,6 +489,10 @@ mod tests {
                     assert!(
                         nx.is_finite() && ny.is_finite(),
                         "non-finite notch ({nx}, {ny}) for ({dx}, {dy})"
+                    );
+                    assert!(
+                        nx.abs() <= MAX_WHEEL_DELTA_PX && ny.abs() <= MAX_WHEEL_DELTA_PX,
+                        "unclamped notch ({nx}, {ny}) exceeded {MAX_WHEEL_DELTA_PX}"
                     );
                 }
             }

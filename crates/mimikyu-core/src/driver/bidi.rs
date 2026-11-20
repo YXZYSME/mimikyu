@@ -5,34 +5,34 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::{Mutex, RwLock};
-use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
+use serde_json::{Value, json};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async_with_config;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{debug, warn};
 
 use crate::driver::{
-    now_ms, AxNode, BoundingBox, BrowserDriver, ConsoleEntry, ContextOptions, Cookie,
-    DriverCapabilities, DriverSession, EngineKind, EnvProfile, FrameInfo, KeyEvent, KeyEventType,
-    LaunchOptions, MouseButton, MouseEvent, MouseEventType, NavInfo, NetworkEvent, OriginStorage,
-    PageError, PermissionGrant, PermissionState, ProfileMode, ProxyConfig, RouteMock,
-    ScreenshotFormat, ScreenshotOpts, SelectBy, SessionInfo, ShadowMatch, StorageState, TabInfo,
-    WheelEvent, MOD_ALT, MOD_CONTROL, MOD_META, MOD_SHIFT,
+    AxNode, BoundingBox, BrowserDriver, ConsoleEntry, ContextOptions, Cookie, DriverCapabilities,
+    DriverSession, EngineKind, EnvProfile, FrameInfo, KeyEvent, KeyEventType, LaunchOptions,
+    MOD_ALT, MOD_CONTROL, MOD_META, MOD_SHIFT, MouseButton, MouseEvent, MouseEventType, NavInfo,
+    NetworkEvent, OriginStorage, PageError, PermissionGrant, PermissionState, ProfileMode,
+    ProxyConfig, RouteMock, ScreenshotFormat, ScreenshotOpts, SelectBy, SessionInfo, ShadowMatch,
+    StorageState, TabInfo, WheelEvent, now_ms,
 };
 use crate::env_profile::{
-    build_firefox_shared_worker_network_clear_script, build_firefox_shared_worker_network_script,
-    build_window_init_script, ProxyRelay,
+    ProxyRelay, build_firefox_shared_worker_network_clear_script,
+    build_firefox_shared_worker_network_script, build_window_init_script,
 };
 use crate::error::{MimikyuError, Result};
 use crate::network::{
-    http_reason_phrase, merge_headers_case_insensitive, BlockPolicy, InterceptDecision,
-    InterceptRequest, NetworkInterceptor, ResourceType, RouteRule, TelemetryConfig, TelemetryStore,
+    BlockPolicy, InterceptDecision, InterceptRequest, NetworkInterceptor, ResourceType, RouteRule,
+    TelemetryConfig, TelemetryStore, http_reason_phrase, merge_headers_case_insensitive,
 };
 use crate::process::ProcessGuard;
 
@@ -94,7 +94,8 @@ impl BrowserDriver for BidiDriver {
             .unwrap_or_else(|| profile_dir.join("downloads"));
         let pid = process.pid();
 
-        let conn = BidiConnection::connect(&ws_session_url, process, root_relay, pool_download_dir).await?;
+        let conn = BidiConnection::connect(&ws_session_url, process, root_relay, pool_download_dir)
+            .await?;
 
         let new_sess = match conn
             .send(
@@ -295,10 +296,7 @@ fn bidi_capabilities() -> DriverCapabilities {
     }
 }
 
-async fn create_user_context(
-    conn: &BidiConnection,
-    proxy: Option<&ProxyConfig>,
-) -> Result<String> {
+async fn create_user_context(conn: &BidiConnection, proxy: Option<&ProxyConfig>) -> Result<String> {
     let mut params = json!({ "acceptInsecureCerts": true });
     if let Some(p) = proxy {
         params["proxy"] = proxy_to_bidi_json(p)?;
@@ -494,10 +492,7 @@ impl BidiConnection {
         }
         let uc = {
             let ctx_ucs = self.context_user_contexts.read();
-            ctx_ucs
-                .get(cid)
-                .or_else(|| ctx_ucs.get(&last_cur))
-                .cloned()
+            ctx_ucs.get(cid).or_else(|| ctx_ucs.get(&last_cur)).cloned()
         }?;
         self.user_contexts.read().get(&uc).cloned()
     }
@@ -655,9 +650,8 @@ impl BidiConnection {
                     break;
                 }
             }
-            parents.retain(|child, parent| {
-                !destroyed.contains(child) && !destroyed.contains(parent)
-            });
+            parents
+                .retain(|child, parent| !destroyed.contains(child) && !destroyed.contains(parent));
         }
         {
             self.context_openers
@@ -672,9 +666,10 @@ impl BidiConnection {
         }
 
         if let Some(state) = owner_state {
-            state.inline_frame_owners.lock().retain(|child, owner| {
-                !destroyed.contains(child) && !destroyed.contains(owner)
-            });
+            state
+                .inline_frame_owners
+                .lock()
+                .retain(|child, owner| !destroyed.contains(child) && !destroyed.contains(owner));
             let mut removed_popups = Vec::new();
             {
                 let mut pops = state.popup_contexts.lock();
@@ -842,7 +837,9 @@ impl BidiConnection {
                                 let state_clone = Arc::clone(&owner_state);
                                 let popup_cid = cid.to_string();
                                 tokio::spawn(async move {
-                                    state_clone.setup_popup_context(&conn_clone, &popup_cid).await;
+                                    state_clone
+                                        .setup_popup_context(&conn_clone, &popup_cid)
+                                        .await;
                                 });
                             }
                         }
@@ -953,15 +950,12 @@ impl BidiConnection {
                     return;
                 }
 
-                let ctx_id = params
-                    .get("context")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        params
-                            .get("source")
-                            .and_then(|s| s.get("context"))
-                            .and_then(|v| v.as_str())
-                    });
+                let ctx_id = params.get("context").and_then(|v| v.as_str()).or_else(|| {
+                    params
+                        .get("source")
+                        .and_then(|s| s.get("context"))
+                        .and_then(|v| v.as_str())
+                });
 
                 self.record_download_network_event(method, ctx_id, &params);
                 if method == "browsingContext.load"
@@ -981,8 +975,10 @@ impl BidiConnection {
                     {
                         let _ = self.untrack_request(ctx_id, req_id);
                     }
-                    if matches!(method, "network.responseStarted" | "network.responseCompleted")
-                        && let Some(cid) = ctx_id
+                    if matches!(
+                        method,
+                        "network.responseStarted" | "network.responseCompleted"
+                    ) && let Some(cid) = ctx_id
                         && let Some(url_str) = params["request"]["url"].as_str()
                     {
                         let hdrs = bidi_headers_to_btree(params["response"].get("headers"));
@@ -1019,7 +1015,10 @@ impl BidiConnection {
                         .and_then(|w| w.upgrade());
                     if let Some(telem) = telem_opt {
                         let resp = &params["response"];
-                        let status = resp.get("status").and_then(|v| v.as_u64()).map(|s| s as u16);
+                        let status = resp
+                            .get("status")
+                            .and_then(|v| v.as_u64())
+                            .map(|s| s as u16);
                         let mime_type = resp
                             .get("mimeType")
                             .and_then(|v| v.as_str())
@@ -1035,7 +1034,10 @@ impl BidiConnection {
                 {
                     if let Some(telem) = self.untrack_request(ctx_id, req_id) {
                         let resp = &params["response"];
-                        let status = resp.get("status").and_then(|v| v.as_u64()).map(|s| s as u16);
+                        let status = resp
+                            .get("status")
+                            .and_then(|v| v.as_u64())
+                            .map(|s| s as u16);
                         let mime_type = resp
                             .get("mimeType")
                             .and_then(|v| v.as_str())
@@ -1132,10 +1134,7 @@ impl BidiConnection {
                     .get("initiator")
                     .and_then(|i| i.get("type"))
                     .and_then(|v| v.as_str());
-                let is_navigation = params
-                    .get("navigation")
-                    .and_then(|v| v.as_str())
-                    .is_some();
+                let is_navigation = params.get("navigation").and_then(|v| v.as_str()).is_some();
                 let is_fetch_or_xhr = initiator_type.is_some_and(|t| {
                     matches!(t.to_ascii_lowercase().as_str(), "fetch" | "xmlhttprequest")
                 });
@@ -1154,8 +1153,7 @@ impl BidiConnection {
                     if pending.len() >= 512 {
                         pending.retain(|_, q| {
                             while let Some(front) = q.front() {
-                                if now.duration_since(front.enqueued_at)
-                                    >= Duration::from_secs(120)
+                                if now.duration_since(front.enqueued_at) >= Duration::from_secs(120)
                                 {
                                     q.pop_front();
                                 } else {
@@ -1389,7 +1387,8 @@ impl BidiConnection {
             let chosen = if let Some(cd) = cd_name {
                 cd
             } else if let Some(un_suffixed) = strip_firefox_collision_suffix(&safe_suggested)
-                && (active.contains(&un_suffixed) || self.pool_download_dir.join(&un_suffixed).exists())
+                && (active.contains(&un_suffixed)
+                    || self.pool_download_dir.join(&un_suffixed).exists())
             {
                 un_suffixed
             } else {
@@ -1405,8 +1404,7 @@ impl BidiConnection {
         let nav_counts = Arc::clone(&self.active_download_nav_counts);
         let weak_conn = Arc::downgrade(self);
         let ctx_owned = cid.to_string();
-        let is_http_url =
-            norm_url.starts_with("http://") || norm_url.starts_with("https://");
+        let is_http_url = norm_url.starts_with("http://") || norm_url.starts_with("https://");
 
         tokio::spawn(async move {
             const ZERO_BYTE_FALLBACK_SETTLE: Duration = Duration::from_millis(250);
@@ -1606,9 +1604,7 @@ impl BidiConnection {
                             false
                         } else if download_end_complete {
                             !part_blocking
-                        } else if bound_req_id.is_some()
-                            && is_completed
-                            && expected_len == Some(0)
+                        } else if bound_req_id.is_some() && is_completed && expected_len == Some(0)
                         {
                             if !part_blocking && !req_pending {
                                 if zero_finalized {
@@ -1619,7 +1615,8 @@ impl BidiConnection {
                                     // stealing Firefox's pre-move 0-byte placeholder under CI CPU load.
                                     let since = zero_settle_since
                                         .get_or_insert_with(tokio::time::Instant::now);
-                                    stable_ticks >= 5 && since.elapsed() >= DOWNLOAD_END_SAFETY_FALLBACK
+                                    stable_ticks >= 5
+                                        && since.elapsed() >= DOWNLOAD_END_SAFETY_FALLBACK
                                 } else {
                                     let since = zero_settle_since
                                         .get_or_insert_with(tokio::time::Instant::now);
@@ -1663,8 +1660,7 @@ impl BidiConnection {
                             let latest_active = active_set.lock().len();
                             let latest_part_blocking = latest_own_part
                                 || (has_any_part_file(&pool_dir) && latest_active <= 1);
-                            let grew_non_zero =
-                                std::fs::metadata(&src).is_ok_and(|m| m.len() > 0);
+                            let grew_non_zero = std::fs::metadata(&src).is_ok_and(|m| m.len() > 0);
                             if latest_part_blocking || grew_non_zero {
                                 tokio::time::sleep(Duration::from_millis(15)).await;
                                 continue;
@@ -1770,9 +1766,7 @@ impl BidiConnection {
                 })?
                 .to_string();
             *guard = Some(id);
-        } else if !need
-            && let Some(id) = guard.take()
-        {
+        } else if !need && let Some(id) = guard.take() {
             let _ = self
                 .send("network.removeIntercept", json!({ "intercept": id }))
                 .await;
@@ -1907,9 +1901,7 @@ impl BidiContextState {
         conn: &Arc<BidiConnection>,
         params: &Value,
     ) {
-        if !self.instant_animations.load(Ordering::SeqCst)
-            || self.disposed.load(Ordering::SeqCst)
-        {
+        if !self.instant_animations.load(Ordering::SeqCst) || self.disposed.load(Ordering::SeqCst) {
             return;
         }
         let Some(target_cid) = params
@@ -2061,11 +2053,9 @@ impl BidiContextState {
                                     let ln =
                                         f.get("lineNumber").and_then(|v| v.as_u64()).unwrap_or(0)
                                             + 1;
-                                    let col = f
-                                        .get("columnNumber")
-                                        .and_then(|v| v.as_u64())
-                                        .unwrap_or(0)
-                                        + 1;
+                                    let col =
+                                        f.get("columnNumber").and_then(|v| v.as_u64()).unwrap_or(0)
+                                            + 1;
                                     format!("    at {fn_name} ({u}:{ln}:{col})")
                                 })
                                 .collect::<Vec<_>>()
@@ -2138,10 +2128,7 @@ impl BidiContextState {
                     .get("initiator")
                     .and_then(|i| i.get("type"))
                     .and_then(|v| v.as_str());
-                let is_navigation = params
-                    .get("navigation")
-                    .and_then(|v| v.as_str())
-                    .is_some();
+                let is_navigation = params.get("navigation").and_then(|v| v.as_str()).is_some();
                 let is_sse_accept = request_headers.iter().any(|(k, v)| {
                     k.eq_ignore_ascii_case("accept")
                         && v.to_ascii_lowercase().contains("text/event-stream")
@@ -2272,7 +2259,10 @@ impl BidiContextState {
                                         "network.continueRequest(ModifyHeaders) failed: {e}"
                                     );
                                     let _ = conn_clone
-                                        .send("network.continueRequest", json!({ "request": req_id }))
+                                        .send(
+                                            "network.continueRequest",
+                                            json!({ "request": req_id }),
+                                        )
                                         .await;
                                 }
                             }
@@ -2299,7 +2289,10 @@ impl BidiContextState {
                                     }
                                 } else {
                                     let _ = conn_clone
-                                        .send("network.continueRequest", json!({ "request": req_id }))
+                                        .send(
+                                            "network.continueRequest",
+                                            json!({ "request": req_id }),
+                                        )
                                         .await;
                                 }
                             }
@@ -2361,9 +2354,7 @@ impl BidiContextState {
     }
 
     async fn setup_popup_context(self: &Arc<Self>, conn: &Arc<BidiConnection>, popup_cid: &str) {
-        if self.disposed.load(Ordering::SeqCst)
-            || !self.popup_contexts.lock().contains(popup_cid)
-        {
+        if self.disposed.load(Ordering::SeqCst) || !self.popup_contexts.lock().contains(popup_cid) {
             return;
         }
 
@@ -3270,9 +3261,7 @@ impl BidiSession {
                 .and_then(|arr| arr.first())
                 .cloned()
                 .ok_or_else(|| {
-                    MimikyuError::ElementNotFound(format!(
-                        "selector '{sel}' matched no element"
-                    ))
+                    MimikyuError::ElementNotFound(format!("selector '{sel}' matched no element"))
                 })?;
             return Ok((target_ctx.to_string(), node));
         }
@@ -4421,13 +4410,16 @@ impl DriverSession for BidiSession {
                     .map(|p| (f.frame_id.clone(), p.clone()))
             })
             .collect();
-        let mut rect_cache: HashMap<String, HashMap<String, (bool, FrameTransform)>> = HashMap::new();
+        let mut rect_cache: HashMap<String, HashMap<String, (bool, FrameTransform)>> =
+            HashMap::new();
 
         for f in frames {
             if f.is_main {
                 continue;
             }
-            let already_has_frame = nodes.iter().any(|n| n.frame_id.as_deref() == Some(&f.frame_id));
+            let already_has_frame = nodes
+                .iter()
+                .any(|n| n.frame_id.as_deref() == Some(&f.frame_id));
             if already_has_frame {
                 continue;
             }
@@ -4543,7 +4535,9 @@ impl DriverSession for BidiSession {
             )));
         }
         let mut bbox = serde_json::from_value::<BoundingBox>(val).map_err(|e| {
-            MimikyuError::ElementNotFound(format!("invalid bounding box for {backend_node_id}: {e}"))
+            MimikyuError::ElementNotFound(format!(
+                "invalid bounding box for {backend_node_id}: {e}"
+            ))
         })?;
         if let Some(ref fid) = found_in_ctx
             && !fid.starts_with("iframe:")
@@ -4706,6 +4700,89 @@ impl DriverSession for BidiSession {
         let right = val["right"].as_f64().unwrap_or(0.0).max(0.0);
         let bottom = val["bottom"].as_f64().unwrap_or(0.0).max(0.0);
         Ok((right, bottom))
+    }
+
+    async fn viewport_and_gutters(&self) -> Result<(f64, f64, f64, f64)> {
+        let val = self
+            .eval_isolated(
+                r#"(() => {
+                    const iw = window.innerWidth || 1280;
+                    const ih = window.innerHeight || 800;
+                    const de = document.documentElement;
+                    const cw = (de && de.clientWidth) || iw;
+                    const ch = (de && de.clientHeight) || ih;
+                    const se = document.scrollingElement || de;
+                    if (!se) {
+                        return {
+                            w: iw,
+                            h: ih,
+                            right: Math.max(0, iw - cw),
+                            bottom: Math.max(0, ih - ch),
+                        };
+                    }
+                    const deStyle = de ? getComputedStyle(de) : null;
+                    const bodyStyle = document.body ? getComputedStyle(document.body) : null;
+                    const deSb = deStyle ? deStyle.scrollbarWidth : 'auto';
+                    const sbWidth = deSb || 'auto';
+                    const ovY = deStyle && deStyle.overflowY !== 'visible'
+                        ? deStyle.overflowY
+                        : (bodyStyle ? bodyStyle.overflowY : 'visible');
+                    const ovX = deStyle && deStyle.overflowX !== 'visible'
+                        ? deStyle.overflowX
+                        : (bodyStyle ? bodyStyle.overflowX : 'visible');
+                    let right = 0;
+                    if (cw < iw) {
+                        right = iw - cw;
+                    } else if (se.scrollHeight > ih + 1 && ovY !== 'hidden' && ovY !== 'clip' && sbWidth !== 'none') {
+                        if (sbWidth === 'thin') {
+                            right = 12;
+                            const probeY = Math.min(Math.max(Math.floor(ih / 2), 1), Math.max(ih - 1, 1));
+                            const interiorHit = iw > 24 ? document.elementFromPoint(iw - 24, probeY) : null;
+                            const canUseDeHit = interiorHit !== null && interiorHit !== de;
+                            for (let d = 16; d >= 6; d--) {
+                                if (iw > d) {
+                                    const hit = document.elementFromPoint(iw - d, probeY);
+                                    if (hit === null || (d <= 12 && canUseDeHit && hit === de)) {
+                                        right = d;
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            right = 16;
+                        }
+                    }
+                    let bottom = 0;
+                    if (ch < ih) {
+                        bottom = ih - ch;
+                    } else if (se.scrollWidth > iw + 1 && ovX !== 'hidden' && ovX !== 'clip' && sbWidth !== 'none') {
+                        if (sbWidth === 'thin') {
+                            bottom = 12;
+                            const probeX = Math.min(Math.max(Math.floor(iw / 2), 1), Math.max(iw - 1, 1));
+                            const interiorHit = ih > 24 ? document.elementFromPoint(probeX, ih - 24) : null;
+                            const canUseDeHit = interiorHit !== null && interiorHit !== de;
+                            for (let d = 16; d >= 6; d--) {
+                                if (ih > d) {
+                                    const hit = document.elementFromPoint(probeX, ih - d);
+                                    if (hit === null || (d <= 12 && canUseDeHit && hit === de)) {
+                                        bottom = d;
+                                        break;
+                                    }
+                                }
+                            }
+                        } else {
+                            bottom = 16;
+                        }
+                    }
+                    return { w: iw, h: ih, right, bottom };
+                })()"#,
+            )
+            .await?;
+        let w = val["w"].as_f64().unwrap_or(1280.0).max(1.0);
+        let h = val["h"].as_f64().unwrap_or(800.0).max(1.0);
+        let right = val["right"].as_f64().unwrap_or(0.0).max(0.0);
+        let bottom = val["bottom"].as_f64().unwrap_or(0.0).max(0.0);
+        Ok((w, h, right, bottom))
     }
 
     async fn scroll_into_view(
@@ -4967,11 +5044,7 @@ impl DriverSession for BidiSession {
         Ok(val.as_str().map(ToString::to_string))
     }
 
-    async fn focus_node(
-        &self,
-        backend_node_id: Option<i64>,
-        selector: Option<&str>,
-    ) -> Result<()> {
+    async fn focus_node(&self, backend_node_id: Option<i64>, selector: Option<&str>) -> Result<()> {
         if let Some(sel) = selector {
             let ok = self
                 .call_sandbox_fn(
@@ -5221,6 +5294,8 @@ impl DriverSession for BidiSession {
         if missing != 0 {
             self.send_modifier_key_actions(missing, true).await?;
         }
+        let dx = crate::input::humanize::sanitize_wheel_delta(ev.delta_x);
+        let dy = crate::input::humanize::sanitize_wheel_delta(ev.delta_y);
         let res = self
             .conn
             .send(
@@ -5234,8 +5309,8 @@ impl DriverSession for BidiSession {
                             "type": "scroll",
                             "x": (ev.x.round() as i64).max(0),
                             "y": (ev.y.round() as i64).max(0),
-                            "deltaX": ev.delta_x.round() as i64,
-                            "deltaY": ev.delta_y.round() as i64,
+                            "deltaX": dx.round() as i64,
+                            "deltaY": dy.round() as i64,
                         }],
                     }],
                 }),
@@ -5320,18 +5395,14 @@ impl DriverSession for BidiSession {
             .conn
             .send("browsingContext.captureScreenshot", params)
             .await?;
-        let b64 = res["data"]
-            .as_str()
-            .ok_or_else(|| MimikyuError::Protocol {
-                code: -1,
-                message: "browsingContext.captureScreenshot missing data".to_string(),
-            })?;
-        BASE64
-            .decode(b64)
-            .map_err(|e| MimikyuError::Protocol {
-                code: -1,
-                message: format!("invalid base64 screenshot data: {e}"),
-            })
+        let b64 = res["data"].as_str().ok_or_else(|| MimikyuError::Protocol {
+            code: -1,
+            message: "browsingContext.captureScreenshot missing data".to_string(),
+        })?;
+        BASE64.decode(b64).map_err(|e| MimikyuError::Protocol {
+            code: -1,
+            message: format!("invalid base64 screenshot data: {e}"),
+        })
     }
 
     async fn pdf(&self) -> Result<Vec<u8>> {
@@ -5346,18 +5417,14 @@ impl DriverSession for BidiSession {
                 }),
             )
             .await?;
-        let b64 = res["data"]
-            .as_str()
-            .ok_or_else(|| MimikyuError::Protocol {
-                code: -1,
-                message: "browsingContext.print missing data".to_string(),
-            })?;
-        BASE64
-            .decode(b64)
-            .map_err(|e| MimikyuError::Protocol {
-                code: -1,
-                message: format!("invalid base64 PDF data: {e}"),
-            })
+        let b64 = res["data"].as_str().ok_or_else(|| MimikyuError::Protocol {
+            code: -1,
+            message: "browsingContext.print missing data".to_string(),
+        })?;
+        BASE64.decode(b64).map_err(|e| MimikyuError::Protocol {
+            code: -1,
+            message: format!("invalid base64 PDF data: {e}"),
+        })
     }
 
     async fn set_instant_animations(&self, enabled: bool) -> Result<()> {
@@ -5380,10 +5447,7 @@ impl DriverSession for BidiSession {
                 .anim_uses_user_context
                 .store(false, Ordering::SeqCst);
             if enabled {
-                let fn_decl = format!(
-                    "() => {{\n{}\n}}",
-                    BIDI_INSTANT_ANIM_ENABLE_SCRIPT
-                );
+                let fn_decl = format!("() => {{\n{}\n}}", BIDI_INSTANT_ANIM_ENABLE_SCRIPT);
                 if self.state.owns_user_context
                     && let Some(ref uc) = self.state.user_context
                     && let Ok(res) = self
@@ -5434,10 +5498,7 @@ impl DriverSession for BidiSession {
                     .await;
             }
             if enabled && !uses_uc {
-                let fn_decl = format!(
-                    "() => {{\n{}\n}}",
-                    BIDI_INSTANT_ANIM_ENABLE_SCRIPT
-                );
+                let fn_decl = format!("() => {{\n{}\n}}", BIDI_INSTANT_ANIM_ENABLE_SCRIPT);
                 for pcid in &popup_cids {
                     if let Ok(res) = self
                         .conn
@@ -6082,10 +6143,7 @@ impl DriverSession for BidiSession {
             .into_iter()
             .map(|c| Cookie {
                 name: c["name"].as_str().unwrap_or_default().to_string(),
-                value: c["value"]["value"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_string(),
+                value: c["value"]["value"].as_str().unwrap_or_default().to_string(),
                 domain: c["domain"].as_str().unwrap_or_default().to_string(),
                 path: c["path"].as_str().unwrap_or("/").to_string(),
                 expires: c["expiry"].as_f64(),
@@ -6202,9 +6260,7 @@ impl DriverSession for BidiSession {
             }
             let ls_json = serde_json::to_string(&entry.local_storage)?;
             let ss_json = serde_json::to_string(&entry.session_storage)?;
-            if current_origin.as_deref() == Some(entry.origin.as_str())
-                && entry.origin != "null"
-            {
+            if current_origin.as_deref() == Some(entry.origin.as_str()) && entry.origin != "null" {
                 let script = format!(
                     r#"(() => {{
                         const ls = {ls_json};
@@ -6300,9 +6356,7 @@ impl DriverSession for BidiSession {
             return Ok(());
         }
         self.state.anim_gen.fetch_add(1, Ordering::SeqCst);
-        self.state
-            .instant_animations
-            .store(false, Ordering::SeqCst);
+        self.state.instant_animations.store(false, Ordering::SeqCst);
         self.state
             .anim_uses_user_context
             .store(false, Ordering::SeqCst);
@@ -6442,14 +6496,17 @@ impl DriverSession for BidiSession {
                     self.conn.cleanup_destroyed_context(cid);
                 }
                 let mut uc_cids = Vec::new();
-                self.conn.context_user_contexts.write().retain(|cid, ctx_uc| {
-                    if ctx_uc == uc {
-                        uc_cids.push(cid.clone());
-                        false
-                    } else {
-                        true
-                    }
-                });
+                self.conn
+                    .context_user_contexts
+                    .write()
+                    .retain(|cid, ctx_uc| {
+                        if ctx_uc == uc {
+                            uc_cids.push(cid.clone());
+                            false
+                        } else {
+                            true
+                        }
+                    });
                 if !uc_cids.is_empty() {
                     let mut openers = self.conn.context_openers.write();
                     for cid in &uc_cids {
@@ -6497,11 +6554,7 @@ fn extract_http_origin(raw_url: &str) -> Option<String> {
         return None;
     }
     let orig = parsed.origin().ascii_serialization();
-    if orig == "null" {
-        None
-    } else {
-        Some(orig)
-    }
+    if orig == "null" { None } else { Some(orig) }
 }
 
 async fn send_bidi_permission(
@@ -6550,8 +6603,10 @@ fn parse_bidi_walker_result(
         for pair in wins {
             if let Some(arr) = pair.as_array()
                 && arr.len() == 2
-                && let (Some(sub_fid), Some(ctx)) =
-                    (arr[0].as_str(), arr[1].get("context").and_then(|c| c.as_str()))
+                && let (Some(sub_fid), Some(ctx)) = (
+                    arr[0].as_str(),
+                    arr[1].get("context").and_then(|c| c.as_str()),
+                )
             {
                 win_map.insert(sub_fid.to_string(), ctx.to_string());
                 inline_owners.insert(ctx.to_string(), owner_ctx.to_string());
@@ -6619,14 +6674,18 @@ fn bidi_remote_value_to_json(
             .and_then(|v| v.as_bool())
             .map(Value::Bool)
             .ok_or_else(|| {
-                MimikyuError::EvalFailed("JavaScript evaluation returned invalid boolean value".into())
+                MimikyuError::EvalFailed(
+                    "JavaScript evaluation returned invalid boolean value".into(),
+                )
             }),
         "string" => val
             .get("value")
             .and_then(|v| v.as_str())
             .map(|s| Value::String(s.to_string()))
             .ok_or_else(|| {
-                MimikyuError::EvalFailed("JavaScript evaluation returned invalid string value".into())
+                MimikyuError::EvalFailed(
+                    "JavaScript evaluation returned invalid string value".into(),
+                )
             }),
         "number" => {
             if let Some(n) = val.get("value") {
@@ -7468,8 +7527,12 @@ mod tests {
         let conn = make_test_conn(PathBuf::from("/tmp/pool"));
         let dl1 = PathBuf::from("/tmp/dl1");
         let st = make_test_ctx_state(Some("uc-1"), Some(dl1.clone()));
-        conn.contexts.write().insert("tab-1".into(), Arc::clone(&st));
-        conn.user_contexts.write().insert("uc-1".into(), Arc::clone(&st));
+        conn.contexts
+            .write()
+            .insert("tab-1".into(), Arc::clone(&st));
+        conn.user_contexts
+            .write()
+            .insert("uc-1".into(), Arc::clone(&st));
 
         // Simulate browsingContext.contextCreated for popup + iframe inside popup
         conn.handle_incoming(
@@ -7662,8 +7725,13 @@ mod tests {
         conn.pending.lock().insert(101, tx1);
         conn.pending.lock().insert(102, tx2);
 
-        conn.handle_incoming(r#"{"type":"success","id":101,"result":{"type":"string","value":"\ud800"}}"#);
-        let res1 = rx1.try_recv().expect("101 must resolve immediately").unwrap();
+        conn.handle_incoming(
+            r#"{"type":"success","id":101,"result":{"type":"string","value":"\ud800"}}"#,
+        );
+        let res1 = rx1
+            .try_recv()
+            .expect("101 must resolve immediately")
+            .unwrap();
         assert_eq!(res1["value"], "\u{FFFD}");
 
         conn.handle_incoming(r#"{"type":"success","id":102,"result":BROKEN}"#);
@@ -7680,8 +7748,12 @@ mod tests {
 
         let conn = make_test_conn(pool_dir.clone());
         let st = make_test_ctx_state(Some("uc-dl"), Some(dest_dir.clone()));
-        conn.contexts.write().insert("cid-dl".into(), Arc::clone(&st));
-        conn.user_contexts.write().insert("uc-dl".into(), Arc::clone(&st));
+        conn.contexts
+            .write()
+            .insert("cid-dl".into(), Arc::clone(&st));
+        conn.user_contexts
+            .write()
+            .insert("uc-dl".into(), Arc::clone(&st));
 
         // 1. 0-byte placeholder + random Firefox .part file: must NOT relocate until .part moves onto target
         let url1 = "http://127.0.0.1:9999/zero1.bin";
@@ -7730,7 +7802,10 @@ mod tests {
         while !dest_dir.join("zero1.bin").exists() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
-        assert!(dest_dir.join("zero1.bin").exists(), "zero1.bin should relocate after .part finalization");
+        assert!(
+            dest_dir.join("zero1.bin").exists(),
+            "zero1.bin should relocate after .part finalization"
+        );
         assert!(!target1.exists(), "pool_dir must not retain zero1.bin");
 
         // 2. browsingContext.downloadEnd(canceled) cleans up placeholder without relocating
@@ -7767,7 +7842,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
         assert!(!target2.exists(), "canceled placeholder must be cleaned up");
-        assert!(!dest_dir.join("zero2.bin").exists(), "canceled download must not be relocated");
+        assert!(
+            !dest_dir.join("zero2.bin").exists(),
+            "canceled download must not be relocated"
+        );
     }
 
     #[tokio::test]
@@ -7780,7 +7858,9 @@ mod tests {
         let conn = make_test_conn(pool_dir.clone());
         conn.download_end_supported.store(true, Ordering::SeqCst);
         let st = make_test_ctx_state(Some("uc-chunk"), Some(dest_dir.clone()));
-        conn.contexts.write().insert("cid-chunk".into(), Arc::clone(&st));
+        conn.contexts
+            .write()
+            .insert("cid-chunk".into(), Arc::clone(&st));
         conn.user_contexts
             .write()
             .insert("uc-chunk".into(), Arc::clone(&st));
@@ -7859,7 +7939,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anchor_download_null_navigation_waits_for_late_finalization_without_leaking_pool_file() {
+    async fn anchor_download_null_navigation_waits_for_late_finalization_without_leaking_pool_file()
+    {
         let tmp = tempfile::tempdir().expect("tempdir");
         let pool_dir = tmp.path().join("pool");
         let dest_dir = tmp.path().join("dest");
@@ -7943,7 +8024,10 @@ mod tests {
         while !dest_dir.join("empty.bin").exists() && tokio::time::Instant::now() < deadline {
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
-        assert!(dest_dir.join("empty.bin").exists(), "empty.bin must relocate once finalized");
+        assert!(
+            dest_dir.join("empty.bin").exists(),
+            "empty.bin must relocate once finalized"
+        );
         assert!(
             !placeholder.exists(),
             "pool_download_dir must not retain empty.bin after late finalization"
@@ -8081,6 +8165,9 @@ mod tests {
             !dest_dir.join("fail.bin").exists(),
             "aborted fail.bin must never relocate"
         );
-        assert!(!fail_placeholder.exists(), "fail.bin placeholder cleaned up");
+        assert!(
+            !fail_placeholder.exists(),
+            "fail.bin placeholder cleaned up"
+        );
     }
 }

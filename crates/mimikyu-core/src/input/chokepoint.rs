@@ -7,13 +7,13 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::driver::{
-    BoundingBox, DriverSession, KeyEvent, KeyEventType, MouseButton, MouseEvent, MouseEventType,
-    SelectBy, WheelEvent, MOD_ALT, MOD_CONTROL, MOD_META, MOD_SHIFT,
+    BoundingBox, DriverSession, KeyEvent, KeyEventType, MOD_ALT, MOD_CONTROL, MOD_META, MOD_SHIFT,
+    MouseButton, MouseEvent, MouseEventType, SelectBy, WheelEvent,
 };
 use crate::error::{MimikyuError, Result};
 use crate::input::humanize::{
-    clamp_point_to_viewport, generate_trajectory, make_rng, sample_key_delay_ms,
-    split_wheel_notches, HumanizeConfig,
+    HumanizeConfig, MAX_WHEEL_DELTA_PX, clamp_point_to_viewport, generate_trajectory, make_rng,
+    sample_key_delay_ms, split_wheel_notches,
 };
 use crate::snapshot::{RefMap, TargetLocator};
 
@@ -371,7 +371,11 @@ impl ChokepointInput {
         }
     }
 
-    fn resolve_target(&self, target: &InputTarget, refs: Option<&RefMap>) -> Result<ResolvedTarget> {
+    fn resolve_target(
+        &self,
+        target: &InputTarget,
+        refs: Option<&RefMap>,
+    ) -> Result<ResolvedTarget> {
         match target {
             InputTarget::Selector(sel) => Ok(ResolvedTarget {
                 backend_node_id: None,
@@ -451,15 +455,15 @@ impl ChokepointInput {
         resolved: &ResolvedTarget,
         ack: Duration,
     ) -> Result<(BoundingBox, f64, f64, (f64, f64))> {
-        let (vp_w, vp_h) = self
-            .run_with_ack(ack, "viewport_size", self.session.viewport_size())
+        let (raw_vp_w, raw_vp_h, gutter_r, gutter_b) = self
+            .run_with_ack(
+                ack,
+                "viewport_and_gutters",
+                self.session.viewport_and_gutters(),
+            )
             .await?;
-        let (gutter_r, gutter_b) = self
-            .run_with_ack(ack, "scrollbar_gutters", self.session.scrollbar_gutters())
-            .await
-            .unwrap_or((0.0, 0.0));
-        let safe_w = (vp_w - gutter_r.max(0.0)).max(1.0);
-        let safe_h = (vp_h - gutter_b.max(0.0)).max(1.0);
+        let safe_w = (raw_vp_w - gutter_r.max(0.0)).max(1.0);
+        let safe_h = (raw_vp_h - gutter_b.max(0.0)).max(1.0);
         let mut bbox = self.resolve_box_for_target(resolved, ack).await?;
         if !bbox.is_visible() {
             return Err(MimikyuError::ElementNotFound(
@@ -530,8 +534,8 @@ impl ChokepointInput {
             }
         }
 
-        let point = resolve_safe_click_point(bbox, vp_w, vp_h, gutter_r, gutter_b)?;
-        Ok((bbox, vp_w, vp_h, point))
+        let point = resolve_safe_click_point(bbox, raw_vp_w, raw_vp_h, gutter_r, gutter_b)?;
+        Ok((bbox, safe_w, safe_h, point))
     }
 
     async fn move_cursor_to(
@@ -546,7 +550,8 @@ impl ChokepointInput {
         let (vp_w, vp_h) = viewport;
         let (tx, ty) = clamp_point_to_viewport(target.0, target.1, vp_w, vp_h);
         if humanize.enabled {
-            let pts = generate_trajectory(state.cursor, (tx, ty), target_size, vp_w, vp_h, humanize);
+            let pts =
+                generate_trajectory(state.cursor, (tx, ty), target_size, vp_w, vp_h, humanize);
             for pt in pts {
                 if pt.delay_ms > 0 {
                     tokio::time::sleep(Duration::from_millis(pt.delay_ms)).await;
@@ -821,7 +826,8 @@ impl ChokepointInput {
             self.run_with_ack(
                 ack,
                 "check_target_focus",
-                self.session.eval_isolated_in_frame(target_check_js, Some(tfid)),
+                self.session
+                    .eval_isolated_in_frame(target_check_js, Some(tfid)),
             )
             .await
             .ok()
@@ -848,7 +854,8 @@ impl ChokepointInput {
                     .run_with_ack(
                         ack,
                         "check_other_frame_focus",
-                        self.session.eval_isolated_in_frame(target_check_js, Some(fid)),
+                        self.session
+                            .eval_isolated_in_frame(target_check_js, Some(fid)),
                     )
                     .await
                 {
@@ -978,8 +985,7 @@ impl ChokepointInput {
         let mut state = self.gate.lock().await;
         let ack = self.ack_duration(opts.ack_timeout_ms);
         let resolved = self.resolve_target(target, refs)?;
-        let (bbox, vp_w, vp_h, (tx, ty)) =
-            self.resolve_target_in_viewport(&resolved, ack).await?;
+        let (bbox, vp_w, vp_h, (tx, ty)) = self.resolve_target_in_viewport(&resolved, ack).await?;
 
         self.move_cursor_to(
             &mut state,
@@ -1026,8 +1032,7 @@ impl ChokepointInput {
         let mut state = self.gate.lock().await;
         let ack = self.ack_duration(opts.ack_timeout_ms);
         let resolved = self.resolve_target(target, refs)?;
-        let (bbox, vp_w, vp_h, (tx, ty)) =
-            self.resolve_target_in_viewport(&resolved, ack).await?;
+        let (bbox, vp_w, vp_h, (tx, ty)) = self.resolve_target_in_viewport(&resolved, ack).await?;
         self.move_cursor_to(
             &mut state,
             (tx, ty),
@@ -1078,13 +1083,8 @@ impl ChokepointInput {
             )
             .await?;
         } else {
-            self.prepare_firefox_click_focus(
-                resolved.frame_id.as_deref(),
-                f64::NAN,
-                f64::NAN,
-                ack,
-            )
-            .await;
+            self.prepare_firefox_click_focus(resolved.frame_id.as_deref(), f64::NAN, f64::NAN, ack)
+                .await;
             let _ = self
                 .run_with_ack(
                     ack,
@@ -1163,23 +1163,14 @@ impl ChokepointInput {
             )
             .await?;
         } else {
-            self.prepare_firefox_click_focus(
-                resolved.frame_id.as_deref(),
-                f64::NAN,
-                f64::NAN,
-                ack,
-            )
-            .await;
+            self.prepare_firefox_click_focus(resolved.frame_id.as_deref(), f64::NAN, f64::NAN, ack)
+                .await;
             self.focus_resolved(&resolved, ack).await?;
         }
 
         if !text.is_empty() {
-            self.dispatch_typed_chars(
-                text,
-                opts.humanize.enabled.then_some(&opts.humanize),
-                ack,
-            )
-            .await?;
+            self.dispatch_typed_chars(text, opts.humanize.enabled.then_some(&opts.humanize), ack)
+                .await?;
         }
         Ok(())
     }
@@ -1378,6 +1369,13 @@ impl ChokepointInput {
         refs: Option<&RefMap>,
         opts: &ScrollOptions,
     ) -> Result<()> {
+        if !dx.is_finite() || !dy.is_finite() {
+            return Err(MimikyuError::InvalidConfig(
+                "scroll deltas must be finite numbers".to_string(),
+            ));
+        }
+        let dx = dx.clamp(-MAX_WHEEL_DELTA_PX, MAX_WHEEL_DELTA_PX);
+        let dy = dy.clamp(-MAX_WHEEL_DELTA_PX, MAX_WHEEL_DELTA_PX);
         let mut state = self.gate.lock().await;
         let ack = self.ack_duration(opts.ack_timeout_ms);
 
@@ -1622,5 +1620,16 @@ mod tests {
             resolve_safe_click_point(occluded, 800.0, 600.0, 0.0, 0.0).unwrap(),
             (795.0, 215.0)
         );
+
+        // Classic layout scrollbar (`clientWidth = 785 < innerWidth = 800`, 15px scrollbar in [785, 800)):
+        // partially overlapping [770, 810] aims at midpoint of [770, 785] = 777.5, while [790, 830]
+        // inside [785, 800) fails explicitly instead of clamping to x=784 and clicking empty body!
+        assert_eq!(
+            resolve_safe_click_point(partial, 800.0, 600.0, 15.0, 0.0).unwrap(),
+            (777.5, 215.0)
+        );
+        let classic_err = resolve_safe_click_point(occluded, 800.0, 600.0, 15.0, 0.0)
+            .expect_err("classic scrollbar-occluded target must error");
+        assert!(matches!(classic_err, MimikyuError::ElementNotFound(_)));
     }
 }

@@ -3,14 +3,14 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mimikyu_core::driver::{driver_for, EngineKind, LaunchOptions, ProfileMode, SelectBy};
+use mimikyu_core::MimikyuError;
+use mimikyu_core::driver::{EngineKind, LaunchOptions, ProfileMode, SelectBy, driver_for};
 use mimikyu_core::input::{
     ChokepointInput, ClickOptions, FillOptions, HumanizeConfig, InputOptions, InputTarget,
     ScrollOptions, TypeOptions,
 };
 use mimikyu_core::snapshot::{SnapshotEngine, SnapshotOptions, SnapshotState};
-use mimikyu_core::MimikyuError;
-use support::{assert_pgid_gone, TestServer};
+use support::{TestServer, assert_pgid_gone};
 
 async fn assert_chokepoint_and_humanize_parity(engine: EngineKind) {
     let server = TestServer::start().await;
@@ -158,7 +158,10 @@ async fn assert_chokepoint_and_humanize_parity(engine: EngineKind) {
         .eval_isolated("({ value: document.getElementById('type-target').value, down: window.__typeKeysDown, up: window.__typeKeysUp })")
         .await
         .expect("read key events");
-    assert_eq!(key_res["value"], "abc", "{engine}: non-humanized type_text value");
+    assert_eq!(
+        key_res["value"], "abc",
+        "{engine}: non-humanized type_text value"
+    );
     let down = key_res["down"].as_array().expect("down array");
     let up = key_res["up"].as_array().expect("up array");
     assert_eq!(
@@ -178,9 +181,18 @@ async fn assert_chokepoint_and_humanize_parity(engine: EngineKind) {
         .await
         .expect("navigate /edge-and-scroll");
 
-    for sel in ["#top-edge-btn", "#above-edge-btn", "#bottom-right-btn", "#offscreen-btn"] {
+    for sel in [
+        "#top-edge-btn",
+        "#above-edge-btn",
+        "#bottom-right-btn",
+        "#offscreen-btn",
+    ] {
         input
-            .click(&InputTarget::Selector(sel.into()), None, &ClickOptions::default())
+            .click(
+                &InputTarget::Selector(sel.into()),
+                None,
+                &ClickOptions::default(),
+            )
             .await
             .unwrap_or_else(|e| panic!("{engine}: failed clicking {sel}: {e}"));
     }
@@ -189,7 +201,11 @@ async fn assert_chokepoint_and_humanize_parity(engine: EngineKind) {
         .await
         .expect("read __edgeHits");
     let hits_arr = hits.as_array().expect("__edgeHits array");
-    assert_eq!(hits_arr.len(), 4, "{engine}: expected 4 edge/offscreen hits, got {hits_arr:?}");
+    assert_eq!(
+        hits_arr.len(),
+        4,
+        "{engine}: expected 4 edge/offscreen hits, got {hits_arr:?}"
+    );
 
     input
         .scroll(
@@ -332,7 +348,9 @@ async fn assert_chokepoint_and_humanize_parity(engine: EngineKind) {
 
     // Chorded shortcuts (verify ctrlKey/altKey/shiftKey/metaKey & no literal text inserted into focused input)
     session
-        .eval_isolated("const pf = document.getElementById('prefilled'); pf.value = 'sentinel'; pf.focus();")
+        .eval_isolated(
+            "const pf = document.getElementById('prefilled'); pf.value = 'sentinel'; pf.focus();",
+        )
         .await
         .unwrap();
     let baseline_chords = session
@@ -357,7 +375,9 @@ async fn assert_chokepoint_and_humanize_parity(engine: EngineKind) {
     }
     // Also verify Alt+x does not insert literal 'x' into a focused <textarea>
     session
-        .eval_isolated("const ta = document.getElementById('notes'); ta.value = 'ta-sentinel'; ta.focus();")
+        .eval_isolated(
+            "const ta = document.getElementById('notes'); ta.value = 'ta-sentinel'; ta.focus();",
+        )
         .await
         .unwrap();
     input
@@ -388,9 +408,11 @@ async fn assert_chokepoint_and_humanize_parity(engine: EngineKind) {
         .expect("read __chords");
     let chords_arr = &chords.as_array().expect("__chords array")[baseline_chords..];
     assert!(
-        chords_arr
-            .iter()
-            .any(|c| c["ctrlKey"] == true && c["key"].as_str().map(|s| s.eq_ignore_ascii_case("a")).unwrap_or(false)),
+        chords_arr.iter().any(|c| c["ctrlKey"] == true
+            && c["key"]
+                .as_str()
+                .map(|s| s.eq_ignore_ascii_case("a"))
+                .unwrap_or(false)),
         "{engine}: expected Control+a keydown: {chords_arr:?}"
     );
     assert!(
@@ -405,13 +427,17 @@ async fn assert_chokepoint_and_humanize_parity(engine: EngineKind) {
         "{engine}: expected Alt+x keydown with code KeyX: {chords_arr:?}"
     );
     assert!(
-        chords_arr.iter().any(|c| c["shiftKey"] == true && c["key"] == "A"),
+        chords_arr
+            .iter()
+            .any(|c| c["shiftKey"] == true && c["key"] == "A"),
         "{engine}: expected Shift+a keydown: {chords_arr:?}"
     );
     assert!(
-        chords_arr
-            .iter()
-            .any(|c| c["metaKey"] == true && c["key"].as_str().map(|s| s.eq_ignore_ascii_case("k")).unwrap_or(false)),
+        chords_arr.iter().any(|c| c["metaKey"] == true
+            && c["key"]
+                .as_str()
+                .map(|s| s.eq_ignore_ascii_case("k"))
+                .unwrap_or(false)),
         "{engine}: expected Meta+k keydown: {chords_arr:?}"
     );
     assert!(chords_arr.iter().any(|c| c["key"] == "F1"));
@@ -461,8 +487,20 @@ async fn assert_chokepoint_and_humanize_parity(engine: EngineKind) {
         .expect("XOChordInput ref");
 
     for (label, tgt_ref, fid, inp_id, expected_init) in [
-        ("same-origin", &so_inp_ref, &so_chord_fid, "so-chord-inp", "so-sentinel"),
-        ("cross-origin", &xo_inp_ref, &xo_chord_fid, "xo-chord-inp", "xo-sentinel"),
+        (
+            "same-origin",
+            &so_inp_ref,
+            &so_chord_fid,
+            "so-chord-inp",
+            "so-sentinel",
+        ),
+        (
+            "cross-origin",
+            &xo_inp_ref,
+            &xo_chord_fid,
+            "xo-chord-inp",
+            "xo-sentinel",
+        ),
     ] {
         input
             .click(
@@ -501,7 +539,9 @@ async fn assert_chokepoint_and_humanize_parity(engine: EngineKind) {
             ifr_arr.iter().any(|c| {
                 c["type"] == "keydown"
                     && c["altKey"] == true
-                    && c["key"].as_str().is_some_and(|s| s.eq_ignore_ascii_case("x"))
+                    && c["key"]
+                        .as_str()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("x"))
                     && c["code"] == "KeyX"
             }),
             "{engine}: expected Alt+x keydown inside {label} iframe: {ifr_arr:?}"
@@ -510,7 +550,9 @@ async fn assert_chokepoint_and_humanize_parity(engine: EngineKind) {
             ifr_arr.iter().any(|c| {
                 c["type"] == "keyup"
                     && c["altKey"] == true
-                    && c["key"].as_str().is_some_and(|s| s.eq_ignore_ascii_case("x"))
+                    && c["key"]
+                        .as_str()
+                        .is_some_and(|s| s.eq_ignore_ascii_case("x"))
                     && c["code"] == "KeyX"
             }),
             "{engine}: expected Alt+x keyup inside {label} iframe: {ifr_arr:?}"
@@ -533,7 +575,9 @@ async fn assert_chokepoint_and_humanize_parity(engine: EngineKind) {
                 &TypeOptions::default(),
             )
             .await
-            .unwrap_or_else(|e| panic!("{engine}: post-Alt+x type_text in {label} iframe failed: {e}"));
+            .unwrap_or_else(|e| {
+                panic!("{engine}: post-Alt+x type_text in {label} iframe failed: {e}")
+            });
         let after_fill_type = session
             .eval_isolated_in_frame(
                 &format!("document.getElementById('{inp_id}').value"),
@@ -559,17 +603,14 @@ async fn assert_chokepoint_and_humanize_parity(engine: EngineKind) {
     let notes_tgt = InputTarget::Selector("#notes".into());
     let type_opts = TypeOptions::default();
     let scroll_opts = ScrollOptions::default();
-    let (r1, r2, r3, r4) = tokio::time::timeout(
-        Duration::from_secs(15),
-        async {
-            tokio::join!(
-                i1.press("Escape", &inp_opts),
-                i2.click(&agree_tgt, None, &click_opts),
-                i3.type_text(&notes_tgt, None, "-appended", &type_opts),
-                i4.scroll(0.0, 50.0, None, None, &scroll_opts),
-            )
-        },
-    )
+    let (r1, r2, r3, r4) = tokio::time::timeout(Duration::from_secs(15), async {
+        tokio::join!(
+            i1.press("Escape", &inp_opts),
+            i2.click(&agree_tgt, None, &click_opts),
+            i3.type_text(&notes_tgt, None, "-appended", &type_opts),
+            i4.scroll(0.0, 50.0, None, None, &scroll_opts),
+        )
+    })
     .await
     .expect("concurrent chokepoint join must not deadlock");
     r1.unwrap();
@@ -584,13 +625,10 @@ async fn assert_chokepoint_and_humanize_parity(engine: EngineKind) {
             .await
             .expect("navigate /nested-frames-shadow");
         let mut s_state = SnapshotState::default();
-        let snap = SnapshotEngine::capture(
-            session.as_ref(),
-            &mut s_state,
-            SnapshotOptions::default(),
-        )
-        .await
-        .expect("capture shadow snapshot");
+        let snap =
+            SnapshotEngine::capture(session.as_ref(), &mut s_state, SnapshotOptions::default())
+                .await
+                .expect("capture shadow snapshot");
 
         let closed_inp_ref = snap
             .ref_map
@@ -665,13 +703,10 @@ async fn assert_iframe_focus_transitions(engine: EngineKind) {
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut f_state = SnapshotState::default();
-    let f_snap = SnapshotEngine::capture(
-        session.as_ref(),
-        &mut f_state,
-        SnapshotOptions::default(),
-    )
-    .await
-    .expect("snapshot /iframe-focus-host");
+    let f_snap =
+        SnapshotEngine::capture(session.as_ref(), &mut f_state, SnapshotOptions::default())
+            .await
+            .expect("snapshot /iframe-focus-host");
     let so_inp_ref = f_snap
         .ref_map
         .iter()
@@ -695,7 +730,10 @@ async fn assert_iframe_focus_transitions(engine: EngineKind) {
         .expect("click SOChordInput");
     assert_eq!(
         session
-            .eval_isolated_in_frame("document.activeElement && document.activeElement.id", Some(&so_fid))
+            .eval_isolated_in_frame(
+                "document.activeElement && document.activeElement.id",
+                Some(&so_fid)
+            )
             .await
             .expect("so activeElement"),
         "so-chord-inp"
@@ -755,14 +793,14 @@ async fn assert_iframe_focus_transitions(engine: EngineKind) {
     tokio::time::sleep(Duration::from_millis(250)).await;
 
     let mut n_state = SnapshotState::default();
-    let n_snap = SnapshotEngine::capture(
-        session.as_ref(),
-        &mut n_state,
-        SnapshotOptions::default(),
-    )
-    .await
-    .expect("snapshot /nested-iframe-focus-host");
-    let n_frames = session.list_frames().await.expect("list_frames nested focus");
+    let n_snap =
+        SnapshotEngine::capture(session.as_ref(), &mut n_state, SnapshotOptions::default())
+            .await
+            .expect("snapshot /nested-iframe-focus-host");
+    let n_frames = session
+        .list_frames()
+        .await
+        .expect("list_frames nested focus");
     let outer_fid = n_frames
         .iter()
         .find(|f| !f.is_main && f.url.contains("/nested-iframe-focus-outer"))
@@ -822,10 +860,7 @@ async fn assert_iframe_focus_transitions(engine: EngineKind) {
         .expect("press Alt+x in Inner1Input");
     assert_eq!(
         session
-            .eval_isolated_in_frame(
-                "document.getElementById('in1-inp').value",
-                Some(&in1_fid),
-            )
+            .eval_isolated_in_frame("document.getElementById('in1-inp').value", Some(&in1_fid),)
             .await
             .expect("in1 value"),
         "in1-sentinel"
@@ -870,10 +905,7 @@ async fn assert_iframe_focus_transitions(engine: EngineKind) {
         .expect("press Alt+x in Inner2Input");
     assert_eq!(
         session
-            .eval_isolated_in_frame(
-                "document.getElementById('in2-inp').value",
-                Some(&in2_fid),
-            )
+            .eval_isolated_in_frame("document.getElementById('in2-inp').value", Some(&in2_fid),)
             .await
             .expect("in2 value"),
         "in2-sentinel"
@@ -951,10 +983,7 @@ async fn assert_iframe_focus_transitions(engine: EngineKind) {
         .expect("humanize fill inner-2");
     assert_eq!(
         session
-            .eval_isolated_in_frame(
-                "document.getElementById('in2-inp').value",
-                Some(&in2_fid),
-            )
+            .eval_isolated_in_frame("document.getElementById('in2-inp').value", Some(&in2_fid),)
             .await
             .expect("in2 humanized value"),
         "h2"
@@ -1057,14 +1086,20 @@ async fn assert_closed_shadow_iframe_bounds_and_focus(engine: EngineKind) {
         .expect("click SO2ChordInput inside closed shadow root");
     assert_eq!(
         session
-            .eval_isolated_in_frame("document.activeElement && document.activeElement.id", Some(&so2_fid))
+            .eval_isolated_in_frame(
+                "document.activeElement && document.activeElement.id",
+                Some(&so2_fid)
+            )
             .await
             .expect("so2 activeElement"),
         "so2-chord-inp",
         "{engine}: click(@eN) must focus #so2-chord-inp inside closed-shadow-DOM iframe"
     );
     let fevs = session
-        .eval_isolated_in_frame("JSON.parse(document.documentElement.dataset.fevs || '[]')", Some(&so2_fid))
+        .eval_isolated_in_frame(
+            "JSON.parse(document.documentElement.dataset.fevs || '[]')",
+            Some(&so2_fid),
+        )
         .await
         .expect("so2 fevs");
     assert!(
@@ -1099,9 +1134,9 @@ async fn assert_closed_shadow_iframe_bounds_and_focus(engine: EngineKind) {
         .await
         .expect("main chords");
     assert!(
-        mchords
-            .as_array()
-            .is_some_and(|a| a.iter().any(|c| c["type"] == "keydown" && c["altKey"] == true && c["code"] == "KeyX")),
+        mchords.as_array().is_some_and(|a| a
+            .iter()
+            .any(|c| c["type"] == "keydown" && c["altKey"] == true && c["code"] == "KeyX")),
         "{engine}: expected Alt+x in main after closed-shadow iframe transition: {mchords:?}"
     );
 
@@ -1116,7 +1151,10 @@ async fn assert_closed_shadow_iframe_bounds_and_focus(engine: EngineKind) {
         .expect("click XOChordInput inside closed shadow root");
     assert_eq!(
         session
-            .eval_isolated_in_frame("document.activeElement && document.activeElement.id", Some(&xo_fid))
+            .eval_isolated_in_frame(
+                "document.activeElement && document.activeElement.id",
+                Some(&xo_fid)
+            )
             .await
             .expect("xo activeElement"),
         "xo-chord-inp",
@@ -1196,7 +1234,9 @@ async fn assert_non_humanized_regular_so_iframe_type_and_fill(engine: EngineKind
     let frames = session.list_frames().await.expect("list_frames regular so");
     let so1_fid = frames
         .iter()
-        .find(|f| !f.is_main && f.url.contains("/so-chord-child") && !f.url.contains("/so-chord-child-2"))
+        .find(|f| {
+            !f.is_main && f.url.contains("/so-chord-child") && !f.url.contains("/so-chord-child-2")
+        })
         .map(|f| f.frame_id.clone())
         .expect("so-chord-child frame");
     let so2_fid = frames
@@ -1265,7 +1305,10 @@ async fn assert_non_humanized_regular_so_iframe_type_and_fill(engine: EngineKind
         "{engine}: non-humanized type_text must focus #so-chord-inp inside same-origin iframe"
     );
     let so1_val = session
-        .eval_isolated_in_frame("document.getElementById('so-chord-inp').value", Some(&so1_fid))
+        .eval_isolated_in_frame(
+            "document.getElementById('so-chord-inp').value",
+            Some(&so1_fid),
+        )
         .await
         .expect("so1 value after type_text");
     let so1_val_str = so1_val.as_str().unwrap_or_default();
@@ -1295,9 +1338,9 @@ async fn assert_non_humanized_regular_so_iframe_type_and_fill(engine: EngineKind
         .await
         .expect("so1 chords");
     assert!(
-        so1_chords
-            .as_array()
-            .is_some_and(|a| a.iter().any(|c| c["type"] == "keydown" && c["altKey"] == true && c["code"] == "KeyX")),
+        so1_chords.as_array().is_some_and(|a| a
+            .iter()
+            .any(|c| c["type"] == "keydown" && c["altKey"] == true && c["code"] == "KeyX")),
         "{engine}: expected Alt+x inside so1 after non-humanized type_text: {so1_chords:?}"
     );
 
@@ -1331,7 +1374,10 @@ async fn assert_non_humanized_regular_so_iframe_type_and_fill(engine: EngineKind
     );
     assert_eq!(
         session
-            .eval_isolated_in_frame("document.getElementById('so-chord-inp').value", Some(&so1_fid))
+            .eval_isolated_in_frame(
+                "document.getElementById('so-chord-inp').value",
+                Some(&so1_fid)
+            )
             .await
             .expect("so1 value after fill"),
         "nh-fill-reg"
@@ -1366,7 +1412,10 @@ async fn assert_non_humanized_regular_so_iframe_type_and_fill(engine: EngineKind
         "so2-chord-inp"
     );
     let so2_val = session
-        .eval_isolated_in_frame("document.getElementById('so2-chord-inp').value", Some(&so2_fid))
+        .eval_isolated_in_frame(
+            "document.getElementById('so2-chord-inp').value",
+            Some(&so2_fid),
+        )
         .await
         .expect("so2 value after type_text");
     let so2_val_str = so2_val.as_str().unwrap_or_default();
@@ -1386,7 +1435,10 @@ async fn assert_non_humanized_regular_so_iframe_type_and_fill(engine: EngineKind
         .expect("non-humanized fill into id-less SO2ChordInput");
     assert_eq!(
         session
-            .eval_isolated_in_frame("document.getElementById('so2-chord-inp').value", Some(&so2_fid))
+            .eval_isolated_in_frame(
+                "document.getElementById('so2-chord-inp').value",
+                Some(&so2_fid)
+            )
             .await
             .expect("so2 value after fill"),
         "nh-fill-so2"
@@ -1988,7 +2040,9 @@ async fn assert_clamped_scroll_then_offscreen_click(engine: EngineKind) {
             &ClickOptions::default(),
         )
         .await
-        .unwrap_or_else(|e| panic!("{engine}: click(#offscreen-btn) after clamped scroll failed: {e}"));
+        .unwrap_or_else(|e| {
+            panic!("{engine}: click(#offscreen-btn) after clamped scroll failed: {e}")
+        });
 
     let hits = session
         .eval_isolated("JSON.parse(document.documentElement.dataset.edgeHits || '[]')")
@@ -2014,7 +2068,10 @@ async fn live_clamped_scroll_then_offscreen_click_firefox() {
     assert_clamped_scroll_then_offscreen_click(EngineKind::Firefox).await;
 }
 
-async fn assert_fixed_right_edge_scrollbar_handling(engine: EngineKind) {
+async fn assert_fixed_right_edge_scrollbar_handling_with_prefs(
+    engine: EngineKind,
+    extra_prefs: std::collections::BTreeMap<String, serde_json::Value>,
+) {
     let env_profile = mimikyu_core::env_profile::EnvProfileBuilder::from_preset(
         mimikyu_core::env_profile::PresetKind::MacOs,
         engine,
@@ -2028,6 +2085,7 @@ async fn assert_fixed_right_edge_scrollbar_handling(engine: EngineKind) {
             headless: true,
             profile_mode: ProfileMode::EphemeralDir,
             env_profile: Some(env_profile),
+            extra_prefs,
             ..Default::default()
         })
         .await
@@ -2140,12 +2198,32 @@ async fn assert_fixed_right_edge_scrollbar_handling(engine: EngineKind) {
 
 #[tokio::test]
 async fn live_fixed_right_edge_scrollbar_handling_chromium() {
-    assert_fixed_right_edge_scrollbar_handling(EngineKind::Chromium).await;
+    assert_fixed_right_edge_scrollbar_handling_with_prefs(
+        EngineKind::Chromium,
+        std::collections::BTreeMap::new(),
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn live_fixed_right_edge_scrollbar_handling_firefox() {
-    assert_fixed_right_edge_scrollbar_handling(EngineKind::Firefox).await;
+    assert_fixed_right_edge_scrollbar_handling_with_prefs(
+        EngineKind::Firefox,
+        std::collections::BTreeMap::new(),
+    )
+    .await;
+    // Explicitly cover both classic layout scrollbars (`ui.useOverlayScrollbars = 0`, matching
+    // headless macOS CI VMs with a virtual USB mouse) and overlay scrollbars (`1`).
+    for mode in [0, 1] {
+        assert_fixed_right_edge_scrollbar_handling_with_prefs(
+            EngineKind::Firefox,
+            std::collections::BTreeMap::from([(
+                "ui.useOverlayScrollbars".to_string(),
+                serde_json::json!(mode),
+            )]),
+        )
+        .await;
+    }
 }
 
 #[tokio::test]
@@ -2263,14 +2341,17 @@ async fn batch_extract_accepts_md_txt_aliases_and_open_validates_url_and_clears_
 #[tokio::test]
 async fn humanized_scroll_handles_extreme_finite_deltas_without_infinity_overflow() {
     use mimikyu_core::input::humanize::split_wheel_notches;
-    use rand::rngs::StdRng;
     use rand::SeedableRng;
+    use rand::rngs::StdRng;
 
     let mut rng = StdRng::seed_from_u64(99);
     let notches = split_wheel_notches(f64::MAX, -f64::MAX, &mut rng);
     assert!(notches.len() >= 2);
     for (nx, ny, _) in &notches {
-        assert!(nx.is_finite() && ny.is_finite(), "non-finite notch ({nx}, {ny})");
+        assert!(
+            nx.is_finite() && ny.is_finite(),
+            "non-finite notch ({nx}, {ny})"
+        );
     }
 
     let server = TestServer::start().await;
@@ -2308,6 +2389,11 @@ async fn humanized_scroll_handles_extreme_finite_deltas_without_infinity_overflo
         )
         .await
         .expect("humanized scroll with 1.5e308 must succeed without CDP -32602");
+
+    input
+        .scroll(-1.5e308, 1.5e308, None, None, &ScrollOptions::default())
+        .await
+        .expect("non-humanized scroll with 1.5e308 must succeed without CDP -32602");
 
     session.dispose().await.expect("dispose");
     assert_pgid_gone(pid);

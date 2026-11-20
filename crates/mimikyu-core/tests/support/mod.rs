@@ -3269,10 +3269,10 @@ self.onmessage = async (ev) => {
 <html>
 <head><title>Target Blank Host</title></head>
 <body>
-  <pre id="tb-blank"></pre>
-  <pre id="tb-noopener"></pre>
   <a id="lnk-blank" href="/target-blank-child?tag=blank" target="_blank" style="display:inline-block;padding:12px;">Open Target Blank</a>
   <a id="lnk-noopener" href="/target-blank-child?tag=noopener" target="_blank" rel="noopener" style="display:inline-block;padding:12px;">Open Target Blank Noopener</a>
+  <pre id="tb-blank"></pre>
+  <pre id="tb-noopener"></pre>
   <script>
     const bc = new BroadcastChannel('target_blank_probe');
     bc.onmessage = (ev) => {

@@ -93,16 +93,19 @@ impl ProxyConfig {
         let normalized = if trimmed.contains("://") {
             trimmed.to_string()
         } else {
-            let host_port = trimmed.rsplit_once('@').map(|(_, hp)| hp).unwrap_or(trimmed);
+            let host_port = trimmed
+                .rsplit_once('@')
+                .map(|(_, hp)| hp)
+                .unwrap_or(trimmed);
             let valid_host_port = if let Some(rest) = host_port.strip_prefix('[') {
                 rest.rsplit_once("]:")
                     .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok_and(|n| n > 0))
             } else {
                 !host_port.contains('[')
                     && !host_port.contains(']')
-                    && host_port
-                        .rsplit_once(':')
-                        .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok_and(|n| n > 0))
+                    && host_port.rsplit_once(':').is_some_and(|(h, p)| {
+                        !h.is_empty() && p.parse::<u16>().is_ok_and(|n| n > 0)
+                    })
             };
             if !valid_host_port {
                 return Err(MimikyuError::InvalidConfig(format!(
@@ -684,6 +687,11 @@ pub trait DriverSession: Send + Sync {
     async fn scrollbar_gutters(&self) -> Result<(f64, f64)> {
         Ok((0.0, 0.0))
     }
+    async fn viewport_and_gutters(&self) -> Result<(f64, f64, f64, f64)> {
+        let (vp_w, vp_h) = self.viewport_size().await?;
+        let (gr, gb) = self.scrollbar_gutters().await.unwrap_or((0.0, 0.0));
+        Ok((vp_w, vp_h, gr, gb))
+    }
     async fn scroll_into_view(
         &self,
         backend_node_id: Option<i64>,
@@ -703,8 +711,7 @@ pub trait DriverSession: Send + Sync {
         selector: Option<&str>,
         by: SelectBy,
     ) -> Result<String>;
-    async fn focus_node(&self, backend_node_id: Option<i64>, selector: Option<&str>)
-        -> Result<()>;
+    async fn focus_node(&self, backend_node_id: Option<i64>, selector: Option<&str>) -> Result<()>;
     async fn set_file_input_files(
         &self,
         backend_node_id: Option<i64>,
@@ -960,19 +967,40 @@ mod tests {
 
     #[test]
     fn engine_kind_round_trip() {
-        assert_eq!("chromium".parse::<EngineKind>().unwrap(), EngineKind::Chromium);
-        assert_eq!("chrome".parse::<EngineKind>().unwrap(), EngineKind::Chromium);
-        assert_eq!("firefox".parse::<EngineKind>().unwrap(), EngineKind::Firefox);
+        assert_eq!(
+            "chromium".parse::<EngineKind>().unwrap(),
+            EngineKind::Chromium
+        );
+        assert_eq!(
+            "chrome".parse::<EngineKind>().unwrap(),
+            EngineKind::Chromium
+        );
+        assert_eq!(
+            "firefox".parse::<EngineKind>().unwrap(),
+            EngineKind::Firefox
+        );
         assert_eq!("gecko".parse::<EngineKind>().unwrap(), EngineKind::Firefox);
         assert!("webkit".parse::<EngineKind>().is_err());
     }
 
     #[test]
     fn url_matches_pattern_handles_globs_and_substrings() {
-        assert!(url_matches_pattern("*blocked.png*", "http://127.0.0.1:8080/blocked.png"));
-        assert!(url_matches_pattern("*/api/mock*", "http://127.0.0.1:8080/api/mock?x=1"));
-        assert!(!url_matches_pattern("*/api/mock*", "http://127.0.0.1:8080/api/real"));
-        assert!(url_matches_pattern("example.com", "https://example.com/path"));
+        assert!(url_matches_pattern(
+            "*blocked.png*",
+            "http://127.0.0.1:8080/blocked.png"
+        ));
+        assert!(url_matches_pattern(
+            "*/api/mock*",
+            "http://127.0.0.1:8080/api/mock?x=1"
+        ));
+        assert!(!url_matches_pattern(
+            "*/api/mock*",
+            "http://127.0.0.1:8080/api/real"
+        ));
+        assert!(url_matches_pattern(
+            "example.com",
+            "https://example.com/path"
+        ));
     }
 
     #[test]
@@ -985,13 +1013,15 @@ mod tests {
         };
         assert_eq!(b.center(), (60.0, 40.0));
         assert!(b.is_visible());
-        assert!(!BoundingBox {
-            x: 0.0,
-            y: 0.0,
-            width: 0.0,
-            height: 10.0,
-        }
-        .is_visible());
+        assert!(
+            !BoundingBox {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 10.0,
+            }
+            .is_visible()
+        );
     }
 
     #[test]
@@ -1013,7 +1043,11 @@ mod tests {
             assert!(cfg.needs_relay(), "expected needs_relay=true for {raw}");
         }
 
-        for raw in ["127.0.0.1:8080", "http://127.0.0.1:8080", "socks5://127.0.0.1:1080"] {
+        for raw in [
+            "127.0.0.1:8080",
+            "http://127.0.0.1:8080",
+            "socks5://127.0.0.1:1080",
+        ] {
             let cfg = ProxyConfig {
                 server: raw.to_string(),
                 username: None,
@@ -1076,7 +1110,8 @@ mod tests {
         assert_eq!(v4["result"]["value"], "😀");
 
         // 5. High + valid surrogate pair -> first replaced, pair preserved
-        let v5 = parse_protocol_json(r#"{"id":5,"result":{"value":"\ud800\uD83D\uDE00"}}"#).unwrap();
+        let v5 =
+            parse_protocol_json(r#"{"id":5,"result":{"value":"\ud800\uD83D\uDE00"}}"#).unwrap();
         assert_eq!(v5["result"]["value"], "\u{FFFD}😀");
 
         // 6. Escaped backslash before ud800 -> literal "\ud800" preserved
@@ -1092,4 +1127,3 @@ mod tests {
         assert_eq!(err.0, Some(42));
     }
 }
-

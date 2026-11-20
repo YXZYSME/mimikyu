@@ -732,6 +732,7 @@ async fn assert_target_blank_links_network_and_env_ephemeral(engine: EngineKind)
         .await
         .expect("set_route_mock");
 
+    let host_tid = session.info().target_id.clone();
     session
         .navigate(&server.url("/target-blank-host"))
         .await
@@ -803,6 +804,16 @@ async fn assert_target_blank_links_network_and_env_ephemeral(engine: EngineKind)
         !blank_out.is_null(),
         "{engine}: timed out waiting for target=_blank"
     );
+
+    session
+        .activate_tab(&host_tid)
+        .await
+        .unwrap_or_else(|e| panic!("{engine}: activate_tab(host_tid) before noopener failed: {e}"));
+    let _ = session
+        .eval_isolated(
+            "new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))",
+        )
+        .await;
 
     click_sel("#lnk-noopener").await;
     let mut noopener_out = serde_json::Value::Null;

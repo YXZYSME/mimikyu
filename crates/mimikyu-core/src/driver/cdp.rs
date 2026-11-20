@@ -5,36 +5,35 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::{Mutex, RwLock};
-use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex, Notify};
+use serde_json::{Value, json};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::connect_async_with_config;
-use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tracing::{debug, warn};
 
 use crate::driver::{
-    now_ms, AxNode, BoundingBox, BrowserDriver, ConsoleEntry, ContextOptions, Cookie,
-    DriverCapabilities, DriverSession, EngineKind, EnvProfile, FrameInfo, KeyEvent, KeyEventType,
-    LaunchOptions, MouseButton, MouseEvent, MouseEventType, NavInfo, NetworkEvent, OriginStorage,
-    PageError, PermissionGrant, PermissionState, RouteMock, ScreenshotFormat,
-    ScreenshotOpts, SelectBy, SessionInfo, ShadowMatch, StorageState, TabInfo, WheelEvent,
-    MOD_ALT, MOD_CONTROL, MOD_META,
+    AxNode, BoundingBox, BrowserDriver, ConsoleEntry, ContextOptions, Cookie, DriverCapabilities,
+    DriverSession, EngineKind, EnvProfile, FrameInfo, KeyEvent, KeyEventType, LaunchOptions,
+    MOD_ALT, MOD_CONTROL, MOD_META, MouseButton, MouseEvent, MouseEventType, NavInfo, NetworkEvent,
+    OriginStorage, PageError, PermissionGrant, PermissionState, RouteMock, ScreenshotFormat,
+    ScreenshotOpts, SelectBy, SessionInfo, ShadowMatch, StorageState, TabInfo, WheelEvent, now_ms,
 };
 use crate::env_profile::{
-    build_webrtc_no_host_init_script, build_window_init_script, build_worker_init_script,
-    ProxyRelay,
+    ProxyRelay, build_webrtc_no_host_init_script, build_window_init_script,
+    build_worker_init_script,
 };
 use crate::error::{MimikyuError, Result};
 use crate::network::{
     BlockPolicy, InterceptDecision, InterceptRequest, NetworkInterceptor, ResourceType, RouteRule,
     TelemetryConfig, TelemetryStore,
 };
-use crate::process::{chromium_proxy_bypass_list, ProcessGuard};
+use crate::process::{ProcessGuard, chromium_proxy_bypass_list};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(30);
 static NEXT_OBJECT_GROUP_ID: AtomicU64 = AtomicU64::new(1);
@@ -243,19 +242,22 @@ impl BrowserDriver for CdpDriver {
             crate::driver::ProfileMode::VirtualContext => {
                 let mut params = json!({});
                 if let Some(ref proxy) = opts.proxy {
-                    params["proxyServer"] =
-                        json!(crate::process::normalize_chromium_proxy_server(&proxy.server));
+                    params["proxyServer"] = json!(crate::process::normalize_chromium_proxy_server(
+                        &proxy.server
+                    ));
                     params["proxyBypassList"] = json!(chromium_proxy_bypass_list(&proxy.bypass));
                 }
-                let res = match conn.send_browser("Target.createBrowserContext", params).await {
+                let res = match conn
+                    .send_browser("Target.createBrowserContext", params)
+                    .await
+                {
                     Ok(r) => r,
                     Err(e) => {
                         conn.shutdown_all().await;
                         return Err(e);
                     }
                 };
-                let Some(ctx_id) = res["browserContextId"].as_str().map(ToString::to_string)
-                else {
+                let Some(ctx_id) = res["browserContextId"].as_str().map(ToString::to_string) else {
                     conn.shutdown_all().await;
                     return Err(MimikyuError::Protocol {
                         code: -1,
@@ -491,12 +493,49 @@ struct CdpConnection {
     handled_sw_fetch_nids: Mutex<VecDeque<String>>,
     browser_fetch_patterns: AsyncMutex<Option<Vec<Value>>>,
     isolated_contexts: RwLock<HashSet<String>>,
+    creating_context_targets: Mutex<HashMap<String, usize>>,
     active_targets: RwLock<HashMap<String, String>>,
     foreground_target: RwLock<Option<String>>,
     process: AsyncMutex<Option<ProcessGuard>>,
     _root_proxy_relay: Mutex<Option<ProxyRelay>>,
     closed: AtomicBool,
     io_tasks: Mutex<Vec<JoinHandle<()>>>,
+}
+
+struct CreatingContextTargetGuard<'a> {
+    conn: &'a CdpConnection,
+    context_id: Option<String>,
+}
+
+impl<'a> CreatingContextTargetGuard<'a> {
+    fn enter(conn: &'a CdpConnection, context_id: Option<&str>) -> Self {
+        let owned = context_id.map(ToString::to_string);
+        if let Some(ref cid) = owned {
+            *conn
+                .creating_context_targets
+                .lock()
+                .entry(cid.clone())
+                .or_insert(0) += 1;
+        }
+        Self {
+            conn,
+            context_id: owned,
+        }
+    }
+}
+
+impl Drop for CreatingContextTargetGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(ref cid) = self.context_id {
+            let mut guard = self.conn.creating_context_targets.lock();
+            if let Some(cnt) = guard.get_mut(cid) {
+                *cnt = cnt.saturating_sub(1);
+                if *cnt == 0 {
+                    guard.remove(cid);
+                }
+            }
+        }
+    }
 }
 
 fn context_scope_key(context_id: Option<&str>) -> String {
@@ -598,6 +637,7 @@ impl CdpConnection {
             handled_sw_fetch_nids: Mutex::new(VecDeque::new()),
             browser_fetch_patterns: AsyncMutex::new(None),
             isolated_contexts: RwLock::new(HashSet::new()),
+            creating_context_targets: Mutex::new(HashMap::new()),
             active_targets: RwLock::new(HashMap::new()),
             foreground_target: RwLock::new(None),
             process: AsyncMutex::new(Some(process)),
@@ -797,20 +837,51 @@ impl CdpConnection {
 
         if target_type == "page"
             && let Some(ptid) = target_id
-            && let Some(otid) = opener_tid
         {
-            let owner_state = {
+            let owner_state = if let Some(otid) = opener_tid {
                 let sessions = self.sessions.read();
-                let direct = sessions
-                    .values()
-                    .find(|st| st.target_id == otid)
-                    .cloned();
+                let direct = sessions.values().find(|st| st.target_id == otid).cloned();
                 if direct.is_some() {
                     direct
                 } else {
                     let owner_sid = self.popup_target_owners.read().get(otid).cloned();
                     owner_sid.and_then(|osid| sessions.get(&osid).cloned())
                 }
+            } else if let Some(tc) = target_ctx
+                && self.isolated_contexts.read().contains(tc)
+                && self
+                    .creating_context_targets
+                    .lock()
+                    .get(tc)
+                    .copied()
+                    .unwrap_or(0)
+                    == 0
+            {
+                let preferred_tid = self.active_target_for(Some(tc));
+                let sessions = self.sessions.read();
+                preferred_tid
+                    .as_deref()
+                    .and_then(|atid| {
+                        sessions
+                            .values()
+                            .find(|st| {
+                                !st.disposed.load(Ordering::SeqCst)
+                                    && st.context_id.as_deref() == Some(tc)
+                                    && st.target_id == atid
+                            })
+                            .cloned()
+                    })
+                    .or_else(|| {
+                        sessions
+                            .values()
+                            .find(|st| {
+                                !st.disposed.load(Ordering::SeqCst)
+                                    && st.context_id.as_deref() == Some(tc)
+                            })
+                            .cloned()
+                    })
+            } else {
+                None
             };
             let matched = owner_state
                 .filter(|st| {
@@ -824,11 +895,8 @@ impl CdpConnection {
                     }
                 })
                 .filter(|_| {
-                    let is_existing_session = self
-                        .sessions
-                        .read()
-                        .values()
-                        .any(|st| st.target_id == ptid);
+                    let is_existing_session =
+                        self.sessions.read().values().any(|st| st.target_id == ptid);
                     !is_existing_session && !self.popup_target_owners.read().contains_key(ptid)
                 });
             if let Some(owner_state) = matched {
@@ -968,7 +1036,11 @@ impl CdpConnection {
             let conn_clone = Arc::clone(self);
             tokio::spawn(async move {
                 let _ = conn_clone
-                    .send_raw(Some(&auto_sid), "Runtime.runIfWaitingForDebugger", json!({}))
+                    .send_raw(
+                        Some(&auto_sid),
+                        "Runtime.runIfWaitingForDebugger",
+                        json!({}),
+                    )
                     .await;
             });
         }
@@ -992,8 +1064,7 @@ impl CdpConnection {
 
     async fn sync_browser_fetch(&self) {
         let mut guard = self.browser_fetch_patterns.lock().await;
-        let sessions: Vec<Arc<CdpSessionState>> =
-            self.sessions.read().values().cloned().collect();
+        let sessions: Vec<Arc<CdpSessionState>> = self.sessions.read().values().cloned().collect();
         let mut all_urls = false;
         let mut resource_types: Vec<String> = Vec::new();
         for st in sessions {
@@ -1095,8 +1166,7 @@ impl CdpConnection {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        let req_headers =
-            json_map_to_btree(params.get("request").and_then(|r| r.get("headers")));
+        let req_headers = json_map_to_btree(params.get("request").and_then(|r| r.get("headers")));
         let resource_type_raw = params
             .get("resourceType")
             .and_then(|v| v.as_str())
@@ -1154,10 +1224,7 @@ impl CdpConnection {
                     {
                         warn!(target: "mimikyu::cdp::fetch", "browser Fetch.continueRequest(ModifyHeaders) failed: {e}");
                         conn_clone
-                            .send_browser(
-                                "Fetch.continueRequest",
-                                json!({ "requestId": fetch_id }),
-                            )
+                            .send_browser("Fetch.continueRequest", json!({ "requestId": fetch_id }))
                             .await
                     } else {
                         Ok(Value::Null)
@@ -1196,7 +1263,11 @@ impl CdpConnection {
             self.popup_owner_sessions.write().remove(popup_sid);
             if waiting {
                 let _ = self
-                    .send_raw(Some(popup_sid), "Runtime.runIfWaitingForDebugger", json!({}))
+                    .send_raw(
+                        Some(popup_sid),
+                        "Runtime.runIfWaitingForDebugger",
+                        json!({}),
+                    )
                     .await;
             }
             return;
@@ -1205,7 +1276,11 @@ impl CdpConnection {
         if owner_state.disposed.load(Ordering::SeqCst) || !still_tracked {
             if waiting {
                 let _ = self
-                    .send_raw(Some(popup_sid), "Runtime.runIfWaitingForDebugger", json!({}))
+                    .send_raw(
+                        Some(popup_sid),
+                        "Runtime.runIfWaitingForDebugger",
+                        json!({}),
+                    )
                     .await;
             }
             return;
@@ -1761,9 +1836,7 @@ impl CdpSessionState {
                                 dcs.remove(fid);
                             }
                         } else if aux_type == "isolated" && ctx_name == "mimikyu_isolated" {
-                            self.isolated_worlds
-                                .lock()
-                                .insert(fid.to_string(), ctx_id);
+                            self.isolated_worlds.lock().insert(fid.to_string(), ctx_id);
                         }
                     }
                 }
@@ -1849,8 +1922,12 @@ impl CdpSessionState {
                     let is_iframe = target_type == "iframe";
                     let tid_for_spawn = target_id_opt.clone();
                     if is_iframe && let Some(tid) = target_id_opt {
-                        self.iframe_sessions.lock().insert(tid.clone(), child_sid.clone());
-                        self.iframe_session_targets.lock().insert(child_sid.clone(), tid);
+                        self.iframe_sessions
+                            .lock()
+                            .insert(tid.clone(), child_sid.clone());
+                        self.iframe_session_targets
+                            .lock()
+                            .insert(child_sid.clone(), tid);
                         if from_child {
                             self.iframe_parent_sessions
                                 .lock()
@@ -1860,10 +1937,8 @@ impl CdpSessionState {
                             .write()
                             .insert(child_sid.clone(), self.session_id.clone());
                     }
-                    let is_worker = matches!(
-                        target_type,
-                        "worker" | "shared_worker" | "service_worker"
-                    );
+                    let is_worker =
+                        matches!(target_type, "worker" | "shared_worker" | "service_worker");
                     let is_dedicated_worker = target_type == "worker";
                     if is_worker {
                         self.worker_sessions.lock().insert(child_sid.clone());
@@ -2071,18 +2146,17 @@ impl CdpSessionState {
                                             }),
                                         )
                                         .await;
-                                    let preload_res = match preload_res {
-                                        Ok(v) if v["identifier"].as_str().is_some() => Ok(v),
-                                        _ => {
-                                            conn_clone
+                                    let preload_res =
+                                        match preload_res {
+                                            Ok(v) if v["identifier"].as_str().is_some() => Ok(v),
+                                            _ => conn_clone
                                                 .send_raw(
                                                     Some(&child_sid),
                                                     "Page.addScriptToEvaluateOnNewDocument",
                                                     json!({ "source": INSTANT_ANIM_PRELOAD_JS }),
                                                 )
-                                                .await
-                                        }
-                                    };
+                                                .await,
+                                        };
                                     if let Ok(v) = preload_res
                                         && let Some(script_id) = v["identifier"].as_str()
                                     {
@@ -2174,11 +2248,7 @@ impl CdpSessionState {
                             }
                             if let Some(hdrs) = target_headers {
                                 let _ = conn_clone
-                                    .send_raw(
-                                        Some(&child_sid),
-                                        "Network.setExtraHTTPHeaders",
-                                        hdrs,
-                                    )
+                                    .send_raw(Some(&child_sid), "Network.setExtraHTTPHeaders", hdrs)
                                     .await;
                             }
                             if let Some(js) = worker_script {
@@ -2312,9 +2382,11 @@ impl CdpSessionState {
                                             .filter(|s| !s.is_empty())
                                             .unwrap_or("<anonymous>");
                                         let u = f.get("url").and_then(|v| v.as_str()).unwrap_or("");
-                                        let ln =
-                                            f.get("lineNumber").and_then(|v| v.as_u64()).unwrap_or(0)
-                                                + 1;
+                                        let ln = f
+                                            .get("lineNumber")
+                                            .and_then(|v| v.as_u64())
+                                            .unwrap_or(0)
+                                            + 1;
                                         let col = f
                                             .get("columnNumber")
                                             .and_then(|v| v.as_u64())
@@ -2731,10 +2803,8 @@ impl CdpSessionState {
                     return;
                 };
                 let is_iframe = target_type == "iframe";
-                let is_worker = matches!(
-                    target_type,
-                    "worker" | "shared_worker" | "service_worker"
-                );
+                let is_worker =
+                    matches!(target_type, "worker" | "shared_worker" | "service_worker");
                 let is_dedicated_worker = target_type == "worker";
                 if is_iframe || is_worker {
                     self.popup_child_sessions
@@ -2770,9 +2840,7 @@ impl CdpSessionState {
                 let iframe_tz = is_iframe
                     .then(|| self.env_timezone.lock().clone())
                     .flatten();
-                let iframe_locale = is_iframe
-                    .then(|| self.env_locale.lock().clone())
-                    .flatten();
+                let iframe_locale = is_iframe.then(|| self.env_locale.lock().clone()).flatten();
                 let iframe_geo = is_iframe
                     .then(|| self.env_geolocation.lock().clone())
                     .flatten();
@@ -2980,11 +3048,7 @@ impl CdpSessionState {
                         }
                         if let Some(ua) = worker_ua {
                             let _ = conn_clone
-                                .send_raw(
-                                    Some(&child_sid),
-                                    "Emulation.setUserAgentOverride",
-                                    ua,
-                                )
+                                .send_raw(Some(&child_sid), "Emulation.setUserAgentOverride", ua)
                                 .await;
                         }
                         if let Some(tz) = iframe_tz {
@@ -3007,11 +3071,7 @@ impl CdpSessionState {
                         }
                         if let Some(geo) = iframe_geo {
                             let _ = conn_clone
-                                .send_raw(
-                                    Some(&child_sid),
-                                    "Emulation.setGeolocationOverride",
-                                    geo,
-                                )
+                                .send_raw(Some(&child_sid), "Emulation.setGeolocationOverride", geo)
                                 .await;
                         }
                         if let Some(hc) = iframe_hc {
@@ -3025,11 +3085,7 @@ impl CdpSessionState {
                         }
                         if let Some(hdrs) = target_headers {
                             let _ = conn_clone
-                                .send_raw(
-                                    Some(&child_sid),
-                                    "Network.setExtraHTTPHeaders",
-                                    hdrs,
-                                )
+                                .send_raw(Some(&child_sid), "Network.setExtraHTTPHeaders", hdrs)
                                 .await;
                         }
                         if let Some(js) = worker_script {
@@ -3143,9 +3199,9 @@ impl CdpSessionState {
     fn clear_execution_contexts(&self, event_sid: &str, from_child: bool) {
         let iframe_fids = self.iframe_sessions.lock().clone();
         if from_child {
-            self.isolated_worlds.lock().retain(|fid, _| {
-                iframe_fids.get(fid).map(String::as_str) != Some(event_sid)
-            });
+            self.isolated_worlds
+                .lock()
+                .retain(|fid, _| iframe_fids.get(fid).map(String::as_str) != Some(event_sid));
             let mut dc = self.default_contexts.lock();
             let mut dcs = self.default_context_sessions.lock();
             dc.retain(|fid, _| {
@@ -3429,11 +3485,7 @@ impl CdpSessionState {
         }
     }
 
-    fn prune_pending_requests_for_detached(
-        &self,
-        sids: &HashSet<String>,
-        fids: &HashSet<String>,
-    ) {
+    fn prune_pending_requests_for_detached(&self, sids: &HashSet<String>, fids: &HashSet<String>) {
         let mut to_fail: Vec<(String, Option<String>)> = Vec::new();
         {
             let mut pending = self.pending_cdp_requests.lock();
@@ -3586,11 +3638,7 @@ impl CdpSession {
             ),
         );
 
-        if let Err(err) = page_res
-            .and(runtime_res)
-            .and(dom_res)
-            .and(net_res)
-        {
+        if let Err(err) = page_res.and(runtime_res).and(dom_res).and(net_res) {
             session.state.disposed.store(true, Ordering::SeqCst);
             session.conn.sessions.write().remove(&cdp_sid);
             return Err(err);
@@ -3797,7 +3845,8 @@ impl CdpSession {
         params: Value,
     ) -> Result<Value> {
         self.ensure_alive()?;
-        let child_sid = frame_id.and_then(|fid| self.state.iframe_sessions.lock().get(fid).cloned());
+        let child_sid =
+            frame_id.and_then(|fid| self.state.iframe_sessions.lock().get(fid).cloned());
         let sid = child_sid.as_deref().unwrap_or(&self.info.session_id);
         self.conn.send_raw(Some(sid), method, params).await
     }
@@ -3918,7 +3967,10 @@ impl CdpSession {
                 code: -1,
                 message: "Page.createIsolatedWorld missing executionContextId".to_string(),
             })?;
-        self.state.isolated_worlds.lock().insert(fid.clone(), ctx_id);
+        self.state
+            .isolated_worlds
+            .lock()
+            .insert(fid.clone(), ctx_id);
         let env_js = self.state.env_window_script.lock().clone();
         if let Some(js) = env_js {
             let _ = self
@@ -4096,8 +4148,7 @@ impl CdpSession {
             let val = parse_eval_result(info_res)?;
             let attributes: BTreeMap<String, String> =
                 serde_json::from_value(val["attributes"].clone()).unwrap_or_default();
-            let bounds: Option<BoundingBox> =
-                serde_json::from_value(val["bounds"].clone()).ok();
+            let bounds: Option<BoundingBox> = serde_json::from_value(val["bounds"].clone()).ok();
             matches.push(ShadowMatch {
                 backend_node_id: bid,
                 frame_id: Some(fid.to_string()),
@@ -4287,7 +4338,8 @@ impl CdpSession {
                     for (ni, bid_val) in backend_ids.iter().enumerate() {
                         if let Some(bid) = bid_val.as_i64()
                             && let Some(tag) = names.get(ni).and_then(&str_at)
-                            && (tag.eq_ignore_ascii_case("HTML") || tag.eq_ignore_ascii_case("BODY"))
+                            && (tag.eq_ignore_ascii_case("HTML")
+                                || tag.eq_ignore_ascii_case("BODY"))
                         {
                             shell_bids.insert((doc_fid.clone(), bid));
                         }
@@ -4418,7 +4470,9 @@ impl CdpSession {
             let sel_json = serde_json::to_string(selector)?;
             let expr = format!("document.querySelector({sel_json})");
             for attempt in 0..2 {
-                let (fid, ctx_id) = self.get_or_create_isolated_context_for(Some(fid_in)).await?;
+                let (fid, ctx_id) = self
+                    .get_or_create_isolated_context_for(Some(fid_in))
+                    .await?;
                 let res = self
                     .call_for_frame(
                         Some(&fid),
@@ -4443,7 +4497,11 @@ impl CdpSession {
                 };
                 if let Some(obj_id) = eval_val["result"]["objectId"].as_str() {
                     let desc = self
-                        .call_for_frame(Some(&fid), "DOM.describeNode", json!({ "objectId": obj_id }))
+                        .call_for_frame(
+                            Some(&fid),
+                            "DOM.describeNode",
+                            json!({ "objectId": obj_id }),
+                        )
                         .await;
                     let _ = self
                         .call_for_frame(
@@ -4514,7 +4572,9 @@ impl DriverSession for CdpSession {
             } else {
                 proxy.clone()
             };
-            params["proxyServer"] = json!(crate::process::normalize_chromium_proxy_server(&effective.server));
+            params["proxyServer"] = json!(crate::process::normalize_chromium_proxy_server(
+                &effective.server
+            ));
             params["proxyBypassList"] = json!(chromium_proxy_bypass_list(&effective.bypass));
         }
         let res = self
@@ -4543,14 +4603,16 @@ impl DriverSession for CdpSession {
                 .await;
         };
 
-        let tgt_res = match self
-            .conn
-            .send_browser(
-                "Target.createTarget",
-                json!({ "url": "about:blank", "browserContextId": ctx_id }),
-            )
-            .await
-        {
+        let tgt_res = {
+            let _creating = CreatingContextTargetGuard::enter(&self.conn, Some(ctx_id.as_str()));
+            self.conn
+                .send_browser(
+                    "Target.createTarget",
+                    json!({ "url": "about:blank", "browserContextId": ctx_id }),
+                )
+                .await
+        };
+        let tgt_res = match tgt_res {
             Ok(r) => r,
             Err(e) => {
                 cleanup_context(Arc::clone(&self.conn), ctx_id).await;
@@ -4675,10 +4737,13 @@ impl DriverSession for CdpSession {
         if let Some(ref ctx_id) = self.state.context_id {
             create_params["browserContextId"] = json!(ctx_id);
         }
-        let tgt_res = self
-            .conn
-            .send_browser("Target.createTarget", create_params)
-            .await?;
+        let tgt_res = {
+            let _creating =
+                CreatingContextTargetGuard::enter(&self.conn, self.state.context_id.as_deref());
+            self.conn
+                .send_browser("Target.createTarget", create_params)
+                .await?
+        };
         let target_id = tgt_res["targetId"]
             .as_str()
             .ok_or_else(|| MimikyuError::Protocol {
@@ -4784,7 +4849,10 @@ impl DriverSession for CdpSession {
 
     async fn list_tabs(&self) -> Result<Vec<TabInfo>> {
         self.ensure_alive()?;
-        let res = self.conn.send_browser("Target.getTargets", json!({})).await?;
+        let res = self
+            .conn
+            .send_browser("Target.getTargets", json!({}))
+            .await?;
         let targets = res["targetInfos"].as_array().cloned().unwrap_or_default();
         let active_tid = self
             .conn
@@ -4852,9 +4920,7 @@ impl DriverSession for CdpSession {
     async fn navigate(&self, url: &str) -> Result<NavInfo> {
         self.ensure_compositor_foreground().await?;
         let notified = self.state.load_notify.notified();
-        let res = self
-            .call("Page.navigate", json!({ "url": url }))
-            .await?;
+        let res = self.call("Page.navigate", json!({ "url": url })).await?;
         if let Some(err_text) = res.get("errorText").and_then(|v| v.as_str()) {
             return Err(MimikyuError::NavigationFailed(err_text.to_string()));
         }
@@ -4896,9 +4962,9 @@ impl DriverSession for CdpSession {
                 "cannot go back: already at earliest history entry".to_string(),
             ));
         }
-        let entry_id = entries[(idx - 1) as usize]["id"].as_i64().ok_or_else(|| {
-            MimikyuError::NavigationFailed("missing history entryId".to_string())
-        })?;
+        let entry_id = entries[(idx - 1) as usize]["id"]
+            .as_i64()
+            .ok_or_else(|| MimikyuError::NavigationFailed("missing history entryId".to_string()))?;
         let notified = self.state.load_notify.notified();
         self.call(
             "Page.navigateToHistoryEntry",
@@ -4924,9 +4990,9 @@ impl DriverSession for CdpSession {
                 "cannot go forward: already at latest history entry".to_string(),
             ));
         }
-        let entry_id = entries[(idx + 1) as usize]["id"].as_i64().ok_or_else(|| {
-            MimikyuError::NavigationFailed("missing history entryId".to_string())
-        })?;
+        let entry_id = entries[(idx + 1) as usize]["id"]
+            .as_i64()
+            .ok_or_else(|| MimikyuError::NavigationFailed("missing history entryId".to_string()))?;
         let notified = self.state.load_notify.notified();
         self.call(
             "Page.navigateToHistoryEntry",
@@ -5076,7 +5142,11 @@ impl DriverSession for CdpSession {
                         } else if pfids.len() > 1 {
                             if let Ok(owner) = self
                                 .conn
-                                .send_raw(Some(psid), "DOM.getFrameOwner", json!({ "frameId": root_fid }))
+                                .send_raw(
+                                    Some(psid),
+                                    "DOM.getFrameOwner",
+                                    json!({ "frameId": root_fid }),
+                                )
                                 .await
                                 && let Some(obid) = owner["backendNodeId"].as_i64()
                             {
@@ -5119,7 +5189,11 @@ impl DriverSession for CdpSession {
                     let owner_res = match cand_sid.as_deref() {
                         Some(sid) => {
                             self.conn
-                                .send_raw(Some(sid), "DOM.getFrameOwner", json!({ "frameId": root_fid }))
+                                .send_raw(
+                                    Some(sid),
+                                    "DOM.getFrameOwner",
+                                    json!({ "frameId": root_fid }),
+                                )
                                 .await
                         }
                         None => {
@@ -5405,8 +5479,8 @@ impl DriverSession for CdpSession {
 
     async fn closed_shadow_hosts(&self, frame_id: Option<&str>) -> Result<Vec<i64>> {
         self.ensure_alive()?;
-        let is_oopif = frame_id
-            .is_some_and(|fid| self.state.iframe_sessions.lock().contains_key(fid));
+        let is_oopif =
+            frame_id.is_some_and(|fid| self.state.iframe_sessions.lock().contains_key(fid));
         let main_fid = if !is_oopif {
             self.main_frame_id().await.ok()
         } else {
@@ -5595,6 +5669,7 @@ impl DriverSession for CdpSession {
         backend_node_id: i64,
         frame_id: Option<&str>,
     ) -> Result<BoundingBox> {
+        self.ensure_compositor_foreground().await?;
         let mut bbox_opt = None;
         let mut from_local_root = false;
         if let Ok(res) = self
@@ -5673,9 +5748,7 @@ impl DriverSession for CdpSession {
                             .map(|p| (f.frame_id.clone(), p.clone()))
                     })
                     .collect();
-                let offset_fid = if from_local_root
-                    && let Some(ref child_sid) = child_sid_opt
-                {
+                let offset_fid = if from_local_root && let Some(ref child_sid) = child_sid_opt {
                     let iframe_map = self.state.iframe_sessions.lock().clone();
                     let mut cur = fid.to_string();
                     for _ in 0..32 {
@@ -5714,6 +5787,7 @@ impl DriverSession for CdpSession {
     }
 
     async fn viewport_size(&self) -> Result<(f64, f64)> {
+        self.ensure_compositor_foreground().await?;
         let val = self
             .eval_isolated(
                 r#"(() => {
@@ -5730,6 +5804,31 @@ impl DriverSession for CdpSession {
         Ok((w, h))
     }
 
+    async fn viewport_and_gutters(&self) -> Result<(f64, f64, f64, f64)> {
+        self.ensure_compositor_foreground().await?;
+        let val = self
+            .eval_isolated(
+                r#"(() => {
+                    const iw = window.innerWidth || 1280;
+                    const ih = window.innerHeight || 800;
+                    const cw = (document.documentElement && document.documentElement.clientWidth) || iw;
+                    const ch = (document.documentElement && document.documentElement.clientHeight) || ih;
+                    return {
+                        w: iw,
+                        h: ih,
+                        right: Math.max(0, iw - cw),
+                        bottom: Math.max(0, ih - ch),
+                    };
+                })()"#,
+            )
+            .await?;
+        let w = val["w"].as_f64().unwrap_or(1280.0).max(1.0);
+        let h = val["h"].as_f64().unwrap_or(800.0).max(1.0);
+        let right = val["right"].as_f64().unwrap_or(0.0).max(0.0);
+        let bottom = val["bottom"].as_f64().unwrap_or(0.0).max(0.0);
+        Ok((w, h, right, bottom))
+    }
+
     async fn scroll_into_view(
         &self,
         backend_node_id: Option<i64>,
@@ -5742,7 +5841,7 @@ impl DriverSession for CdpSession {
             (None, None) => {
                 return Err(MimikyuError::InvalidConfig(
                     "scroll_into_view requires backend_node_id or selector".to_string(),
-                ))
+                ));
             }
         };
         if self
@@ -5779,7 +5878,7 @@ impl DriverSession for CdpSession {
             (None, None) => {
                 return Err(MimikyuError::InvalidConfig(
                     "clear_node_value requires backend_node_id or selector".to_string(),
-                ))
+                ));
             }
         };
         let ok = self
@@ -5829,7 +5928,7 @@ impl DriverSession for CdpSession {
             (None, None) => {
                 return Err(MimikyuError::InvalidConfig(
                     "select_option requires backend_node_id or selector".to_string(),
-                ))
+                ));
             }
         };
         let (mode, val_arg): (&str, Value) = match by {
@@ -5924,11 +6023,7 @@ impl DriverSession for CdpSession {
         Ok(val.as_str().map(ToString::to_string))
     }
 
-    async fn focus_node(
-        &self,
-        backend_node_id: Option<i64>,
-        selector: Option<&str>,
-    ) -> Result<()> {
+    async fn focus_node(&self, backend_node_id: Option<i64>, selector: Option<&str>) -> Result<()> {
         if let Some(bid) = backend_node_id {
             self.call("DOM.focus", json!({ "backendNodeId": bid }))
                 .await?;
@@ -6096,7 +6191,9 @@ impl DriverSession for CdpSession {
             let (resolved_key, resolved_text) = resolve_cdp_char_key_and_text(&ev);
             let fallback = ascii_key_code_and_vk(&ev.key);
             let code_opt = ev.code.as_deref().or_else(|| fallback.map(|f| f.0));
-            let vk_opt = ev.windows_virtual_key_code.or_else(|| fallback.map(|f| f.1));
+            let vk_opt = ev
+                .windows_virtual_key_code
+                .or_else(|| fallback.map(|f| f.1));
             let down_type = if resolved_text.is_some() {
                 "keyDown"
             } else {
@@ -6159,12 +6256,14 @@ impl DriverSession for CdpSession {
     }
 
     async fn dispatch_wheel(&self, ev: WheelEvent) -> Result<()> {
+        let dx = crate::input::humanize::sanitize_wheel_delta(ev.delta_x);
+        let dy = crate::input::humanize::sanitize_wheel_delta(ev.delta_y);
         self.dispatch_cdp_mouse_event(json!({
             "type": "mouseWheel",
             "x": ev.x,
             "y": ev.y,
-            "deltaX": ev.delta_x,
-            "deltaY": ev.delta_y,
+            "deltaX": dx,
+            "deltaY": dy,
             "modifiers": ev.modifiers,
         }))
         .await
@@ -6245,36 +6344,28 @@ impl DriverSession for CdpSession {
         }
 
         let res = res?;
-        let b64 = res["data"]
-            .as_str()
-            .ok_or_else(|| MimikyuError::Protocol {
-                code: -1,
-                message: "Page.captureScreenshot missing data".to_string(),
-            })?;
-        BASE64
-            .decode(b64)
-            .map_err(|e| MimikyuError::Protocol {
-                code: -1,
-                message: format!("invalid base64 screenshot data: {e}"),
-            })
+        let b64 = res["data"].as_str().ok_or_else(|| MimikyuError::Protocol {
+            code: -1,
+            message: "Page.captureScreenshot missing data".to_string(),
+        })?;
+        BASE64.decode(b64).map_err(|e| MimikyuError::Protocol {
+            code: -1,
+            message: format!("invalid base64 screenshot data: {e}"),
+        })
     }
 
     async fn pdf(&self) -> Result<Vec<u8>> {
         let res = self
             .call("Page.printToPDF", json!({ "printBackground": true }))
             .await?;
-        let b64 = res["data"]
-            .as_str()
-            .ok_or_else(|| MimikyuError::Protocol {
-                code: -1,
-                message: "Page.printToPDF missing data".to_string(),
-            })?;
-        BASE64
-            .decode(b64)
-            .map_err(|e| MimikyuError::Protocol {
-                code: -1,
-                message: format!("invalid base64 PDF data: {e}"),
-            })
+        let b64 = res["data"].as_str().ok_or_else(|| MimikyuError::Protocol {
+            code: -1,
+            message: "Page.printToPDF missing data".to_string(),
+        })?;
+        BASE64.decode(b64).map_err(|e| MimikyuError::Protocol {
+            code: -1,
+            message: format!("invalid base64 PDF data: {e}"),
+        })
     }
 
     async fn set_instant_animations(&self, enabled: bool) -> Result<()> {
@@ -6347,13 +6438,7 @@ impl DriverSession for CdpSession {
             .keys()
             .cloned()
             .collect();
-        let popup_sids: Vec<String> = self
-            .state
-            .popup_sessions
-            .lock()
-            .values()
-            .cloned()
-            .collect();
+        let popup_sids: Vec<String> = self.state.popup_sessions.lock().values().cloned().collect();
         let popup_child_sids: Vec<String> = {
             let workers: HashSet<String> = self.state.worker_sessions.lock().clone();
             self.state
@@ -6365,9 +6450,8 @@ impl DriverSession for CdpSession {
                 .collect()
         };
 
-        let mut all_child_sids: Vec<String> = Vec::with_capacity(
-            oopif_sids.len() + popup_sids.len() + popup_child_sids.len(),
-        );
+        let mut all_child_sids: Vec<String> =
+            Vec::with_capacity(oopif_sids.len() + popup_sids.len() + popup_child_sids.len());
         all_child_sids.extend(oopif_sids);
         all_child_sids.extend(popup_sids.iter().cloned());
         all_child_sids.extend(popup_child_sids.iter().cloned());
@@ -6449,8 +6533,7 @@ impl DriverSession for CdpSession {
         self.ensure_alive()?;
         *self.state.env_profile.lock() = Some(profile.clone());
 
-        let ua_params = if !profile.user_agent.is_empty() || profile.user_agent_metadata.is_some()
-        {
+        let ua_params = if !profile.user_agent.is_empty() || profile.user_agent_metadata.is_some() {
             let accept_lang = if !profile.languages.is_empty() {
                 profile.languages.join(",")
             } else {
@@ -6575,13 +6658,8 @@ impl DriverSession for CdpSession {
             sids.dedup();
             sids
         };
-        let popup_sids: HashSet<String> = self
-            .state
-            .popup_sessions
-            .lock()
-            .values()
-            .cloned()
-            .collect();
+        let popup_sids: HashSet<String> =
+            self.state.popup_sessions.lock().values().cloned().collect();
         for child_sid in existing_iframes {
             let _ = self
                 .conn
@@ -6605,7 +6683,11 @@ impl DriverSession for CdpSession {
             if let Some(ref p) = ua_params {
                 let _ = self
                     .conn
-                    .send_raw(Some(&child_sid), "Emulation.setUserAgentOverride", p.clone())
+                    .send_raw(
+                        Some(&child_sid),
+                        "Emulation.setUserAgentOverride",
+                        p.clone(),
+                    )
                     .await;
             }
             if let Some(ref tz) = tz_val {
@@ -6678,18 +6760,17 @@ impl DriverSession for CdpSession {
                 )
                 .await;
         }
-        let existing_workers: Vec<String> = self
-            .state
-            .worker_sessions
-            .lock()
-            .iter()
-            .cloned()
-            .collect();
+        let existing_workers: Vec<String> =
+            self.state.worker_sessions.lock().iter().cloned().collect();
         for child_sid in existing_workers {
             if let Some(ref p) = ua_params {
                 let _ = self
                     .conn
-                    .send_raw(Some(&child_sid), "Emulation.setUserAgentOverride", p.clone())
+                    .send_raw(
+                        Some(&child_sid),
+                        "Emulation.setUserAgentOverride",
+                        p.clone(),
+                    )
                     .await;
             }
             let _ = self
@@ -6784,7 +6865,15 @@ impl DriverSession for CdpSession {
             Ok::<_, MimikyuError>(())
         };
 
-        tokio::try_join!(ua_fut, tz_fut, loc_fut, metrics_fut, geo_fut, hc_fut, hdr_fut)?;
+        tokio::try_join!(
+            ua_fut,
+            tz_fut,
+            loc_fut,
+            metrics_fut,
+            geo_fut,
+            hc_fut,
+            hdr_fut
+        )?;
 
         let _ = self
             .call(
@@ -6868,7 +6957,11 @@ impl DriverSession for CdpSession {
             if let Some(ref ctx_id) = self.state.context_id {
                 params["browserContextId"] = json!(ctx_id);
             }
-            if let Err(err) = self.conn.send_browser("Browser.setPermission", params).await {
+            if let Err(err) = self
+                .conn
+                .send_browser("Browser.setPermission", params)
+                .await
+            {
                 if g.state == PermissionState::Granted {
                     let mut gp = json!({ "permissions": [g.name] });
                     if let Some(ref orig) = g.origin {
@@ -6877,7 +6970,9 @@ impl DriverSession for CdpSession {
                     if let Some(ref ctx_id) = self.state.context_id {
                         gp["browserContextId"] = json!(ctx_id);
                     }
-                    self.conn.send_browser("Browser.grantPermissions", gp).await?;
+                    self.conn
+                        .send_browser("Browser.grantPermissions", gp)
+                        .await?;
                 } else {
                     return Err(err);
                 }
@@ -6988,7 +7083,11 @@ impl DriverSession for CdpSession {
         if let Some(ref ctx_id) = self.state.context_id {
             storage_params["browserContextId"] = json!(ctx_id);
         }
-        if self.call("Storage.setCookies", storage_params).await.is_err() {
+        if self
+            .call("Storage.setCookies", storage_params)
+            .await
+            .is_err()
+        {
             self.call("Network.setCookies", json!({ "cookies": mapped }))
                 .await?;
         }
@@ -7001,7 +7100,11 @@ impl DriverSession for CdpSession {
             Some(ref ctx_id) => json!({ "browserContextId": ctx_id }),
             None => json!({}),
         };
-        if self.call("Storage.clearCookies", storage_params).await.is_err() {
+        if self
+            .call("Storage.clearCookies", storage_params)
+            .await
+            .is_err()
+        {
             self.call("Network.clearBrowserCookies", json!({})).await?;
         }
         Ok(())
@@ -7058,9 +7161,7 @@ impl DriverSession for CdpSession {
             }
             let ls_json = serde_json::to_string(&entry.local_storage)?;
             let ss_json = serde_json::to_string(&entry.session_storage)?;
-            if current_origin.as_deref() == Some(entry.origin.as_str())
-                && entry.origin != "null"
-            {
+            if current_origin.as_deref() == Some(entry.origin.as_str()) && entry.origin != "null" {
                 let script = format!(
                     r#"(() => {{
                         const ls = {ls_json};
@@ -7746,10 +7847,7 @@ fn parse_cdp_ax_nodes(
                     .collect()
             })
             .unwrap_or_default();
-        let role = n["role"]["value"]
-            .as_str()
-            .unwrap_or("unknown")
-            .to_string();
+        let role = n["role"]["value"].as_str().unwrap_or("unknown").to_string();
         let name = n["name"]["value"].as_str().map(ToString::to_string);
         let value = n["value"]["value"]
             .as_str()
@@ -7796,8 +7894,8 @@ fn parse_cdp_ax_nodes(
             }
         }
 
-        let bounds = backend_node_id
-            .and_then(|bid| bounds_map.get(&(frame_id.clone(), bid)).copied());
+        let bounds =
+            backend_node_id.and_then(|bid| bounds_map.get(&(frame_id.clone(), bid)).copied());
 
         nodes.push(AxNode {
             node_id,
@@ -7824,10 +7922,7 @@ fn parse_cdp_ax_nodes(
     nodes
 }
 
-fn is_unwrappable_doc_shell(
-    node: &AxNode,
-    shell_bids: &HashSet<(Option<String>, i64)>,
-) -> bool {
+fn is_unwrappable_doc_shell(node: &AxNode, shell_bids: &HashSet<(Option<String>, i64)>) -> bool {
     if node.parent_id.is_none() || node.role.eq_ignore_ascii_case("RootWebArea") {
         return false;
     }
@@ -7933,14 +8028,22 @@ fn unwrap_document_shell_nodes(
             .unwrap_or_else(|| std::mem::take(&mut node.child_ids));
         let mut expanded = Vec::with_capacity(raw_cids.len());
         let mut visited = HashSet::new();
-        expand_children(&raw_cids, &removed, &children_of, &mut visited, &mut expanded);
+        expand_children(
+            &raw_cids,
+            &removed,
+            &children_of,
+            &mut visited,
+            &mut expanded,
+        );
         node.child_ids = expanded;
         out.push(node);
     }
     out
 }
 
-fn named_key_cdp_spec(key: &str) -> Option<(&'static str, &'static str, u32, Option<&'static str>)> {
+fn named_key_cdp_spec(
+    key: &str,
+) -> Option<(&'static str, &'static str, u32, Option<&'static str>)> {
     match key {
         "Cancel" => Some(("Cancel", "Cancel", 3, None)),
         "Help" => Some(("Help", "Help", 47, None)),
@@ -8173,7 +8276,12 @@ mod tests {
         assert_eq!(state.telemetry.inflight_count(), 2);
         state.prune_pending_requests_outside_loader("loader-new");
         assert_eq!(state.telemetry.inflight_count(), 1);
-        assert!(state.pending_cdp_requests.lock().contains_key("req-new-doc"));
+        assert!(
+            state
+                .pending_cdp_requests
+                .lock()
+                .contains_key("req-new-doc")
+        );
 
         // 4. Child-session Fetch + Document deduplication + SSE ignore_long_lived + detach pruning
         state.finalize_document_requests_for_frame("main-fid", false);
@@ -8342,11 +8450,15 @@ mod tests {
             CdpEvalAction::Resolved(Ok(v)) => assert_eq!(v, Value::Null),
             other => panic!("unexpected action: {other:?}"),
         }
-        match classify_cdp_eval_remote_object(&json!({ "type": "object", "subtype": "null", "value": null })) {
+        match classify_cdp_eval_remote_object(
+            &json!({ "type": "object", "subtype": "null", "value": null }),
+        ) {
             CdpEvalAction::Resolved(Ok(v)) => assert_eq!(v, Value::Null),
             other => panic!("unexpected action: {other:?}"),
         }
-        match classify_cdp_eval_remote_object(&json!({ "type": "number", "unserializableValue": "-0" })) {
+        match classify_cdp_eval_remote_object(
+            &json!({ "type": "number", "unserializableValue": "-0" }),
+        ) {
             CdpEvalAction::Resolved(Ok(v)) => assert_eq!(v, json!(0)),
             other => panic!("unexpected action: {other:?}"),
         }
@@ -8395,7 +8507,12 @@ mod tests {
 
     #[test]
     fn unwrap_document_shell_nodes_strips_html_and_body_only() {
-        let mk = |id: &str, pid: Option<&str>, cids: Vec<&str>, role: &str, bid: Option<i64>, ignored: bool| {
+        let mk = |id: &str,
+                  pid: Option<&str>,
+                  cids: Vec<&str>,
+                  role: &str,
+                  bid: Option<i64>,
+                  ignored: bool| {
             AxNode {
                 node_id: id.to_string(),
                 parent_id: pid.map(ToString::to_string),
@@ -8421,11 +8538,11 @@ mod tests {
 
         let raw = vec![
             mk("1", None, vec!["2"], "RootWebArea", Some(1), false),
-            mk("2", Some("1"), vec!["3"], "none", Some(2), true),      // <html>
+            mk("2", Some("1"), vec!["3"], "none", Some(2), true), // <html>
             mk("3", Some("2"), vec!["4", "5"], "generic", Some(3), false), // <body>
-            mk("4", Some("3"), vec![], "button", Some(4), false),    // <button>
+            mk("4", Some("3"), vec![], "button", Some(4), false), // <button>
             mk("5", Some("3"), vec!["6"], "generic", Some(5), false), // user <div>
-            mk("6", Some("5"), vec![], "button", Some(6), false),    // nested <button>
+            mk("6", Some("5"), vec![], "button", Some(6), false), // nested <button>
         ];
         let mut shell_bids = HashSet::new();
         shell_bids.insert((Some("f1".to_string()), 2));
@@ -8469,13 +8586,7 @@ mod tests {
 
         let mut got = state.collect_same_proc_env_contexts(Some("main-fid"));
         got.sort_by_key(|(cid, _)| *cid);
-        assert_eq!(
-            got,
-            vec![
-                (3, Some("child-sid-1".to_string())),
-                (4, None),
-            ]
-        );
+        assert_eq!(got, vec![(3, Some("child-sid-1".to_string())), (4, None),]);
     }
 
     #[test]
